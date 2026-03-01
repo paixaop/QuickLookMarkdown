@@ -1,0 +1,69 @@
+name: QuickLookMarkdown
+options:
+  bundleIdPrefix: com.pedro
+  deploymentTarget:
+    macOS: '13.0'
+packages:
+  Down:
+    url: https://github.com/johnxnguyen/Down.git
+    from: 0.11.0
+targets:
+  QuickLookMarkdownApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: QuickLookMarkdownApp
+      - path: Resources
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: QuickLookMarkdownApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownApp/QuickLookMarkdownApp.entitlements
+    dependencies:
+      - target: QuickLookMarkdownPreviewExtension
+      - package: Down
+
+  QuickLookMarkdownPreviewExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: QuickLookMarkdownPreviewExtension
+      - path: Resources
+        type: folder
+        buildPhase: resources
+    info:
+      path: QuickLookMarkdownPreviewExtension/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.preview
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PreviewViewController
+          NSExtensionAttributes:
+            QLIsDataBasedPreview: true
+            QLSupportedContentTypes:
+              - net.daringfireball.markdown
+              - public.markdown
+              - org.commonmark.markdown
+              - com.unknown.md
+              - dyn.ah62d4rv4ge81e5pe
+              - dyn.ah62d4rv4ge8043a
+              - dyn.ah62d4rv4ge81c5pe
+              - dyn.ah62d4rv4ge8043d2
+              - dyn.ah62d4rv4ge8043dd
+              - dyn.ah62d4rv4ge80c6dmqk
+            QLSupportsSearchableItems: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp.QuickLookMarkdownPreviewExtension
+        PRODUCT_NAME: QuickLookMarkdownPreview
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: YES
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownPreviewExtension/QuickLookMarkdownPreviewExtension.entitlements
+    dependencies:
+      - package: Down
+      - framework: QuickLookUI.framework
+      - framework: WebKit.framework
+      - framework: AppKit.framework
