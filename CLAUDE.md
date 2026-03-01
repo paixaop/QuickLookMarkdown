@@ -76,8 +76,45 @@ qlmanage -r && qlmanage -r cache && killall Finder
 - The app must declare `LSHandlerRank: Owner` for markdown document types
 - Mermaid JS can be inlined in HTML (no `</script>` in mermaid.min.js) for the data-based QL extension, but use `WKUserScript` injection for the app's WKWebView
 
+## Syntax Highlighting & Code Rendering
+
+### Libraries
+
+- **highlight.js** v11.11.1 (~127KB) — syntax highlighting for 190+ languages
+- **highlight-github.css / highlight-github-dark.css** — GitHub light/dark theme, switching via `@media (prefers-color-scheme: dark)`
+- **js-yaml** v4.1.0 (~39KB) — full YAML parser for pretty-printing
+
+All JS/CSS are bundled in `Resources/` alongside `mermaid.min.js`. None contain `</script>` so they're safe to inline in HTML.
+
+### How It Works
+
+1. **File type detection**: `htmlBody(for:)` checks the file extension — markdown files go through Down, everything else is HTML-escaped and wrapped in `<pre><code class="language-X">`
+2. **JSON pretty-print**: `JSON.parse()` + `JSON.stringify(null, 2)` runs before highlighting
+3. **YAML pretty-print**: `jsyaml.load()` + `jsyaml.dump()` runs before highlighting
+4. **highlight.js**: `hljs.highlightElement()` runs on all `<pre><code>` blocks (skipping mermaid)
+5. **Mermaid**: Runs last, replacing `language-mermaid` blocks with rendered SVG
+
+### Integration Pattern (Same as Mermaid)
+
+- **App target**: Libraries injected via `WKUserScript` at document end (ContentView.swift)
+- **QL extension**: Libraries inlined in `<script>` tags in HTML output (PreviewViewController.swift)
+
+### CSS Layering
+
+The highlight.js theme CSS loads first, then our custom `<style>` block overrides `pre code.hljs` background/padding to `transparent`/`0` so our existing `pre` styling (background, border-radius, padding) takes precedence.
+
+### Supported File Types
+
+The app registers as default handler (`LSHandlerRank: Owner`) for markdown, JSON, and YAML. For source code files it registers as `Alternate` (won't steal default from Xcode/editors). The extension's `QLSupportedContentTypes` includes all the same types for Quick Look previews.
+
+The `extensionToLanguage` dictionary in both `MarkdownDocumentModel.swift` and `PreviewViewController.swift` maps file extensions to highlight.js language names. Add new languages by adding entries there and corresponding UTIs to Info.plist + project.yml.
+
 ## Architecture
 
-- **App target**: SwiftUI + WKWebView + Down (markdown→HTML) + mermaid via WKUserScript
-- **Extension target**: QLPreviewingController + QLPreviewReply (data-based HTML) + Down + mermaid inlined in HTML
-- **Shared**: Resources/mermaid.min.js (~2.9MB) bundled in both targets
+- **App target**: SwiftUI + WKWebView + Down (markdown→HTML) + highlight.js/js-yaml/mermaid via WKUserScript
+- **Extension target**: QLPreviewingController + QLPreviewReply (data-based HTML) + Down + highlight.js/js-yaml/mermaid inlined in HTML
+- **Shared**: `Resources/` folder bundled in both targets:
+  - `mermaid.min.js` (~2.9MB) — Mermaid diagram rendering
+  - `highlight.min.js` (~127KB) — Syntax highlighting
+  - `highlight-github.css` / `highlight-github-dark.css` (~1.3KB each) — GitHub theme
+  - `js-yaml.min.js` (~39KB) — YAML parsing
