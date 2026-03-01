@@ -33,13 +33,50 @@ final class MarkdownDocumentModel: ObservableObject {
         }
     }
 
+    private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd"]
+
+    private static let extensionToLanguage: [String: String] = [
+        "json": "json", "yaml": "yaml", "yml": "yaml",
+        "py": "python", "rb": "ruby", "pl": "perl", "php": "php",
+        "c": "c", "h": "c", "cpp": "cpp", "cxx": "cpp", "cc": "cpp",
+        "hpp": "cpp", "hxx": "cpp", "m": "objectivec", "mm": "objectivec",
+        "swift": "swift", "java": "java", "js": "javascript", "mjs": "javascript",
+        "ts": "typescript", "tsx": "typescript", "jsx": "javascript",
+        "css": "css", "html": "html", "htm": "html", "xml": "xml",
+        "rs": "rust", "go": "go", "sh": "bash", "bash": "bash", "zsh": "bash",
+        "sql": "sql", "r": "r", "kt": "kotlin", "kts": "kotlin",
+        "scala": "scala", "hs": "haskell", "lua": "lua", "dart": "dart",
+        "toml": "toml", "ini": "ini", "conf": "ini", "cfg": "ini",
+        "dockerfile": "dockerfile", "makefile": "makefile",
+        "cs": "csharp", "fs": "fsharp", "ex": "elixir", "exs": "elixir",
+        "erl": "erlang", "clj": "clojure", "zig": "zig", "nim": "nim",
+        "v": "v", "groovy": "groovy", "gradle": "groovy",
+    ]
+
+    private static func htmlBody(for url: URL) throws -> String {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        let ext = url.pathExtension.lowercased()
+
+        if markdownExtensions.contains(ext) {
+            return try Down(markdownString: content).toHTML()
+        }
+
+        let lang = extensionToLanguage[ext] ?? ""
+        let escaped = content
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let langClass = lang.isEmpty ? "" : " class=\"language-\(lang)\""
+        return "<pre><code\(langClass)>\(escaped)</code></pre>"
+    }
+
     func load(from url: URL) {
         Self.log("load(from: \(url.path))")
         do {
-            let markdown = try String(contentsOf: url, encoding: .utf8)
-            Self.log("Read \(markdown.count) chars from file")
-            let htmlBody = try Down(markdownString: markdown).toHTML()
-            Self.log("Down produced \(htmlBody.count) chars of HTML")
+            let content = try String(contentsOf: url, encoding: .utf8)
+            Self.log("Read \(content.count) chars from file")
+            let htmlBody = try Self.htmlBody(for: url)
+            Self.log("Produced \(htmlBody.count) chars of HTML")
             html = Self.wrapHTML(htmlBody)
             Self.log("Wrapped HTML total: \(html?.count ?? 0) chars")
             baseURL = url.deletingLastPathComponent()
@@ -76,6 +113,33 @@ final class MarkdownDocumentModel: ObservableObject {
         return ""
     }()
 
+    static let highlightJS: String = {
+        loadResource("highlight.min", ext: "js", label: "highlight.js")
+    }()
+
+    static let jsYamlJS: String = {
+        loadResource("js-yaml.min", ext: "js", label: "js-yaml")
+    }()
+
+    static let highlightGitHubCSS: String = {
+        loadResource("highlight-github", ext: "css", label: "highlight GitHub CSS")
+    }()
+
+    static let highlightGitHubDarkCSS: String = {
+        loadResource("highlight-github-dark", ext: "css", label: "highlight GitHub Dark CSS")
+    }()
+
+    private static func loadResource(_ name: String, ext: String, label: String) -> String {
+        log("Loading \(label) from bundle...")
+        if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "Resources"),
+           let content = try? String(contentsOf: url, encoding: .utf8) {
+            log("Loaded \(label): \(content.count) chars")
+            return content
+        }
+        log("ERROR: \(label) not found in bundle")
+        return ""
+    }
+
     static let mermaidRenderScript = """
     if (window.mermaid) {
       mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'default' });
@@ -94,6 +158,32 @@ final class MarkdownDocumentModel: ObservableObject {
     }
     """
 
+    static let highlightRenderScript = """
+    (function() {
+      document.querySelectorAll('pre > code.language-json').forEach(function(code) {
+        try {
+          var obj = JSON.parse(code.textContent);
+          code.textContent = JSON.stringify(obj, null, 2);
+        } catch(e) {}
+      });
+      if (window.jsyaml) {
+        document.querySelectorAll('pre > code.language-yaml, pre > code.language-yml').forEach(function(code) {
+          try {
+            var obj = jsyaml.load(code.textContent);
+            code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 });
+          } catch(e) {}
+        });
+      }
+      if (window.hljs) {
+        document.querySelectorAll('pre code').forEach(function(block) {
+          if (!block.classList.contains('language-mermaid')) {
+            hljs.highlightElement(block);
+          }
+        });
+      }
+    })();
+    """
+
     private static func wrapHTML(_ body: String) -> String {
         """
         <!doctype html>
@@ -101,7 +191,12 @@ final class MarkdownDocumentModel: ObservableObject {
           <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <style>\(highlightGitHubCSS)</style>
             <style>
+              @media (prefers-color-scheme: dark) { \(highlightGitHubDarkCSS) }
+              /* Override hljs backgrounds to use our pre styling */
+              pre code.hljs { display: block; overflow-x: auto; padding: 0; background: transparent; }
+              code.hljs { padding: 0; background: transparent; }
               :root { color-scheme: light dark; }
               body {
                 margin: 0;
@@ -116,9 +211,7 @@ final class MarkdownDocumentModel: ObservableObject {
               }
               .markdown-body {
                 box-sizing: border-box;
-                min-width: 200px;
-                max-width: 920px;
-                margin: 0 auto;
+                width: 100%;
                 padding: 24px;
               }
               .markdown-body h1, .markdown-body h2, .markdown-body h3 {

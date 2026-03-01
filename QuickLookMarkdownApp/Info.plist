@@ -36,6 +36,58 @@
         <string>org.commonmark.markdown</string>
       </array>
     </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>JSON Document</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.json</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>YAML Document</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.yaml</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Source Code</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.source-code</string>
+        <string>public.script</string>
+        <string>public.shell-script</string>
+        <string>public.python-script</string>
+        <string>public.ruby-script</string>
+        <string>public.perl-script</string>
+        <string>public.php-script</string>
+        <string>public.c-source</string>
+        <string>public.c-header</string>
+        <string>public.c-plus-plus-source</string>
+        <string>public.c-plus-plus-header</string>
+        <string>public.objective-c-source</string>
+        <string>public.objective-c-plus-plus-source</string>
+        <string>public.swift-source</string>
+        <string>com.sun.java-source</string>
+        <string>com.netscape.javascript-source</string>
+        <string>public.css</string>
+        <string>public.html</string>
+        <string>public.xml</string>
+        <string>com.apple.dt.document.script-suite-property-list</string>
+        <string>org.rust-lang.rust</string>
+        <string>org.go-lang.go</string>
+        <string>net.daringfireball.markdown</string>
+      </array>
+    </dict>
   </array>
   <key>UTImportedTypeDeclarations</key>
   <array>
@@ -60,6 +112,63 @@
         <key>public.mime-type</key>
         <array>
           <string>text/markdown</string>
+        </array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>public.yaml</string>
+      <key>UTTypeDescription</key>
+      <string>YAML Document</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.plain-text</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>yaml</string>
+          <string>yml</string>
+        </array>
+        <key>public.mime-type</key>
+        <array>
+          <string>application/x-yaml</string>
+          <string>text/yaml</string>
+        </array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>org.rust-lang.rust</string>
+      <key>UTTypeDescription</key>
+      <string>Rust Source</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.source-code</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>rs</string>
+        </array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>org.go-lang.go</string>
+      <key>UTTypeDescription</key>
+      <string>Go Source</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.source-code</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>go</string>
         </array>
       </dict>
     </dict>

@@ -57,6 +57,29 @@ targets:
               - dyn.ah62d4rv4ge8043d2
               - dyn.ah62d4rv4ge8043dd
               - dyn.ah62d4rv4ge80c6dmqk
+              - public.json
+              - public.yaml
+              - public.source-code
+              - public.script
+              - public.shell-script
+              - public.python-script
+              - public.ruby-script
+              - public.perl-script
+              - public.php-script
+              - public.c-source
+              - public.c-header
+              - public.c-plus-plus-source
+              - public.c-plus-plus-header
+              - public.objective-c-source
+              - public.objective-c-plus-plus-source
+              - public.swift-source
+              - com.sun.java-source
+              - com.netscape.javascript-source
+              - public.css
+              - public.html
+              - public.xml
+              - org.rust-lang.rust
+              - org.go-lang.go
             QLSupportsSearchableItems: false
     settings:
       base:

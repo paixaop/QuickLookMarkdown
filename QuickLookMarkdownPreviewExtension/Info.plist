@@ -36,6 +36,29 @@
 				<string>dyn.ah62d4rv4ge8043d2</string>
 				<string>dyn.ah62d4rv4ge8043dd</string>
 				<string>dyn.ah62d4rv4ge80c6dmqk</string>
+				<string>public.json</string>
+				<string>public.yaml</string>
+				<string>public.source-code</string>
+				<string>public.script</string>
+				<string>public.shell-script</string>
+				<string>public.python-script</string>
+				<string>public.ruby-script</string>
+				<string>public.perl-script</string>
+				<string>public.php-script</string>
+				<string>public.c-source</string>
+				<string>public.c-header</string>
+				<string>public.c-plus-plus-source</string>
+				<string>public.c-plus-plus-header</string>
+				<string>public.objective-c-source</string>
+				<string>public.objective-c-plus-plus-source</string>
+				<string>public.swift-source</string>
+				<string>com.sun.java-source</string>
+				<string>com.netscape.javascript-source</string>
+				<string>public.css</string>
+				<string>public.html</string>
+				<string>public.xml</string>
+				<string>org.rust-lang.rust</string>
+				<string>org.go-lang.go</string>
 			</array>
 			<key>QLSupportsSearchableItems</key>
 			<false/>

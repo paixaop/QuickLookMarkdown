@@ -10,10 +10,57 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         return js
     }()
 
+    private static func loadResource(_ name: String, ext: String) -> String {
+        guard let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "Resources"),
+              let content = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return content
+    }
+
+    private static let highlightJS: String = loadResource("highlight.min", ext: "js")
+    private static let jsYamlJS: String = loadResource("js-yaml.min", ext: "js")
+    private static let highlightGitHubCSS: String = loadResource("highlight-github", ext: "css")
+    private static let highlightGitHubDarkCSS: String = loadResource("highlight-github-dark", ext: "css")
+
+    private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd"]
+
+    private static let extensionToLanguage: [String: String] = [
+        "json": "json", "yaml": "yaml", "yml": "yaml",
+        "py": "python", "rb": "ruby", "pl": "perl", "php": "php",
+        "c": "c", "h": "c", "cpp": "cpp", "cxx": "cpp", "cc": "cpp",
+        "hpp": "cpp", "hxx": "cpp", "m": "objectivec", "mm": "objectivec",
+        "swift": "swift", "java": "java", "js": "javascript", "mjs": "javascript",
+        "ts": "typescript", "tsx": "typescript", "jsx": "javascript",
+        "css": "css", "html": "html", "htm": "html", "xml": "xml",
+        "rs": "rust", "go": "go", "sh": "bash", "bash": "bash", "zsh": "bash",
+        "sql": "sql", "r": "r", "kt": "kotlin", "kts": "kotlin",
+        "scala": "scala", "hs": "haskell", "lua": "lua", "dart": "dart",
+        "toml": "toml", "ini": "ini", "conf": "ini", "cfg": "ini",
+        "dockerfile": "dockerfile", "makefile": "makefile",
+        "cs": "csharp", "fs": "fsharp", "ex": "elixir", "exs": "elixir",
+        "erl": "erlang", "clj": "clojure", "zig": "zig", "nim": "nim",
+        "v": "v", "groovy": "groovy", "gradle": "groovy",
+    ]
+
+    private static func htmlBody(for url: URL) throws -> String {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        let ext = url.pathExtension.lowercased()
+
+        if markdownExtensions.contains(ext) {
+            return try Down(markdownString: content).toHTML()
+        }
+
+        let lang = extensionToLanguage[ext] ?? ""
+        let escaped = content
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let langClass = lang.isEmpty ? "" : " class=\"language-\(lang)\""
+        return "<pre><code\(langClass)>\(escaped)</code></pre>"
+    }
+
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         do {
-            let markdown = try String(contentsOf: url, encoding: .utf8)
-            let htmlBody = try Down(markdownString: markdown).toHTML()
+            let htmlBody = try Self.htmlBody(for: url)
             let html = Self.wrapHTML(htmlBody)
 
             let tempDir = FileManager.default.temporaryDirectory
@@ -27,8 +74,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     func providePreview(for request: QLFilePreviewRequest) async throws -> QLPreviewReply {
-        let markdown = try String(contentsOf: request.fileURL, encoding: .utf8)
-        let htmlBody = try Down(markdownString: markdown).toHTML()
+        let htmlBody = try Self.htmlBody(for: request.fileURL)
         let html = Self.wrapHTML(htmlBody)
         let data = Data(html.utf8)
 
@@ -41,6 +87,41 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     private static func wrapHTML(_ body: String) -> String {
+        let highlightBlock: String
+        if !highlightJS.isEmpty {
+            highlightBlock = """
+                <script>\(highlightJS)</script>
+                <script>\(jsYamlJS)</script>
+                <script>
+                (function() {
+                  document.querySelectorAll('pre > code.language-json').forEach(function(code) {
+                    try {
+                      var obj = JSON.parse(code.textContent);
+                      code.textContent = JSON.stringify(obj, null, 2);
+                    } catch(e) {}
+                  });
+                  if (window.jsyaml) {
+                    document.querySelectorAll('pre > code.language-yaml, pre > code.language-yml').forEach(function(code) {
+                      try {
+                        var obj = jsyaml.load(code.textContent);
+                        code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 });
+                      } catch(e) {}
+                    });
+                  }
+                  if (window.hljs) {
+                    document.querySelectorAll('pre code').forEach(function(block) {
+                      if (!block.classList.contains('language-mermaid')) {
+                        hljs.highlightElement(block);
+                      }
+                    });
+                  }
+                })();
+                </script>
+            """
+        } else {
+            highlightBlock = ""
+        }
+
         let mermaidBlock = mermaidJS.isEmpty ? "" : """
             <script>\(mermaidJS)</script>
             <script>
@@ -68,7 +149,12 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
           <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <style>\(highlightGitHubCSS)</style>
             <style>
+              @media (prefers-color-scheme: dark) { \(highlightGitHubDarkCSS) }
+              /* Override hljs backgrounds to use our pre styling */
+              pre code.hljs { display: block; overflow-x: auto; padding: 0; background: transparent; }
+              code.hljs { padding: 0; background: transparent; }
               :root { color-scheme: light dark; }
               body {
                 margin: 0;
@@ -83,9 +169,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               }
               .markdown-body {
                 box-sizing: border-box;
-                min-width: 200px;
-                max-width: 920px;
-                margin: 0 auto;
+                width: 100%;
                 padding: 24px;
               }
               .markdown-body h1, .markdown-body h2, .markdown-body h3 {
@@ -130,6 +214,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
           </head>
           <body>
             <article class="markdown-body">\(body)</article>
+            \(highlightBlock)
             \(mermaidBlock)
           </body>
         </html>

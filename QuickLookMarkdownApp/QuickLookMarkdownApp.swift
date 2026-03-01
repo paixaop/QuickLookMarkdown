@@ -53,7 +53,7 @@ struct QuickLookMarkdownApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(model: model)
-                .frame(width: 900, height: 620)
+                .frame(minWidth: 400, idealWidth: 900, minHeight: 300, idealHeight: 620)
                 .onAppear {
                     MarkdownDocumentModel.log("WindowGroup.onAppear, setting AppDelegate.model")
                     AppDelegate.model = model
@@ -63,6 +63,6 @@ struct QuickLookMarkdownApp: App {
                     model.load(from: url)
                 }
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
     }
 }

@@ -15,22 +15,36 @@ struct WebView: NSViewRepresentable {
         MarkdownDocumentModel.log("WebView.makeNSView called, html length=\(html.count)")
         let config = WKWebViewConfiguration()
 
+        // Inject highlight.js + js-yaml (before render scripts)
+        let highlightJS = MarkdownDocumentModel.highlightJS
+        if !highlightJS.isEmpty {
+            config.userContentController.addUserScript(WKUserScript(
+                source: highlightJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
+        }
+        let jsYamlJS = MarkdownDocumentModel.jsYamlJS
+        if !jsYamlJS.isEmpty {
+            config.userContentController.addUserScript(WKUserScript(
+                source: jsYamlJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
+        }
+        // Highlight + format render script (runs after libs are loaded)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.highlightRenderScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // Inject mermaid.js
         let mermaidJS = MarkdownDocumentModel.mermaidJS
         MarkdownDocumentModel.log("Mermaid JS length for WKUserScript: \(mermaidJS.count)")
         if !mermaidJS.isEmpty {
-            let mermaidScript = WKUserScript(
-                source: mermaidJS,
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true
-            )
-            config.userContentController.addUserScript(mermaidScript)
-
-            let renderScript = WKUserScript(
+            config.userContentController.addUserScript(WKUserScript(
+                source: mermaidJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
+            config.userContentController.addUserScript(WKUserScript(
                 source: MarkdownDocumentModel.mermaidRenderScript,
-                injectionTime: .atDocumentEnd,
-                forMainFrameOnly: true
-            )
-            config.userContentController.addUserScript(renderScript)
+                injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
         }
 
         let view = WKWebView(frame: .zero, configuration: config)
