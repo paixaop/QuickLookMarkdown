@@ -19,9 +19,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp
+        PRODUCT_NAME: QuickMD
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: QuickLookMarkdownApp/Info.plist
         CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownApp/QuickLookMarkdownApp.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: LHY266XUWQ
     dependencies:
       - target: QuickLookMarkdownPreviewExtension
       - package: Down
@@ -58,7 +62,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp.QuickLookMarkdownPreviewExtension
         PRODUCT_NAME: QuickLookMarkdownPreview
+        ASSETCATALOG_COMPILER_APPICON_NAME: ExtensionIcon
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: LHY266XUWQ
         SKIP_INSTALL: YES
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownPreviewExtension/QuickLookMarkdownPreviewExtension.entitlements
