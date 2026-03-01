@@ -4,9 +4,9 @@ options:
   deploymentTarget:
     macOS: '13.0'
 packages:
-  Down:
-    url: https://github.com/johnxnguyen/Down.git
-    from: 0.11.0
+  swift-markdown:
+    url: https://github.com/swiftlang/swift-markdown.git
+    from: 0.6.0
 targets:
   QuickLookMarkdownApp:
     type: application
@@ -28,7 +28,8 @@ targets:
         DEVELOPMENT_TEAM: LHY266XUWQ
     dependencies:
       - target: QuickLookMarkdownPreviewExtension
-      - package: Down
+      - package: swift-markdown
+        product: Markdown
 
   QuickLookMarkdownPreviewExtension:
     type: app-extension
@@ -92,7 +93,8 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownPreviewExtension/QuickLookMarkdownPreviewExtension.entitlements
     dependencies:
-      - package: Down
+      - package: swift-markdown
+        product: Markdown
       - framework: QuickLookUI.framework
       - framework: WebKit.framework
       - framework: AppKit.framework

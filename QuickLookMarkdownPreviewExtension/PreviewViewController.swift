@@ -1,5 +1,5 @@
-import Down
 import Foundation
+import Markdown
 import QuickLookUI
 import UniformTypeIdentifiers
 
@@ -46,7 +46,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         let ext = url.pathExtension.lowercased()
 
         if markdownExtensions.contains(ext) {
-            return try Down(markdownString: content).toHTML()
+            return HTMLFormatter.format(content)
         }
 
         let lang = extensionToLanguage[ext] ?? ""
@@ -200,6 +200,29 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 border-left: 4px solid #d0d7de;
                 padding: 0 1em;
                 color: #656d76;
+              }
+              .markdown-body table {
+                border-collapse: collapse;
+                border-spacing: 0;
+                margin: 0 0 1em;
+                width: auto;
+                overflow: auto;
+              }
+              .markdown-body table th, .markdown-body table td {
+                border: 1px solid #d0d7de;
+                padding: 6px 13px;
+              }
+              .markdown-body table th {
+                font-weight: 600;
+                background: #f6f8fa;
+              }
+              .markdown-body table tr:nth-child(2n) {
+                background: #f6f8fa;
+              }
+              @media (prefers-color-scheme: dark) {
+                .markdown-body table th, .markdown-body table td { border-color: #444c56; }
+                .markdown-body table th { background: #2d2d2d; }
+                .markdown-body table tr:nth-child(2n) { background: #2d2d2d; }
               }
               .markdown-body a { color: #0969da; text-decoration: none; }
               .markdown-body a:hover { text-decoration: underline; }
