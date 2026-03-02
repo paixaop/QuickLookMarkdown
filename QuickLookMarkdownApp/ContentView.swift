@@ -45,6 +45,10 @@ struct WebView: NSViewRepresentable {
                 source: MarkdownDocumentModel.mermaidRenderScript,
                 injectionTime: .atDocumentEnd, forMainFrameOnly: true
             ))
+            config.userContentController.addUserScript(WKUserScript(
+                source: MarkdownDocumentModel.mermaidZoomScript,
+                injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
         }
 
         // Inject TOC sidebar script

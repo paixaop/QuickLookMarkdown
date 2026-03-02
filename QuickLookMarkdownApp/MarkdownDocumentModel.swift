@@ -158,6 +158,124 @@ final class MarkdownDocumentModel: ObservableObject {
     }
     """
 
+    static let mermaidZoomScript = """
+    (function() {
+      var scale, panX, panY, overlay, content, zoomLabel, fitScale;
+      var dragging = false, didDrag = false, startX, startY, startPanX, startPanY;
+      function updateTransform() {
+        content.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
+        if (zoomLabel) zoomLabel.textContent = Math.round(scale * 100) + '%';
+      }
+      function setScale(s) { scale = Math.min(Math.max(s, 0.1), 10); updateTransform(); }
+      function closeOverlay() {
+        if (overlay) { overlay.remove(); overlay = null; }
+      }
+      function fitToScreen() {
+        if (!content || !overlay) return;
+        var svg = content.querySelector('svg');
+        if (!svg) return;
+        var vw = overlay.clientWidth * 0.85, vh = overlay.clientHeight * 0.85;
+        var sw = svg.width.baseVal.value || svg.getBoundingClientRect().width;
+        var sh = svg.height.baseVal.value || svg.getBoundingClientRect().height;
+        if (sw > 0 && sh > 0) { fitScale = Math.min(vw / (sw + 48), vh / (sh + 48), 3); }
+        else { fitScale = 1; }
+        scale = fitScale; panX = 0; panY = 0; updateTransform();
+      }
+      document.addEventListener('click', function(e) {
+        var mermaidDiv = e.target.closest('.mermaid');
+        if (!mermaidDiv) return;
+        var svg = mermaidDiv.querySelector('svg');
+        if (!svg) return;
+        scale = 1; panX = 0; panY = 0; fitScale = 1;
+        overlay = document.createElement('div');
+        overlay.className = 'mermaid-overlay';
+        var controls = document.createElement('div');
+        controls.className = 'mermaid-overlay-controls';
+        var btnPlus = document.createElement('button');
+        btnPlus.textContent = '+';
+        btnPlus.title = 'Zoom in (+)';
+        btnPlus.addEventListener('click', function(ev) { ev.stopPropagation(); setScale(scale + 0.25); });
+        var btnMinus = document.createElement('button');
+        btnMinus.textContent = '\\u2212';
+        btnMinus.title = 'Zoom out (\\u2212)';
+        btnMinus.addEventListener('click', function(ev) { ev.stopPropagation(); setScale(scale - 0.25); });
+        zoomLabel = document.createElement('span');
+        zoomLabel.className = 'mermaid-overlay-zoom-label';
+        zoomLabel.textContent = '100%';
+        zoomLabel.title = 'Reset zoom';
+        zoomLabel.addEventListener('click', function(ev) {
+          ev.stopPropagation(); scale = 1; panX = 0; panY = 0; updateTransform();
+        });
+        var btnClose = document.createElement('button');
+        btnClose.textContent = '\\u00D7';
+        btnClose.title = 'Close (Esc)';
+        btnClose.addEventListener('click', function(ev) { ev.stopPropagation(); closeOverlay(); });
+        controls.appendChild(btnPlus);
+        controls.appendChild(btnMinus);
+        controls.appendChild(zoomLabel);
+        controls.appendChild(btnClose);
+        content = document.createElement('div');
+        content.className = 'mermaid-overlay-content';
+        content.appendChild(svg.cloneNode(true));
+        content.addEventListener('click', function(ev) { ev.stopPropagation(); });
+        content.addEventListener('dblclick', function(ev) {
+          ev.stopPropagation();
+          if (Math.abs(scale - 1) < 0.01 && panX === 0 && panY === 0) { fitToScreen(); }
+          else { scale = 1; panX = 0; panY = 0; updateTransform(); }
+        });
+        content.addEventListener('mousedown', function(ev) {
+          ev.preventDefault(); ev.stopPropagation();
+          dragging = true; didDrag = false;
+          startX = ev.clientX; startY = ev.clientY;
+          startPanX = panX; startPanY = panY;
+          content.style.cursor = 'grabbing';
+        });
+        var viewport = document.createElement('div');
+        viewport.className = 'mermaid-overlay-viewport';
+        viewport.appendChild(content);
+        viewport.addEventListener('click', function(ev) { if (!didDrag) closeOverlay(); });
+        overlay.appendChild(controls);
+        overlay.appendChild(viewport);
+        document.body.appendChild(overlay);
+      });
+      document.addEventListener('mousemove', function(e) {
+        if (!dragging) return;
+        var dx = e.clientX - startX, dy = e.clientY - startY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+        panX = startPanX + dx; panY = startPanY + dy;
+        updateTransform();
+      });
+      document.addEventListener('mouseup', function() {
+        if (dragging) { dragging = false; if (content) content.style.cursor = 'grab'; }
+      });
+      document.addEventListener('wheel', function(e) {
+        if (!overlay) return;
+        e.preventDefault();
+        var delta = e.deltaY > 0 ? -0.1 : 0.1;
+        var rect = overlay.getBoundingClientRect();
+        var cx = e.clientX - rect.left - rect.width / 2;
+        var cy = e.clientY - rect.top - rect.height / 2;
+        var oldScale = scale;
+        setScale(scale + delta);
+        var ratio = scale / oldScale;
+        panX = cx - ratio * (cx - panX); panY = cy - ratio * (cy - panY);
+        updateTransform();
+      }, { passive: false });
+      document.addEventListener('keydown', function(e) {
+        if (!overlay) return;
+        var step = 40;
+        if (e.key === 'Escape') { closeOverlay(); }
+        else if (e.key === '+' || e.key === '=') { setScale(scale + 0.25); }
+        else if (e.key === '-' || e.key === '_') { setScale(scale - 0.25); }
+        else if (e.key === '0') { scale = 1; panX = 0; panY = 0; updateTransform(); }
+        else if (e.key === 'ArrowLeft') { panX += step; updateTransform(); }
+        else if (e.key === 'ArrowRight') { panX -= step; updateTransform(); }
+        else if (e.key === 'ArrowUp') { panY += step; updateTransform(); }
+        else if (e.key === 'ArrowDown') { panY -= step; updateTransform(); }
+      });
+    })();
+    """
+
     static let highlightRenderScript = """
     (function() {
       document.querySelectorAll('pre > code.language-json').forEach(function(code) {
@@ -408,7 +526,45 @@ final class MarkdownDocumentModel: ObservableObject {
                 background: #f6f8fa;
                 border-radius: 10px;
                 padding: 10px;
+                cursor: pointer;
               }
+              .mermaid-overlay {
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(30,30,30,0.92); z-index: 9999;
+                display: flex; align-items: center; justify-content: center;
+                backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+              }
+              .mermaid-overlay-controls {
+                position: absolute; top: 16px; right: 16px; z-index: 10001;
+                display: flex; gap: 6px; align-items: center;
+                background: rgba(0,0,0,0.5); border-radius: 10px; padding: 4px;
+              }
+              .mermaid-overlay-controls button {
+                width: 36px; height: 36px; border-radius: 8px;
+                border: 1px solid rgba(255,255,255,0.2); background: rgba(255,255,255,0.12);
+                color: #fff; font-size: 20px; cursor: pointer;
+                display: flex; align-items: center; justify-content: center;
+                transition: background 0.15s;
+              }
+              .mermaid-overlay-controls button:hover { background: rgba(255,255,255,0.25); }
+              .mermaid-overlay-zoom-label {
+                color: rgba(255,255,255,0.7); font-size: 13px;
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                min-width: 44px; text-align: center; cursor: pointer;
+                padding: 0 4px; border-radius: 6px;
+                transition: color 0.15s;
+              }
+              .mermaid-overlay-zoom-label:hover { color: #fff; }
+              .mermaid-overlay-viewport {
+                width: 100%; height: 100%; overflow: hidden;
+                display: flex; align-items: center; justify-content: center;
+              }
+              .mermaid-overlay-content {
+                background: #ffffff; border-radius: 12px; padding: 24px;
+                cursor: grab; user-select: none;
+                box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+              }
+              .mermaid-overlay-content svg { max-width: 85vw; max-height: 80vh; display: block; }
               /* TOC sidebar */
               #layout { height: 100vh; }
               #layout.has-toc { display: flex; overflow: hidden; }
