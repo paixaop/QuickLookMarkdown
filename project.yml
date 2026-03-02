@@ -81,6 +81,28 @@ targets:
               - public.xml
               - org.rust-lang.rust
               - org.go-lang.go
+              - public.type-script
+              - com.microsoft.typescript
+              - public.sql
+              - org.jetbrains.kotlin
+              - org.scala-lang.scala
+              - org.haskell.source
+              - public.lua-script
+              - com.google.dart
+              - public.toml
+              - com.microsoft.c-sharp
+              - com.microsoft.f-sharp
+              - org.elixir-lang.source
+              - org.erlang.source
+              - org.clojure.source
+              - org.ziglang.source
+              - org.nim-lang.source
+              - org.r-project.r
+              - org.codehaus.groovy
+              - com.docker.dockerfile
+              - public.make-source
+              - public.ini
+              - public.plain-text
             QLSupportsSearchableItems: false
     settings:
       base:

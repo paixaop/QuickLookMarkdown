@@ -47,6 +47,12 @@ struct WebView: NSViewRepresentable {
             ))
         }
 
+        // Inject TOC sidebar script
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.tocScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
         let view = WKWebView(frame: .zero, configuration: config)
         context.coordinator.lastHTML = html
         view.loadHTMLString(html, baseURL: baseURL)

@@ -59,6 +59,28 @@
 				<string>public.xml</string>
 				<string>org.rust-lang.rust</string>
 				<string>org.go-lang.go</string>
+				<string>public.type-script</string>
+				<string>com.microsoft.typescript</string>
+				<string>public.sql</string>
+				<string>org.jetbrains.kotlin</string>
+				<string>org.scala-lang.scala</string>
+				<string>org.haskell.source</string>
+				<string>public.lua-script</string>
+				<string>com.google.dart</string>
+				<string>public.toml</string>
+				<string>com.microsoft.c-sharp</string>
+				<string>com.microsoft.f-sharp</string>
+				<string>org.elixir-lang.source</string>
+				<string>org.erlang.source</string>
+				<string>org.clojure.source</string>
+				<string>org.ziglang.source</string>
+				<string>org.nim-lang.source</string>
+				<string>org.r-project.r</string>
+				<string>org.codehaus.groovy</string>
+				<string>com.docker.dockerfile</string>
+				<string>public.make-source</string>
+				<string>public.ini</string>
+				<string>public.plain-text</string>
 			</array>
 			<key>QLSupportsSearchableItems</key>
 			<false/>
