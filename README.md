@@ -51,7 +51,7 @@ A macOS Quick Look extension and standalone app that renders Markdown files, syn
 3. Generate and build:
    ```bash
    xcodegen generate
-   xcodebuild -scheme QuickLookMarkdownApp -configuration Debug \
+   xcodebuild -scheme QuickMDApp -configuration Debug \
      CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" build
    ```
 4. Install to `/Applications`:
@@ -61,7 +61,7 @@ A macOS Quick Look extension and standalone app that renders Markdown files, syn
 5. Register the app and extension:
    ```bash
    lsregister -f -R -trusted /Applications/QuickMD.app
-   pluginkit -e use -i com.pedro.QuickLookMarkdownApp.QuickLookMarkdownPreviewExtension
+   pluginkit -e use -i com.pedro.QuickMDApp.QuickMDPreviewExtension
    qlmanage -r && qlmanage -r cache
    ```
 6. In Finder, select any supported file and press `Space`.

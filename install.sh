@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-BUNDLE_ID="com.pedro.QuickLookMarkdownApp"
-EXTENSION_ID="${BUNDLE_ID}.QuickLookMarkdownPreviewExtension"
+BUNDLE_ID="com.pedro.QuickMDApp"
+EXTENSION_ID="${BUNDLE_ID}.QuickMDPreviewExtension"
 APP_NAME="QuickMD"
 INSTALL_DIR="/Applications"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
@@ -11,12 +11,12 @@ echo "==> Generating Xcode project..."
 xcodegen generate
 
 echo "==> Building..."
-xcodebuild -scheme QuickLookMarkdownApp -configuration Debug \
+xcodebuild -scheme QuickMDApp -configuration Debug \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
   build 2>&1 | tail -3
 
 # Find the built app in DerivedData
-BUILD_DIR=$(xcodebuild -scheme QuickLookMarkdownApp -configuration Debug \
+BUILD_DIR=$(xcodebuild -scheme QuickMDApp -configuration Debug \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
   -showBuildSettings 2>/dev/null | grep -m1 'BUILT_PRODUCTS_DIR' | awk '{print $3}')
 BUILT_APP="${BUILD_DIR}/${APP_NAME}.app"
