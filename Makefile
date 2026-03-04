@@ -1,4 +1,4 @@
-SCHEME       = QuickLookMarkdownApp
+SCHEME       = QuickMDApp
 APP_NAME     = QuickMD
 BUILD_BASE   = $(shell xcodebuild -scheme $(SCHEME) -configuration Release \
                  -showBuildSettings 2>/dev/null | grep -m1 'BUILT_PRODUCTS_DIR' | awk '{print $$3}')

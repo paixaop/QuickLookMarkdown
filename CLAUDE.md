@@ -1,9 +1,9 @@
-# QuickLookMarkdown - Project Notes
+# QuickMD - Project Notes
 
 ## Build & Install
 
 - Uses XcodeGen: `xcodegen generate` then `xcodebuild`
-- App product name is `QuickMD` (bundle ID: `com.pedro.QuickLookMarkdownApp`)
+- App product name is `QuickMD` (bundle ID: `com.pedro.QuickMDApp`)
 - No paid developer certificate — build with ad-hoc signing: `CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM=""`
 
 ## Quick Look Extension — How to Override the System Markdown Previewer
@@ -59,10 +59,10 @@ cp -R DerivedData/.../QuickMD.app /Applications/QuickMD.app
 lsregister -f -R -trusted /Applications/QuickMD.app
 
 # Enable the extension via pluginkit
-pluginkit -e use -i com.pedro.QuickLookMarkdownApp.QuickLookMarkdownPreviewExtension
+pluginkit -e use -i com.pedro.QuickMDApp.QuickMDPreviewExtension
 
 # Set as default handler for markdown files
-swift -e 'import Foundation; import CoreServices; LSSetDefaultRoleHandlerForContentType("net.daringfireball.markdown" as CFString, LSRolesMask.all, "com.pedro.QuickLookMarkdownApp" as CFString)'
+swift -e 'import Foundation; import CoreServices; LSSetDefaultRoleHandlerForContentType("net.daringfireball.markdown" as CFString, LSRolesMask.all, "com.pedro.QuickMDApp" as CFString)'
 
 # Reset Quick Look cache and restart Finder
 qlmanage -r && qlmanage -r cache && killall Finder

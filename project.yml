@@ -1,4 +1,4 @@
-name: QuickLookMarkdown
+name: QuickMD
 options:
   bundleIdPrefix: com.pedro
   deploymentTarget:
@@ -8,39 +8,39 @@ packages:
     url: https://github.com/swiftlang/swift-markdown.git
     from: 0.6.0
 targets:
-  QuickLookMarkdownApp:
+  QuickMDApp:
     type: application
     platform: macOS
     sources:
-      - path: QuickLookMarkdownApp
+      - path: QuickMDApp
       - path: Resources
         type: folder
         buildPhase: resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp
+        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickMDApp
         PRODUCT_NAME: QuickMD
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
-        INFOPLIST_FILE: QuickLookMarkdownApp/Info.plist
-        CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownApp/QuickLookMarkdownApp.entitlements
+        INFOPLIST_FILE: QuickMDApp/Info.plist
+        CODE_SIGN_ENTITLEMENTS: QuickMDApp/QuickMDApp.entitlements
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: LHY266XUWQ
     dependencies:
-      - target: QuickLookMarkdownPreviewExtension
+      - target: QuickMDPreviewExtension
       - package: swift-markdown
         product: Markdown
 
-  QuickLookMarkdownPreviewExtension:
+  QuickMDPreviewExtension:
     type: app-extension
     platform: macOS
     sources:
-      - path: QuickLookMarkdownPreviewExtension
+      - path: QuickMDPreviewExtension
       - path: Resources
         type: folder
         buildPhase: resources
     info:
-      path: QuickLookMarkdownPreviewExtension/Info.plist
+      path: QuickMDPreviewExtension/Info.plist
       properties:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.quicklook.preview
@@ -106,17 +106,29 @@ targets:
             QLSupportsSearchableItems: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickLookMarkdownApp.QuickLookMarkdownPreviewExtension
-        PRODUCT_NAME: QuickLookMarkdownPreview
+        PRODUCT_BUNDLE_IDENTIFIER: com.pedro.QuickMDApp.QuickMDPreviewExtension
+        PRODUCT_NAME: QuickMDPreview
         ASSETCATALOG_COMPILER_APPICON_NAME: ExtensionIcon
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: LHY266XUWQ
         SKIP_INSTALL: YES
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: QuickLookMarkdownPreviewExtension/QuickLookMarkdownPreviewExtension.entitlements
+        CODE_SIGN_ENTITLEMENTS: QuickMDPreviewExtension/QuickMDPreviewExtension.entitlements
     dependencies:
       - package: swift-markdown
         product: Markdown
       - framework: QuickLookUI.framework
       - framework: WebKit.framework
       - framework: AppKit.framework
+
+  QuickMDTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: QuickMDTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/QuickMD.app/Contents/MacOS/QuickMD
+        BUNDLE_LOADER: $(TEST_HOST)
+    dependencies:
+      - target: QuickMDApp
