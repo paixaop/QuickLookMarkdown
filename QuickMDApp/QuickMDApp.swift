@@ -320,9 +320,23 @@ enum PandocHelper {
             result = String(result[firstHeading.lowerBound...])
         }
 
-        // Collapse 3+ consecutive blank lines to 2
-        if let multiBlank = try? NSRegularExpression(pattern: #"\n{4,}"#, options: []) {
-            result = multiBlank.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "\n\n\n")
+        // Tighten loose lists: remove blank lines between list items
+        // Matches: list item, blank line, list item (-, *, +, or 1.)
+        if let looseList = try? NSRegularExpression(pattern: #"(^[ \t]*[-*+][ \t].+)\n\n([ \t]*[-*+][ \t])"#, options: [.anchorsMatchLines]) {
+            // Run multiple passes since each replacement only catches adjacent pairs
+            for _ in 0..<5 {
+                result = looseList.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1\n$2")
+            }
+        }
+        if let looseNumList = try? NSRegularExpression(pattern: #"(^[ \t]*\d+\.[ \t].+)\n\n([ \t]*\d+\.[ \t])"#, options: [.anchorsMatchLines]) {
+            for _ in 0..<5 {
+                result = looseNumList.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1\n$2")
+            }
+        }
+
+        // Collapse 3+ consecutive blank lines to 1
+        if let multiBlank = try? NSRegularExpression(pattern: #"\n{3,}"#, options: []) {
+            result = multiBlank.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "\n\n")
         }
 
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
