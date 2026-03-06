@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MarkdownDocumentModel.log("applicationDidFinishLaunching")
         NSWindow.allowsAutomaticWindowTabbing = true
-        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true])
+        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true, "spellCheck": true])
         // Disable state restoration so previous documents don't reopen on launch
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         // Close restored blank windows — keep only windows that have content or the one that will receive a file
@@ -93,12 +93,29 @@ private func evalJS(_ code: String) {
     WebViewStore.shared.webView?.evaluateJavaScript(code) { _, _ in }
 }
 
+private func applySpellCheck(_ enabled: Bool) {
+    guard let window = NSApp.keyWindow else { return }
+    if let tv = findEditorTextViewIn(window.contentView) {
+        tv.isContinuousSpellCheckingEnabled = enabled
+    }
+}
+
+private func findEditorTextViewIn(_ view: NSView?) -> NSTextView? {
+    guard let view = view else { return nil }
+    if let tv = view as? NSTextView, tv.isEditable { return tv }
+    for sub in view.subviews {
+        if let found = findEditorTextViewIn(sub) { return found }
+    }
+    return nil
+}
+
 @main
 struct QuickMDApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage("theme") private var theme = "system"
     @AppStorage("lineNumbers") private var lineNumbers = false
     @AppStorage("wordWrap") private var wordWrap = false
+    @AppStorage("spellCheck") private var spellCheck = true
     @FocusedValue(\.documentModel) private var activeModel
     @FocusedValue(\.showEditor) private var showEditor
 
@@ -284,6 +301,13 @@ struct QuickMDApp: App {
                     }
                 ))
                 .keyboardShortcut("w", modifiers: [.command, .option])
+                Toggle("Spell Check", isOn: Binding(
+                    get: { spellCheck },
+                    set: { newValue in
+                        spellCheck = newValue
+                        applySpellCheck(newValue)
+                    }
+                ))
                 Button("Jump to Line\u{2026}") {
                     evalJS("if(window.__jumpToLine) __jumpToLine()")
                 }

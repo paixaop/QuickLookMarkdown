@@ -251,6 +251,13 @@ struct MarkdownEditorView: View {
             .background(ScrollFractionObserver(onFractionChange: onScrollFractionChange))
             .onAppear {
                 EditorFontManager.shared.applyToEditorDeferred()
+                // Apply spell check setting when editor appears
+                let spellCheck = UserDefaults.standard.bool(forKey: "spellCheck")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if let window = NSApp.keyWindow, let tv = findEditorTextViewInView(window.contentView) {
+                        tv.isContinuousSpellCheckingEnabled = spellCheck
+                    }
+                }
             }
         }
     }
@@ -356,4 +363,15 @@ private struct ScrollFractionObserver: NSViewRepresentable {
             NotificationCenter.default.removeObserver(self)
         }
     }
+}
+
+// MARK: - Helpers
+
+private func findEditorTextViewInView(_ view: NSView?) -> NSTextView? {
+    guard let view = view else { return nil }
+    if let tv = view as? NSTextView, tv.isEditable { return tv }
+    for sub in view.subviews {
+        if let found = findEditorTextViewInView(sub) { return found }
+    }
+    return nil
 }
