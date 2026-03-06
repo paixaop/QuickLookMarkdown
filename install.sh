@@ -13,6 +13,7 @@ xcodegen generate
 echo "==> Building..."
 xcodebuild -scheme QuickMDApp -configuration Debug \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+  CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION=YES \
   build 2>&1 | tail -3
 
 # Find the built app in DerivedData
