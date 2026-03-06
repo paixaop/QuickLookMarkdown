@@ -675,14 +675,15 @@ struct ContentView: View {
                     AppDelegate.pendingDirAccess = nil
                 }
             } else {
-                // Close this empty window/tab if other windows already have content
+                // Close this empty window/tab if another window already has content
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     guard model.html == nil else { return }
-                    let contentWindows = NSApp.windows.filter { $0.isVisible && !$0.isSheet && $0.tabbingIdentifier != "" }
-                    if contentWindows.count > 1 {
-                        if let window = NSApp.keyWindow ?? contentWindows.last {
-                            window.close()
-                        }
+                    let visibleWindows = NSApp.windows.filter { $0.isVisible && !$0.isSheet }
+                    let hasContentWindow = visibleWindows.contains { $0.representedURL != nil }
+                    guard hasContentWindow else { return }
+                    // Find and close blank windows (no representedURL, no content loaded)
+                    if let blankWindow = visibleWindows.first(where: { $0.representedURL == nil && $0 != NSApp.mainWindow }) {
+                        blankWindow.close()
                     }
                 }
             }

@@ -14,14 +14,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.register(defaults: ["openLinksInNewTab": true])
         // Disable state restoration so previous documents don't reopen on launch
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
-        // Close all restored windows — keep only one for the incoming file (or a fresh blank)
+        // Close restored blank windows — keep only windows that have content or the one that will receive a file
         DispatchQueue.main.async {
-            let windows = NSApp.windows.filter { $0.isVisible && !$0.isSheet && $0.className.contains("NSWindow") }
-            if windows.count > 1 {
-                // Keep only the last window (the one that will receive the opened file)
-                for w in windows.dropLast() {
-                    w.close()
-                }
+            let windows = NSApp.windows.filter { $0.isVisible && !$0.isSheet }
+            guard windows.count > 1 else { return }
+            // Close blank windows (no representedURL), keeping at least one
+            let blankWindows = windows.filter { $0.representedURL == nil }
+            let contentWindows = windows.filter { $0.representedURL != nil }
+            if !contentWindows.isEmpty {
+                for w in blankWindows { w.close() }
+            } else if blankWindows.count > 1 {
+                for w in blankWindows.dropLast() { w.close() }
             }
         }
     }
