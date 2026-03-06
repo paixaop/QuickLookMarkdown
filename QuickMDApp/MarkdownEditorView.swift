@@ -224,6 +224,90 @@ final class EditorFontManager: NSObject {
     }
 }
 
+// MARK: - Auto-Pair Handler
+
+/// Installs an NSEvent local monitor that auto-pairs brackets, backticks, and markdown formatting.
+final class AutoPairHandler: ObservableObject {
+    private var monitor: Any?
+
+    private static let pairs: [(String, String)] = [
+        ("(", ")"), ("[", "]"), ("{", "}"),
+        ("`", "`"), ("*", "*"), ("~", "~"),
+    ]
+
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard UserDefaults.standard.bool(forKey: "autoPair") else { return event }
+            return self?.handleKeyEvent(event) ?? event
+        }
+    }
+
+    func uninstall() {
+        if let monitor = monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+
+    private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
+        guard let chars = event.charactersIgnoringModifiers, chars.count == 1,
+              let window = NSApp.keyWindow,
+              let textView = findEditorTextViewInView(window.contentView) else { return event }
+
+        let char = chars
+        let selectedRange = textView.selectedRange()
+        let nsString = textView.string as NSString
+
+        // Check if typed char is a closing char and the next char matches — skip over it
+        for (open, close) in Self.pairs where close == char && open != close {
+            let nextIdx = selectedRange.location + selectedRange.length
+            if nextIdx < nsString.length && nsString.substring(with: NSRange(location: nextIdx, length: 1)) == close && selectedRange.length == 0 {
+                // Move cursor past the closing char
+                textView.setSelectedRange(NSRange(location: nextIdx + 1, length: 0))
+                return nil
+            }
+        }
+
+        // Handle backtick + Enter for code fences
+        if char == "\r" || char == "\n" {
+            // Check if we're between ``` and ``` (or just typed ```)
+            let loc = selectedRange.location
+            if loc >= 3 {
+                let before = nsString.substring(with: NSRange(location: loc - 3, length: 3))
+                if before == "```" && (loc == nsString.length || nsString.substring(with: NSRange(location: loc, length: min(1, nsString.length - loc))) == "\n" || loc == nsString.length) {
+                    // Insert newline + newline + closing fence
+                    textView.insertText("\n\n```", replacementRange: selectedRange)
+                    // Move cursor to middle line
+                    textView.setSelectedRange(NSRange(location: loc + 1, length: 0))
+                    return nil
+                }
+            }
+        }
+
+        // Auto-pair: wrap selection or insert pair
+        for (open, close) in Self.pairs where open == char {
+            if selectedRange.length > 0 {
+                // Wrap selection
+                let selected = nsString.substring(with: selectedRange)
+                textView.insertText(open + selected + close, replacementRange: selectedRange)
+                // Select the wrapped text (without the pair chars)
+                textView.setSelectedRange(NSRange(location: selectedRange.location + open.count, length: selected.count))
+                return nil
+            } else {
+                // Insert pair and place cursor between
+                textView.insertText(open + close, replacementRange: selectedRange)
+                textView.setSelectedRange(NSRange(location: selectedRange.location + open.count, length: 0))
+                return nil
+            }
+        }
+
+        return event
+    }
+
+    deinit { uninstall() }
+}
+
 // MARK: - Markdown Editor View
 
 /// SwiftUI wrapper around CodeEditorView with formatting toolbar, line numbers, minimap, and syntax highlighting.
@@ -233,6 +317,7 @@ struct MarkdownEditorView: View {
     var onScrollFractionChange: ((CGFloat) -> Void)?
     @State private var messages: Set<TextLocated<Message>> = []
     @Environment(\.colorScheme) private var colorScheme
+    @StateObject private var autoPairHandler = AutoPairHandler()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -251,6 +336,7 @@ struct MarkdownEditorView: View {
             .background(ScrollFractionObserver(onFractionChange: onScrollFractionChange))
             .onAppear {
                 EditorFontManager.shared.applyToEditorDeferred()
+                autoPairHandler.install()
                 // Apply spell check setting when editor appears
                 let spellCheck = UserDefaults.standard.bool(forKey: "spellCheck")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -258,6 +344,9 @@ struct MarkdownEditorView: View {
                         tv.isContinuousSpellCheckingEnabled = spellCheck
                     }
                 }
+            }
+            .onDisappear {
+                autoPairHandler.uninstall()
             }
         }
     }

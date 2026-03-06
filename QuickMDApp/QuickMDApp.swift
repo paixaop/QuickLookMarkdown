@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MarkdownDocumentModel.log("applicationDidFinishLaunching")
         NSWindow.allowsAutomaticWindowTabbing = true
-        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true, "spellCheck": true])
+        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true, "spellCheck": true, "autoPair": true])
         // Disable state restoration so previous documents don't reopen on launch
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         // Close restored blank windows — keep only windows that have content or the one that will receive a file
@@ -116,6 +116,7 @@ struct QuickMDApp: App {
     @AppStorage("lineNumbers") private var lineNumbers = false
     @AppStorage("wordWrap") private var wordWrap = false
     @AppStorage("spellCheck") private var spellCheck = true
+    @AppStorage("autoPair") private var autoPair = true
     @FocusedValue(\.documentModel) private var activeModel
     @FocusedValue(\.showEditor) private var showEditor
 
@@ -308,6 +309,7 @@ struct QuickMDApp: App {
                         applySpellCheck(newValue)
                     }
                 ))
+                Toggle("Auto-Pair Brackets", isOn: $autoPair)
                 Button("Jump to Line\u{2026}") {
                     evalJS("if(window.__jumpToLine) __jumpToLine()")
                 }
