@@ -308,6 +308,52 @@ final class AutoPairHandler: ObservableObject {
     deinit { uninstall() }
 }
 
+// MARK: - Editor Status Bar
+
+struct EditorStatusBar: View {
+    let position: CodeEditor.Position
+    let text: String
+
+    private var cursorLocation: (line: Int, column: Int) {
+        let loc = position.selections.first?.location ?? 0
+        let clamped = min(loc, text.count)
+        let prefix = text.prefix(clamped)
+        let line = prefix.filter { $0 == "\n" }.count + 1
+        let lastNewline = prefix.lastIndex(of: "\n")
+        let column: Int
+        if let nl = lastNewline {
+            column = text.distance(from: text.index(after: nl), to: text.index(text.startIndex, offsetBy: clamped)) + 1
+        } else {
+            column = clamped + 1
+        }
+        return (line, column)
+    }
+
+    private var wordCount: Int {
+        text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+    }
+
+    private var charCount: Int { text.count }
+
+    private var readTime: Int { max(1, wordCount / 200) }
+
+    var body: some View {
+        let loc = cursorLocation
+        HStack(spacing: 16) {
+            Text("Ln \(loc.line), Col \(loc.column)")
+            Text("Words: \(wordCount)")
+            Text("Chars: \(charCount)")
+            Text("~\(readTime) min read")
+            Spacer()
+        }
+        .font(.system(size: 11, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
 // MARK: - Markdown Editor View
 
 /// SwiftUI wrapper around CodeEditorView with formatting toolbar, line numbers, minimap, and syntax highlighting.
@@ -348,6 +394,7 @@ struct MarkdownEditorView: View {
             .onDisappear {
                 autoPairHandler.uninstall()
             }
+            EditorStatusBar(position: position, text: text)
         }
     }
 }
