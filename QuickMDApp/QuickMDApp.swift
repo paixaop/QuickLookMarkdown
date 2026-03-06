@@ -221,6 +221,10 @@ enum PandocHelper {
             "-f", "html-native_divs-native_spans",
             "-t", "gfm-raw_html",
             "--wrap=none",
+            "--strip-comments",
+            "--markdown-headings=atx",
+            "--reference-links",
+            "--reference-location=section",
             urlString,
             "-o", tempFile.path
         ]
