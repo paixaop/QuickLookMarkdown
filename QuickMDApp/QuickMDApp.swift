@@ -223,8 +223,6 @@ enum PandocHelper {
             "--wrap=none",
             "--strip-comments",
             "--markdown-headings=atx",
-            "--reference-links",
-            "--reference-location=section",
             urlString,
             "-o", tempFile.path
         ]
@@ -284,9 +282,25 @@ enum PandocHelper {
             result = bracketAttrs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
         }
 
-        // Remove images with data: URIs (base64 SVG icons, etc.)
+        // Remove images with data: URIs — inline style: ![alt](data:...)
         if let dataImgs = try? NSRegularExpression(pattern: #"!\[[^\]]*\]\(data:[^)]+\)"#, options: []) {
             result = dataImgs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+        // Remove images with data: URIs — reference style: ![][28] and [28]: data:...
+        if let dataRefs = try? NSRegularExpression(pattern: #"^\s*\[\d+\]:\s*data:[^\n]+$"#, options: [.anchorsMatchLines]) {
+            result = dataRefs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+        // Remove reference-style image/link refs: ![][N] or [][N] or [text][N] where ref was removed
+        if let refImgs = try? NSRegularExpression(pattern: #"!\[[^\]]*\]\[\d+\]"#, options: []) {
+            result = refImgs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+        // Remove empty reference links: [​][N] (zero-width space or whitespace only)
+        if let emptyRefs = try? NSRegularExpression(pattern: #"\[[\u{200B}\s]*\]\[\d+\]"#, options: []) {
+            result = emptyRefs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+        // Remove orphaned reference definitions pointing to fragment anchors: [N]: #something
+        if let fragRefs = try? NSRegularExpression(pattern: #"^\s*\[\d+\]:\s*#[^\n]*$"#, options: [.anchorsMatchLines]) {
+            result = fragRefs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
         }
 
         // Remove ::: div markers (pandoc fenced divs)
@@ -302,6 +316,11 @@ enum PandocHelper {
         // Remove "Copy page" / "Copy" standalone lines (common in documentation sites)
         if let copyLines = try? NSRegularExpression(pattern: #"^Copy( page)?$"#, options: [.anchorsMatchLines]) {
             result = copyLines.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove empty headings (## with only whitespace after)
+        if let emptyHeadings = try? NSRegularExpression(pattern: #"^#{1,6}\s*$"#, options: [.anchorsMatchLines]) {
+            result = emptyHeadings.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
         }
 
         // Remove common page feedback/navigation noise at end
