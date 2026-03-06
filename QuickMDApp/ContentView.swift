@@ -13,6 +13,10 @@ private struct FocusedShowEditorKey: FocusedValueKey {
     typealias Value = Binding<Bool>
 }
 
+private struct FocusedShowSearchBarKey: FocusedValueKey {
+    typealias Value = Binding<Bool>
+}
+
 extension FocusedValues {
     var documentModel: MarkdownDocumentModel? {
         get { self[FocusedModelKey.self] }
@@ -21,6 +25,10 @@ extension FocusedValues {
     var showEditor: Binding<Bool>? {
         get { self[FocusedShowEditorKey.self] }
         set { self[FocusedShowEditorKey.self] = newValue }
+    }
+    var showSearchBar: Binding<Bool>? {
+        get { self[FocusedShowSearchBarKey.self] }
+        set { self[FocusedShowSearchBarKey.self] = newValue }
     }
 }
 
@@ -541,6 +549,124 @@ struct WebView: NSViewRepresentable {
     }
 }
 
+// MARK: - Search Bar
+
+struct SearchBar: View {
+    @Binding var isVisible: Bool
+    @State private var query = ""
+    @State private var matchCount = 0
+    @State private var currentIndex = -1
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search\u{2026}", text: $query)
+                .textFieldStyle(.plain)
+                .focused($isFocused)
+                .onSubmit { navigateNext() }
+                .onChange(of: query) { _ in performSearch() }
+            if matchCount > 0 {
+                Text("\(currentIndex + 1)/\(matchCount)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Button(action: navigatePrev) {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            Button(action: navigateNext) {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            Button(action: close) {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .onAppear { isFocused = true }
+    }
+
+    private func performSearch() {
+        let escaped = query.replacingOccurrences(of: "'", with: "\\'")
+        evalJSSearch("window.__searchHighlight ? __searchHighlight('\(escaped)') : 0") { count in
+            matchCount = count
+            currentIndex = count > 0 ? 0 : -1
+        }
+        highlightInEditor(query)
+    }
+
+    private func navigateNext() {
+        evalJSSearch("window.__searchNext ? __searchNext() : -1") { idx in
+            currentIndex = idx
+        }
+    }
+
+    private func navigatePrev() {
+        evalJSSearch("window.__searchPrev ? __searchPrev() : -1") { idx in
+            currentIndex = idx
+        }
+    }
+
+    private func close() {
+        WebViewStore.shared.webView?.evaluateJavaScript("if(window.__searchClear) __searchClear()") { _, _ in }
+        clearEditorHighlights()
+        isVisible = false
+    }
+
+    private func evalJSSearch(_ js: String, completion: @escaping (Int) -> Void) {
+        WebViewStore.shared.webView?.evaluateJavaScript(js) { result, _ in
+            DispatchQueue.main.async {
+                completion(result as? Int ?? 0)
+            }
+        }
+    }
+
+    private func highlightInEditor(_ query: String) {
+        guard !query.isEmpty,
+              let window = NSApp.keyWindow,
+              let tv = findEditorTextView(in: window.contentView),
+              let storage = tv.textStorage else {
+            clearEditorHighlights()
+            return
+        }
+        // Clear previous highlights
+        storage.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: storage.length))
+        let nsString = storage.string as NSString
+        let lowerQuery = query.lowercased()
+        var searchStart = 0
+        while searchStart < nsString.length {
+            let range = nsString.range(of: lowerQuery, options: [.caseInsensitive],
+                                        range: NSRange(location: searchStart, length: nsString.length - searchStart))
+            if range.location == NSNotFound { break }
+            storage.addAttribute(.backgroundColor, value: NSColor.yellow.withAlphaComponent(0.3), range: range)
+            searchStart = range.location + range.length
+        }
+    }
+
+    private func clearEditorHighlights() {
+        guard let window = NSApp.keyWindow,
+              let tv = findEditorTextView(in: window.contentView),
+              let storage = tv.textStorage else { return }
+        storage.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: storage.length))
+    }
+
+    private func findEditorTextView(in view: NSView?) -> NSTextView? {
+        guard let view = view else { return nil }
+        if let tv = view as? NSTextView, tv.isEditable { return tv }
+        for sub in view.subviews {
+            if let found = findEditorTextView(in: sub) { return found }
+        }
+        return nil
+    }
+}
+
 // MARK: - ContentView
 
 struct ContentView: View {
@@ -550,9 +676,14 @@ struct ContentView: View {
     @State private var editorPosition = CodeEditor.Position()
     @State private var editorDebounceTask: Task<Void, Never>?
     @State private var scrollSyncTask: Task<Void, Never>?
+    @State private var showSearchBar = false
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            if showSearchBar {
+                SearchBar(isVisible: $showSearchBar)
+            }
+            Group {
             if let html = model.html {
                 if showEditor {
                     HSplitView {
@@ -625,7 +756,8 @@ struct ContentView: View {
                 .padding(24)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-        }
+        } // Group
+        } // VStack
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 Button(action: { model.goBack() }) {
@@ -643,6 +775,7 @@ struct ContentView: View {
         }
         .focusedValue(\.documentModel, model)
         .focusedSceneValue(\.showEditor, $showEditor)
+        .focusedSceneValue(\.showSearchBar, $showSearchBar)
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in

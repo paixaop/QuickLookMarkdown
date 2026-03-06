@@ -760,6 +760,13 @@ final class MarkdownDocumentModel: ObservableObject {
         if (bar) { bar.remove(); bar = null; }
       }
       window.__findOpen = openBar;
+      // Expose search API for SwiftUI search bar
+      window.__searchHighlight = function(query) { doSearch(query); return highlights.length; };
+      window.__searchNext = function() { if (highlights.length === 0) return -1; currentIdx = (currentIdx + 1) % highlights.length; scrollToCurrent(); return currentIdx; };
+      window.__searchPrev = function() { if (highlights.length === 0) return -1; currentIdx = (currentIdx - 1 + highlights.length) % highlights.length; scrollToCurrent(); return currentIdx; };
+      window.__searchClear = function() { clearHighlights(); };
+      window.__searchCount = function() { return highlights.length; };
+      window.__searchCurrentIndex = function() { return currentIdx; };
       document.addEventListener('keydown', function(e) {
         if (e.metaKey && e.key === 'f') { e.preventDefault(); openBar(); }
       });

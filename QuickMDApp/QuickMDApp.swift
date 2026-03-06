@@ -127,6 +127,7 @@ struct QuickMDApp: App {
     @AppStorage("autoPair") private var autoPair = true
     @FocusedValue(\.documentModel) private var activeModel
     @FocusedValue(\.showEditor) private var showEditor
+    @FocusedValue(\.showSearchBar) private var showSearchBar
 
     var body: some Scene {
         WindowGroup {
@@ -337,7 +338,11 @@ struct QuickMDApp: App {
             }
             CommandMenu("Tools") {
                 Button("Find\u{2026}") {
-                    evalJS("if(window.__findOpen) __findOpen()")
+                    if let binding = showSearchBar {
+                        binding.wrappedValue.toggle()
+                    } else {
+                        evalJS("if(window.__findOpen) __findOpen()")
+                    }
                 }
                 .keyboardShortcut("f")
                 Divider()
