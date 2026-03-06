@@ -201,6 +201,33 @@ enum PandocHelper {
         }
     }
 
+    /// Run pandoc to convert a web URL to markdown.
+    @discardableResult
+    static func convertURL(_ urlString: String, output: URL) -> (success: Bool, error: String) {
+        guard let pandoc = pandocPath() else {
+            return (false, "Pandoc not found")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pandoc)
+        proc.arguments = ["-f", "html", "-t", "markdown", "--standalone", urlString, "-o", output.path]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        proc.standardOutput = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errStr = String(data: errData, encoding: .utf8) ?? ""
+            if proc.terminationStatus == 0 {
+                return (true, "")
+            } else {
+                return (false, errStr.isEmpty ? "Pandoc exited with code \(proc.terminationStatus)" : errStr)
+            }
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
     /// Run pandoc to convert `input` to `output` with the given format.
     @discardableResult
     static func convert(input: URL, output: URL, to format: String? = nil, from inputFormat: String? = nil) -> (success: Bool, error: String) {
@@ -394,6 +421,49 @@ struct QuickMDApp: App {
                 }
 
                 Menu("Import to Markdown") {
+                    Button("From URL\u{2026}") {
+                        guard PandocHelper.pandocPath() != nil else {
+                            PandocHelper.showInstallAlert()
+                            return
+                        }
+                        let alert = NSAlert()
+                        alert.messageText = "Import from URL"
+                        alert.informativeText = "Enter a web page URL to convert to Markdown:"
+                        alert.addButton(withTitle: "Import")
+                        alert.addButton(withTitle: "Cancel")
+                        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 350, height: 24))
+                        textField.placeholderString = "https://example.com/page"
+                        alert.accessoryView = textField
+                        alert.window.initialFirstResponder = textField
+                        guard alert.runModal() == .alertFirstButtonReturn else { return }
+                        let urlString = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let url = URL(string: urlString), url.scheme != nil else {
+                            let err = NSAlert()
+                            err.messageText = "Invalid URL"
+                            err.informativeText = "Please enter a valid URL starting with http:// or https://"
+                            err.runModal()
+                            return
+                        }
+                        // Derive filename from URL host+path
+                        let baseName = (url.host ?? "page").replacingOccurrences(of: ".", with: "-")
+                        let savePanel = NSSavePanel()
+                        savePanel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+                        savePanel.nameFieldStringValue = "\(baseName).md"
+                        guard savePanel.runModal() == .OK, let outputURL = savePanel.url else { return }
+
+                        let result = PandocHelper.convertURL(urlString, output: outputURL)
+                        if result.success {
+                            activeModel?.load(from: outputURL)
+                        } else {
+                            let err = NSAlert()
+                            err.messageText = "Import Failed"
+                            err.informativeText = result.error
+                            err.runModal()
+                        }
+                    }
+
+                    Divider()
+
                     ForEach(PandocHelper.importFormats, id: \.label) { fmt in
                         Button("From \(fmt.label)\u{2026}") {
                             guard PandocHelper.pandocPath() != nil else {
