@@ -117,6 +117,121 @@ private func findEditorTextViewIn(_ view: NSView?) -> NSTextView? {
     return nil
 }
 
+// MARK: - Pandoc Integration
+
+enum PandocHelper {
+    /// Pandoc export formats: (menu label, pandoc format name, file extension)
+    static let exportFormats: [(label: String, format: String, ext: String)] = [
+        ("Word (DOCX)", "docx", "docx"),
+        ("EPUB", "epub", "epub"),
+        ("LaTeX", "latex", "tex"),
+        ("reStructuredText", "rst", "rst"),
+        ("OpenDocument (ODT)", "odt", "odt"),
+        ("Rich Text (RTF)", "rtf", "rtf"),
+        ("Plain Text", "plain", "txt"),
+        ("AsciiDoc", "asciidoc", "adoc"),
+        ("MediaWiki", "mediawiki", "wiki"),
+        ("Org-mode", "org", "org"),
+        ("Textile", "textile", "textile"),
+        ("Man Page", "man", "1"),
+        ("Typst", "typst", "typ"),
+    ]
+
+    /// Pandoc import formats: (menu label, file extensions for open panel)
+    static let importFormats: [(label: String, extensions: [String])] = [
+        ("Word (DOCX)", ["docx"]),
+        ("EPUB", ["epub"]),
+        ("LaTeX", ["tex", "latex"]),
+        ("reStructuredText", ["rst"]),
+        ("OpenDocument (ODT)", ["odt"]),
+        ("Rich Text (RTF)", ["rtf"]),
+        ("HTML", ["html", "htm"]),
+        ("MediaWiki", ["wiki"]),
+        ("Org-mode", ["org"]),
+        ("Textile", ["textile"]),
+        ("OPML", ["opml"]),
+        ("DocBook", ["xml", "dbk"]),
+        ("Typst", ["typ"]),
+    ]
+
+    static func pandocPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/pandoc",
+            "/usr/local/bin/pandoc",
+            "/usr/bin/pandoc",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        // Try `which pandoc` as fallback
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        proc.arguments = ["pandoc"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return path.isEmpty ? nil : path
+    }
+
+    static func showInstallAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Pandoc Not Found"
+        alert.informativeText = """
+        Pandoc is required for format conversion. Install it with Homebrew:
+
+            brew install pandoc
+
+        Or download from: https://pandoc.org/installing.html
+        """
+        alert.addButton(withTitle: "Copy Install Command")
+        alert.addButton(withTitle: "Open Download Page")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew install pandoc", forType: .string)
+        } else if response == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(URL(string: "https://pandoc.org/installing.html")!)
+        }
+    }
+
+    /// Run pandoc to convert `input` to `output` with the given format.
+    @discardableResult
+    static func convert(input: URL, output: URL, to format: String? = nil, from inputFormat: String? = nil) -> (success: Bool, error: String) {
+        guard let pandoc = pandocPath() else {
+            return (false, "Pandoc not found")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pandoc)
+        var args = [input.path, "-o", output.path, "--standalone"]
+        if let format = format { args += ["-t", format] }
+        if let inputFormat = inputFormat { args += ["-f", inputFormat] }
+        proc.arguments = args
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        proc.standardOutput = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let errStr = String(data: errData, encoding: .utf8) ?? ""
+            if proc.terminationStatus == 0 {
+                return (true, "")
+            } else {
+                return (false, errStr.isEmpty ? "Pandoc exited with code \(proc.terminationStatus)" : errStr)
+            }
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+}
+
 @main
 struct QuickMDApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -248,6 +363,66 @@ struct QuickMDApp: App {
                     }
                 }
                 .keyboardShortcut("h", modifiers: [.command, .shift])
+
+                Divider()
+
+                Menu("Export with Pandoc") {
+                    ForEach(PandocHelper.exportFormats, id: \.format) { fmt in
+                        Button(fmt.label) {
+                            guard let model = activeModel, let inputURL = model.currentURL else { return }
+                            guard PandocHelper.pandocPath() != nil else {
+                                PandocHelper.showInstallAlert()
+                                return
+                            }
+                            let panel = NSSavePanel()
+                            if let uttype = UTType(filenameExtension: fmt.ext) {
+                                panel.allowedContentTypes = [uttype]
+                            }
+                            let baseName = inputURL.deletingPathExtension().lastPathComponent
+                            panel.nameFieldStringValue = "\(baseName).\(fmt.ext)"
+                            if panel.runModal() == .OK, let outputURL = panel.url {
+                                let result = PandocHelper.convert(input: inputURL, output: outputURL, to: fmt.format)
+                                if !result.success {
+                                    let alert = NSAlert()
+                                    alert.messageText = "Export Failed"
+                                    alert.informativeText = result.error
+                                    alert.runModal()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Menu("Import to Markdown") {
+                    ForEach(PandocHelper.importFormats, id: \.label) { fmt in
+                        Button("From \(fmt.label)\u{2026}") {
+                            guard PandocHelper.pandocPath() != nil else {
+                                PandocHelper.showInstallAlert()
+                                return
+                            }
+                            let openPanel = NSOpenPanel()
+                            openPanel.allowedContentTypes = fmt.extensions.compactMap { UTType(filenameExtension: $0) }
+                            openPanel.allowsMultipleSelection = false
+                            guard openPanel.runModal() == .OK, let inputURL = openPanel.url else { return }
+
+                            let baseName = inputURL.deletingPathExtension().lastPathComponent
+                            let savePanel = NSSavePanel()
+                            savePanel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+                            savePanel.nameFieldStringValue = "\(baseName).md"
+                            guard savePanel.runModal() == .OK, let outputURL = savePanel.url else { return }
+
+                            let result = PandocHelper.convert(input: inputURL, output: outputURL, to: "markdown")
+                            if result.success {
+                                activeModel?.load(from: outputURL)
+                            } else {
+                                let alert = NSAlert()
+                                alert.messageText = "Import Failed"
+                                alert.informativeText = result.error
+                                alert.runModal()
+                            }
+                        }
+                    }
+                }
             }
             CommandMenu("Theme") {
                 Button("System (Default)") {
