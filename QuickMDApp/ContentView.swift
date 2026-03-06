@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
+import CodeEditorView
 
 // MARK: - FocusedValue for active document model
 
@@ -8,10 +9,18 @@ private struct FocusedModelKey: FocusedValueKey {
     typealias Value = MarkdownDocumentModel
 }
 
+private struct FocusedShowEditorKey: FocusedValueKey {
+    typealias Value = Binding<Bool>
+}
+
 extension FocusedValues {
     var documentModel: MarkdownDocumentModel? {
         get { self[FocusedModelKey.self] }
         set { self[FocusedModelKey.self] = newValue }
+    }
+    var showEditor: Binding<Bool>? {
+        get { self[FocusedShowEditorKey.self] }
+        set { self[FocusedShowEditorKey.self] = newValue }
     }
 }
 
@@ -50,6 +59,12 @@ class ZoomableWebView: WKWebView {
 class WebViewStore: ObservableObject {
     static let shared = WebViewStore()
     weak var webView: ZoomableWebView?
+    /// Set to true to suppress editor→renderer scroll sync (when renderer is driving)
+    var suppressEditorToRenderer = false
+    /// Last known editor scroll fraction (0…1), updated on every editor scroll
+    var lastEditorFraction: CGFloat = 0
+    /// True when an HTML reload is triggered by editor typing (not navigation)
+    var isEditReload = false
 }
 
 struct WebView: NSViewRepresentable {
@@ -57,9 +72,228 @@ struct WebView: NSViewRepresentable {
     let baseURL: URL?
     let theme: String
 
-    class Coordinator {
+    class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var lastHTML: String?
         var lastTheme: String?
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any] else { return }
+
+            switch message.name {
+            case "checkboxToggle":
+                guard let index = body["index"] as? Int,
+                      let checked = body["checked"] as? Bool,
+                      let model = AppDelegate.activeModel else { return }
+                let updated = MarkdownDocumentModel.toggleCheckbox(at: index, checked: checked, in: model.rawContent)
+                model.rawContent = updated
+                if let url = model.currentURL {
+                    try? updated.write(to: url, atomically: true, encoding: .utf8)
+                }
+
+            case "editorSync":
+                guard let type = body["type"] as? String else { return }
+                if type == "scroll" {
+                    // Suppress renderer→editor sync during edit-driven reloads
+                    guard !WebViewStore.shared.isEditReload,
+                          let fraction = body["fraction"] as? Double else { return }
+                    scrollEditorToFraction(CGFloat(fraction))
+                } else if type == "dblclick" {
+                    guard let word = body["word"] as? String else { return }
+                    let before = body["before"] as? String ?? ""
+                    let after = body["after"] as? String ?? ""
+                    let fraction = body["fraction"] as? Double ?? 0
+                    jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+                }
+
+            default:
+                break
+            }
+        }
+
+        // MARK: - Renderer → Editor scroll sync
+
+        private func scrollEditorToFraction(_ fraction: CGFloat) {
+            guard let textView = findEditorTextView(),
+                  let scrollView = textView.enclosingScrollView else { return }
+            let contentHeight = scrollView.documentView?.frame.height ?? 0
+            let viewportHeight = scrollView.contentView.bounds.height
+            let maxScroll = contentHeight - viewportHeight
+            guard maxScroll > 0 else { return }
+            // Suppress editor→renderer sync while we're driving from renderer
+            WebViewStore.shared.suppressEditorToRenderer = true
+            let targetY = fraction * maxScroll
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                WebViewStore.shared.suppressEditorToRenderer = false
+            }
+        }
+
+        // MARK: - Double-click → jump to word in editor
+
+        private func jumpEditorToWord(_ word: String, before: String, after: String, fraction: Double) {
+            guard let model = AppDelegate.activeModel,
+                  let textView = findEditorTextView() else { return }
+            let source = model.rawContent
+            let nsSource = source as NSString
+
+            // Find all occurrences of the word in source
+            var occurrences: [NSRange] = []
+            var searchStart = 0
+            while searchStart < nsSource.length {
+                let range = nsSource.range(of: word, options: [.caseInsensitive],
+                                           range: NSRange(location: searchStart, length: nsSource.length - searchStart))
+                if range.location == NSNotFound { break }
+                occurrences.append(range)
+                searchStart = range.location + range.length
+            }
+
+            guard !occurrences.isEmpty else { return }
+
+            // Use document position fraction as primary locator:
+            // estimate where in the source this word should be
+            let targetPos = fraction * Double(max(1, nsSource.length))
+
+            // Find the occurrence closest to the estimated source position
+            var bestRange = occurrences[0]
+            var bestDistance = abs(Double(bestRange.location) - targetPos)
+
+            if occurrences.count > 1 {
+                let beforeWords = before.split(separator: " ").map { $0.lowercased() }
+                let afterWords = after.split(separator: " ").map { $0.lowercased() }
+
+                for occ in occurrences {
+                    let distance = abs(Double(occ.location) - targetPos)
+
+                    if distance < bestDistance - Double(nsSource.length) * 0.02 {
+                        // Clearly closer — use it
+                        bestDistance = distance
+                        bestRange = occ
+                    } else if abs(distance - bestDistance) <= Double(nsSource.length) * 0.02 {
+                        // Similar distance — use context words as tiebreaker
+                        let occScore = contextScore(for: occ, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
+                        let bestScore = contextScore(for: bestRange, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
+                        if occScore > bestScore || (occScore == bestScore && distance < bestDistance) {
+                            bestDistance = distance
+                            bestRange = occ
+                        }
+                    }
+                }
+            }
+
+            textView.window?.makeFirstResponder(textView)
+            textView.setSelectedRange(bestRange)
+            textView.scrollRangeToVisible(bestRange)
+            textView.showFindIndicator(for: bestRange)
+        }
+
+        private func contextScore(for range: NSRange, in source: NSString, beforeWords: [String], afterWords: [String]) -> Int {
+            let ctxStart = max(0, range.location - 200)
+            let ctxEnd = min(source.length, range.location + range.length + 200)
+            let ctx = source.substring(with: NSRange(location: ctxStart, length: ctxEnd - ctxStart)).lowercased()
+            var score = 0
+            for w in beforeWords where ctx.contains(w) { score += 1 }
+            for w in afterWords where ctx.contains(w) { score += 1 }
+            return score
+        }
+
+        private func findEditorTextView() -> NSTextView? {
+            // Try key window first, then main window, then all visible windows
+            let candidates = [NSApp.keyWindow, NSApp.mainWindow].compactMap { $0 }
+                + NSApp.windows.filter { $0.isVisible }
+            for window in candidates {
+                if let tv = findTextViewIn(window.contentView) {
+                    return tv
+                }
+            }
+            return nil
+        }
+
+        private func findTextViewIn(_ view: NSView?) -> NSTextView? {
+            guard let view = view else { return nil }
+            if let tv = view as? NSTextView, tv.isEditable { return tv }
+            for sub in view.subviews {
+                if let found = findTextViewIn(sub) { return found }
+            }
+            return nil
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            // Allow initial page load and fragment (anchor) navigation
+            if navigationAction.navigationType == .other {
+                decisionHandler(.allow)
+                return
+            }
+
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            // Allow fragment-only navigation (anchor links within the page)
+            if url.fragment != nil && url.path == (webView.url?.path ?? "") {
+                decisionHandler(.allow)
+                return
+            }
+
+            // For file URLs, open within the app
+            if url.isFileURL {
+                let standardized = url.standardizedFileURL
+
+                // Check if already open in an existing tab/window
+                for window in NSApp.windows {
+                    if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+                        window.makeKeyAndOrderFront(nil)
+                        if let tabGroup = window.tabGroup {
+                            tabGroup.selectedWindow = window
+                        }
+                        decisionHandler(.cancel)
+                        return
+                    }
+                }
+
+                // Gain sandbox access via bookmarked parent directory
+                let dirURL = MarkdownDocumentModel.accessDirectoryForFile(url)
+                let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+
+                if openInNewTab {
+                    // Keep directory scope alive until the new tab loads
+                    AppDelegate.pendingDirAccess = dirURL
+                    AppDelegate.pendingURL = url
+                    NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
+                } else {
+                    if let model = AppDelegate.activeModel {
+                        model.navigateTo(url)
+                    }
+                    if let dirURL { dirURL.stopAccessingSecurityScopedResource() }
+                }
+
+                decisionHandler(.cancel)
+                return
+            }
+
+            // Open web URLs in the default browser
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard WebViewStore.shared.isEditReload else { return }
+            // Restore scroll position to match the editor after an edit-driven reload
+            let fraction = WebViewStore.shared.lastEditorFraction
+            let js = """
+            (function() {
+                if (window.__editorSyncPause) __editorSyncPause();
+                if (window.__setScrollFraction) __setScrollFraction(\(fraction));
+                setTimeout(function() { if (window.__editorSyncResume) __editorSyncResume(); }, 200);
+            })();
+            """
+            webView.evaluateJavaScript(js) { _, _ in
+                DispatchQueue.main.async {
+                    WebViewStore.shared.isEditReload = false
+                }
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -190,7 +424,58 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
 
+        // 16. Emoji shortcodes (before highlight)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.emojiScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 17. Footnotes
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.footnotesScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 18. Frontmatter
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.frontmatterScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 19. Word wrap toggle
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.wordWrapScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 20. Anchor links (after TOC assigns IDs)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.anchorLinksScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 21. Presentation mode
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.presentationScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 22. Checkbox toggle (enables clicking checkboxes to modify source)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.checkboxToggleScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+        config.userContentController.add(context.coordinator, name: "checkboxToggle")
+
+        // 23. Editor sync (scroll + double-click to jump)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.editorSyncScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+        config.userContentController.add(context.coordinator, name: "editorSync")
+
         let view = ZoomableWebView(frame: .zero, configuration: config)
+        view.navigationDelegate = context.coordinator
         context.coordinator.lastHTML = html
         context.coordinator.lastTheme = theme
         view.loadHTMLString(html, baseURL: baseURL)
@@ -250,12 +535,68 @@ struct WebView: NSViewRepresentable {
 struct ContentView: View {
     @StateObject private var model = MarkdownDocumentModel()
     @AppStorage("theme") var theme = "system"
+    @State private var showEditor = false
+    @State private var editorPosition = CodeEditor.Position()
+    @State private var editorDebounceTask: Task<Void, Never>?
+    @State private var scrollSyncTask: Task<Void, Never>?
 
     var body: some View {
         Group {
             if let html = model.html {
-                WebView(html: html, baseURL: model.baseURL, theme: theme)
+                if showEditor {
+                    HSplitView {
+                        WebView(html: html, baseURL: model.baseURL, theme: theme)
+                            .frame(minWidth: 200)
+                        MarkdownEditorView(text: $model.rawContent, position: $editorPosition, onScrollFractionChange: { fraction in
+                            // Always track the editor's scroll position
+                            WebViewStore.shared.lastEditorFraction = fraction
+                            // Skip if renderer is driving the scroll
+                            guard !WebViewStore.shared.suppressEditorToRenderer else { return }
+                            scrollSyncTask?.cancel()
+                            scrollSyncTask = Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms debounce
+                                guard !Task.isCancelled else { return }
+                                guard let webView = WebViewStore.shared.webView else { return }
+                                // Pause renderer→editor sync to prevent feedback loop
+                                webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
+                                webView.evaluateJavaScript(
+                                    "if(window.__setScrollFraction) __setScrollFraction(\(fraction));"
+                                ) { _, _ in
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                        webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
+                                    }
+                                }
+                            }
+                        })
+                            .frame(minWidth: 200)
+                    }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onChange(of: model.rawContent) { newValue in
+                        // Debounce re-render since CodeEditorView fires on every keystroke
+                        editorDebounceTask?.cancel()
+                        editorDebounceTask = Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
+                            guard !Task.isCancelled else { return }
+                            if let url = model.currentURL {
+                                let ext = url.pathExtension.lowercased()
+                                if ["md", "markdown", "mdown", "mkd"].contains(ext) {
+                                    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
+                                    try? newValue.write(to: tempURL, atomically: true, encoding: .utf8)
+                                    let result = try? MarkdownDocumentModel.htmlBodyPublic(for: tempURL)
+                                    if let r = result {
+                                        // Flag as edit-driven so didFinish restores scroll position
+                                        WebViewStore.shared.isEditReload = true
+                                        model.html = MarkdownDocumentModel.wrapHTMLPublic(r.html, isMarkdown: r.isMarkdown)
+                                    }
+                                    try? FileManager.default.removeItem(at: tempURL)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    WebView(html: html, baseURL: model.baseURL, theme: theme)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("QuickLook Markdown")
@@ -274,7 +615,23 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
+        .toolbar {
+            ToolbarItemGroup(placement: .navigation) {
+                Button(action: { model.goBack() }) {
+                    Image(systemName: "chevron.left")
+                }
+                .disabled(!model.canGoBack)
+                .help("Back (⌘[)")
+
+                Button(action: { model.goForward() }) {
+                    Image(systemName: "chevron.right")
+                }
+                .disabled(!model.canGoForward)
+                .help("Forward (⌘])")
+            }
+        }
         .focusedValue(\.documentModel, model)
+        .focusedSceneValue(\.showEditor, $showEditor)
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
@@ -298,6 +655,22 @@ struct ContentView: View {
                 MarkdownDocumentModel.log("onAppear: loading pendingURL \(url.path)")
                 model.load(from: url)
                 AppDelegate.pendingURL = nil
+                // Release directory security scope after load completes
+                if let dirURL = AppDelegate.pendingDirAccess {
+                    dirURL.stopAccessingSecurityScopedResource()
+                    AppDelegate.pendingDirAccess = nil
+                }
+            } else {
+                // Close this empty window/tab if other windows already have content
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    guard model.html == nil else { return }
+                    let contentWindows = NSApp.windows.filter { $0.isVisible && !$0.isSheet && $0.tabbingIdentifier != "" }
+                    if contentWindows.count > 1 {
+                        if let window = NSApp.keyWindow ?? contentWindows.last {
+                            window.close()
+                        }
+                    }
+                }
             }
         }
         .task {
@@ -310,6 +683,10 @@ struct ContentView: View {
                     MarkdownDocumentModel.log("cold-start retry after \(delay)s: \(url.path)")
                     model.load(from: url)
                     AppDelegate.pendingURL = nil
+                    if let dirURL = AppDelegate.pendingDirAccess {
+                        dirURL.stopAccessingSecurityScopedResource()
+                        AppDelegate.pendingDirAccess = nil
+                    }
                 }
             }
         }
@@ -317,8 +694,10 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 if let window = NSApp.keyWindow ?? NSApp.mainWindow {
                     window.title = model.fileName ?? "QuickMD"
+                    window.representedURL = model.currentURL
                 }
             }
         }
     }
+
 }
