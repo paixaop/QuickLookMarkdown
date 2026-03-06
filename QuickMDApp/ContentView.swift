@@ -727,7 +727,7 @@ struct ContentView: View {
                                     }
                                 }
                             }
-                        })
+                        }, currentFileURL: { model.currentURL })
                             .frame(minWidth: 200)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

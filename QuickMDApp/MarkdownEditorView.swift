@@ -308,6 +308,97 @@ final class AutoPairHandler: ObservableObject {
     deinit { uninstall() }
 }
 
+// MARK: - Image Paste Handler
+
+/// Handles Cmd+V image paste: saves PNG to images/ subdir next to the .md file and inserts markdown link.
+final class ImagePasteHandler: ObservableObject {
+    private var monitor: Any?
+    var currentFileURL: (() -> URL?)?
+
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers == "v" else { return event }
+            return self.handlePaste(event)
+        }
+    }
+
+    func uninstall() {
+        if let monitor = monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+
+    private func handlePaste(_ event: NSEvent) -> NSEvent? {
+        let pasteboard = NSPasteboard.general
+        guard let window = NSApp.keyWindow,
+              let textView = findEditorTextViewInView(window.contentView) else { return event }
+
+        // Check for image data on pasteboard
+        var imageData: Data?
+
+        if let data = pasteboard.data(forType: .png) {
+            imageData = data
+        } else if let data = pasteboard.data(forType: .tiff),
+                  let image = NSImage(data: data),
+                  let tiffRep = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiffRep),
+                  let png = bitmap.representation(using: .png, properties: [:]) {
+            imageData = png
+        } else if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            // Check if any URL is an image file
+            let imageExts = Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"])
+            if let imageURL = urls.first(where: { imageExts.contains($0.pathExtension.lowercased()) }) {
+                if let data = try? Data(contentsOf: imageURL),
+                   let image = NSImage(data: data),
+                   let tiffRep = image.tiffRepresentation,
+                   let bitmap = NSBitmapImageRep(data: tiffRep),
+                   let png = bitmap.representation(using: .png, properties: [:]) {
+                    imageData = png
+                }
+            }
+        }
+
+        guard let pngData = imageData else { return event } // Not an image, let normal paste handle it
+
+        guard let fileURL = currentFileURL?() else {
+            let alert = NSAlert()
+            alert.messageText = "Save file first"
+            alert.informativeText = "Please save the markdown file before pasting images."
+            alert.runModal()
+            return nil
+        }
+
+        // Create images/ subdirectory
+        let imagesDir = fileURL.deletingLastPathComponent().appendingPathComponent("images")
+        try? FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+
+        // Generate filename
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let filename = "image-\(formatter.string(from: Date())).png"
+        let imageURL = imagesDir.appendingPathComponent(filename)
+
+        do {
+            try pngData.write(to: imageURL)
+            let markdown = "![](images/\(filename))"
+            textView.insertText(markdown, replacementRange: textView.selectedRange())
+            return nil
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Failed to save image"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+            return nil
+        }
+    }
+
+    deinit { uninstall() }
+}
+
 // MARK: - Editor Status Bar
 
 struct EditorStatusBar: View {
@@ -361,9 +452,11 @@ struct MarkdownEditorView: View {
     @Binding var text: String
     @Binding var position: CodeEditor.Position
     var onScrollFractionChange: ((CGFloat) -> Void)?
+    var currentFileURL: (() -> URL?)?
     @State private var messages: Set<TextLocated<Message>> = []
     @Environment(\.colorScheme) private var colorScheme
     @StateObject private var autoPairHandler = AutoPairHandler()
+    @StateObject private var imagePasteHandler = ImagePasteHandler()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -383,6 +476,8 @@ struct MarkdownEditorView: View {
             .onAppear {
                 EditorFontManager.shared.applyToEditorDeferred()
                 autoPairHandler.install()
+                imagePasteHandler.currentFileURL = currentFileURL
+                imagePasteHandler.install()
                 // Apply spell check setting when editor appears
                 let spellCheck = UserDefaults.standard.bool(forKey: "spellCheck")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -393,6 +488,7 @@ struct MarkdownEditorView: View {
             }
             .onDisappear {
                 autoPairHandler.uninstall()
+                imagePasteHandler.uninstall()
             }
             EditorStatusBar(position: position, text: text)
         }
