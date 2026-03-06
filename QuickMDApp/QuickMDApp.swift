@@ -227,6 +227,26 @@ struct QuickMDApp: App {
                     }
                 }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
+
+                Button("Export as HTML\u{2026}") {
+                    guard let model = activeModel, let htmlContent = model.html else { return }
+                    let panel = NSSavePanel()
+                    panel.allowedContentTypes = [.html]
+                    let baseName = model.fileName ?? "document"
+                    let ext = URL(fileURLWithPath: baseName).pathExtension
+                    panel.nameFieldStringValue = ext.isEmpty ? baseName + ".html" : baseName.replacingOccurrences(of: ".\(ext)", with: ".html")
+                    if panel.runModal() == .OK, let url = panel.url {
+                        do {
+                            try htmlContent.write(to: url, atomically: true, encoding: .utf8)
+                        } catch {
+                            let alert = NSAlert()
+                            alert.messageText = "Failed to save HTML"
+                            alert.informativeText = error.localizedDescription
+                            alert.runModal()
+                        }
+                    }
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
             }
             CommandMenu("Theme") {
                 Button("System (Default)") {
