@@ -201,31 +201,131 @@ enum PandocHelper {
         }
     }
 
-    /// Run pandoc to convert a web URL to markdown.
+    /// Convert a web URL to markdown: let pandoc fetch the URL, then clean the resulting markdown.
     @discardableResult
     static func convertURL(_ urlString: String, output: URL) -> (success: Bool, error: String) {
         guard let pandoc = pandocPath() else {
             return (false, "Pandoc not found")
         }
+        guard URL(string: urlString) != nil else {
+            return (false, "Invalid URL")
+        }
+
+        // 1. Let pandoc fetch and convert (it handles JS-rendered pages better than URLSession)
+        let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".md")
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pandoc)
-        proc.arguments = ["-f", "html", "-t", "markdown", "--standalone", urlString, "-o", output.path]
+        proc.arguments = [
+            "-f", "html-native_divs-native_spans",
+            "-t", "gfm-raw_html",
+            "--wrap=none",
+            urlString,
+            "-o", tempFile.path
+        ]
         let errPipe = Pipe()
         proc.standardError = errPipe
         proc.standardOutput = Pipe()
         do {
             try proc.run()
             proc.waitUntilExit()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            let errStr = String(data: errData, encoding: .utf8) ?? ""
-            if proc.terminationStatus == 0 {
-                return (true, "")
-            } else {
-                return (false, errStr.isEmpty ? "Pandoc exited with code \(proc.terminationStatus)" : errStr)
-            }
         } catch {
             return (false, error.localizedDescription)
         }
+
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let errStr = String(data: errData, encoding: .utf8) ?? ""
+        guard proc.terminationStatus == 0 else {
+            return (false, errStr.isEmpty ? "Pandoc exited with code \(proc.terminationStatus)" : errStr)
+        }
+
+        // 2. Read the raw markdown and clean it
+        guard var markdown = try? String(contentsOf: tempFile, encoding: .utf8) else {
+            return (false, "Failed to read pandoc output")
+        }
+
+        markdown = cleanMarkdown(markdown)
+
+        // 3. Write cleaned markdown to final output
+        do {
+            try markdown.write(to: output, atomically: true, encoding: .utf8)
+            return (true, "")
+        } catch {
+            return (false, "Failed to write output: \(error.localizedDescription)")
+        }
+    }
+
+    /// Clean pandoc-generated markdown by removing noise artifacts.
+    private static func cleanMarkdown(_ md: String) -> String {
+        var lines = md.components(separatedBy: "\n")
+
+        // Remove lines that look like CSS class dumps: {.class-name .another-class}
+        lines = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("{.") && trimmed.hasSuffix("}") && !trimmed.contains("](") { return false }
+            if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+                let inner = trimmed.dropFirst().dropLast()
+                let tokens = inner.split(separator: " ")
+                let cssLike = tokens.filter { $0.hasPrefix(".") || $0.hasPrefix("#") || $0.contains(":") }
+                if tokens.count > 2 && cssLike.count > tokens.count / 2 { return false }
+            }
+            return true
+        }
+
+        var result = lines.joined(separator: "\n")
+
+        // Remove inline bracketed class/id attributes: {.class-name ...} or {#id}
+        if let bracketAttrs = try? NSRegularExpression(pattern: #"\{[.#][^}]*\}"#, options: []) {
+            result = bracketAttrs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove images with data: URIs (base64 SVG icons, etc.)
+        if let dataImgs = try? NSRegularExpression(pattern: #"!\[[^\]]*\]\(data:[^)]+\)"#, options: []) {
+            result = dataImgs.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove ::: div markers (pandoc fenced divs)
+        if let divMarkers = try? NSRegularExpression(pattern: #"^:{3,}.*$"#, options: [.anchorsMatchLines]) {
+            result = divMarkers.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove empty anchor links like [​](#some-id) (zero-width space + fragment link)
+        if let emptyAnchors = try? NSRegularExpression(pattern: #"\[[\u{200B}\s]*\]\(#[^)]*\)"#, options: []) {
+            result = emptyAnchors.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove "Copy page" / "Copy" standalone lines (common in documentation sites)
+        if let copyLines = try? NSRegularExpression(pattern: #"^Copy( page)?$"#, options: [.anchorsMatchLines]) {
+            result = copyLines.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+
+        // Remove common page feedback/navigation noise at end
+        let noisePatterns = [
+            #"^Was this page helpful\?.*$"#,
+            #"^(Yes|No)$"#,
+            #"^(Previous|Next)$"#,
+            #"^Skip to main content$"#,
+            #"^Search\.{3}$"#,
+            #"^Navigation$"#,
+        ]
+        for pattern in noisePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) {
+                result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+            }
+        }
+
+        // Try to find and keep content from first heading onward (skip nav/sidebar preamble)
+        if let firstHeading = result.range(of: #"^#{1,6}\s"#, options: .regularExpression) {
+            result = String(result[firstHeading.lowerBound...])
+        }
+
+        // Collapse 3+ consecutive blank lines to 2
+        if let multiBlank = try? NSRegularExpression(pattern: #"\n{4,}"#, options: []) {
+            result = multiBlank.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "\n\n\n")
+        }
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Run pandoc to convert `input` to `output` with the given format.
