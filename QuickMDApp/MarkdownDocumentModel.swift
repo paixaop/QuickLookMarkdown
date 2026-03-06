@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Markdown
 import os
@@ -9,6 +10,49 @@ final class MarkdownDocumentModel: ObservableObject {
     @Published var baseURL: URL?
     @Published var fileName: String?
     @Published var errorMessage: String?
+
+    // MARK: - Directory Sandbox Bookmarks
+
+    /// Bookmarks for directories the user has granted access to (via opening files).
+    /// Keyed by standardized directory path.
+    private static var directoryBookmarks: [String: Data] = [:]
+
+    /// Save a security-scoped bookmark for the parent directory of a file URL.
+    static func bookmarkParentDirectory(of url: URL) {
+        let dir = url.deletingLastPathComponent()
+        let key = dir.standardizedFileURL.path
+        guard directoryBookmarks[key] == nil else { return }
+        do {
+            let bookmark = try dir.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            directoryBookmarks[key] = bookmark
+            log("Bookmarked directory: \(key)")
+        } catch {
+            log("Failed to bookmark directory \(key): \(error)")
+        }
+    }
+
+    /// Attempt to gain sandbox access to a file URL by resolving a bookmark for its parent directory.
+    /// Returns true if access was granted (caller must call `stopAccessingSecurityScopedResource()` on the returned URL).
+    @discardableResult
+    static func accessDirectoryForFile(_ url: URL) -> URL? {
+        let dir = url.deletingLastPathComponent()
+        let key = dir.standardizedFileURL.path
+        guard let bookmark = directoryBookmarks[key] else { return nil }
+        var isStale = false
+        do {
+            let resolved = try URL(resolvingBookmarkData: bookmark, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
+            if isStale {
+                directoryBookmarks.removeValue(forKey: key)
+                return nil
+            }
+            if resolved.startAccessingSecurityScopedResource() {
+                return resolved
+            }
+        } catch {
+            log("Failed to resolve bookmark for \(key): \(error)")
+        }
+        return nil
+    }
 
     static let logFileURL: URL = {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("QuickMD.log")
@@ -54,12 +98,58 @@ final class MarkdownDocumentModel: ObservableObject {
         "dot": "dot", "gv": "graphviz",
     ]
 
+    private static func readFileContent(from url: URL) throws -> String {
+        // Try UTF-8 first
+        if let content = try? String(contentsOf: url, encoding: .utf8) {
+            return content
+        }
+        // Auto-detect encoding
+        let data = try Data(contentsOf: url)
+        // Try common encodings
+        let encodings: [String.Encoding] = [.utf16, .isoLatin1, .windowsCP1252, .macOSRoman]
+        for encoding in encodings {
+            if let content = String(data: data, encoding: encoding) {
+                return content
+            }
+        }
+        throw NSError(domain: "QuickMD", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to detect file encoding"])
+    }
+
+    private static func stripFrontmatter(_ content: String) -> (body: String, frontmatter: String?) {
+        guard content.hasPrefix("---\n") || content.hasPrefix("---\r\n") else {
+            return (content, nil)
+        }
+        let lines = content.components(separatedBy: "\n")
+        var endIndex: Int?
+        for i in 1..<lines.count {
+            if lines[i].trimmingCharacters(in: .whitespaces) == "---" {
+                endIndex = i
+                break
+            }
+        }
+        guard let end = endIndex else { return (content, nil) }
+        let yamlLines = lines[1..<end]
+        let yaml = yamlLines.joined(separator: "\n")
+        let bodyLines = lines[(end + 1)...]
+        let body = bodyLines.joined(separator: "\n")
+        return (body, yaml)
+    }
+
     private static func htmlBody(for url: URL) throws -> (html: String, isMarkdown: Bool) {
-        let content = try String(contentsOf: url, encoding: .utf8)
+        let content = try readFileContent(from: url)
         let ext = url.pathExtension.lowercased()
 
         if markdownExtensions.contains(ext) {
-            return (HTMLFormatter.format(content), true)
+            let (body, frontmatter) = stripFrontmatter(content)
+            var html = HTMLFormatter.format(body)
+            if let fm = frontmatter {
+                let escaped = fm
+                    .replacingOccurrences(of: "&", with: "&amp;")
+                    .replacingOccurrences(of: "<", with: "&lt;")
+                    .replacingOccurrences(of: ">", with: "&gt;")
+                html = "<div id=\"frontmatter-data\" style=\"display:none\">\(escaped)</div>\n" + html
+            }
+            return (html, true)
         }
 
         let lang = extensionToLanguage[ext] ?? ""
@@ -71,21 +161,77 @@ final class MarkdownDocumentModel: ObservableObject {
         return ("<pre><code\(langClass)>\(escaped)</code></pre>", false)
     }
 
+    @Published var currentURL: URL?
+    @Published var rawContent: String = ""
+    @Published var autoReload = false
+    private var fileWatcherSource: DispatchSourceFileSystemObject?
+
+    // MARK: - Navigation History
+
+    @Published var backStack: [URL] = []
+    @Published var forwardStack: [URL] = []
+    private var isNavigating = false
+
+    var canGoBack: Bool { !backStack.isEmpty }
+    var canGoForward: Bool { !forwardStack.isEmpty }
+
+    /// Navigate to a URL via link click — pushes current URL onto back stack.
+    func navigateTo(_ url: URL) {
+        if let current = currentURL {
+            backStack.append(current)
+            forwardStack.removeAll()
+        }
+        isNavigating = true
+        load(from: url)
+        isNavigating = false
+    }
+
+    func goBack() {
+        guard let prev = backStack.popLast() else { return }
+        if let current = currentURL {
+            forwardStack.append(current)
+        }
+        isNavigating = true
+        load(from: prev)
+        isNavigating = false
+    }
+
+    func goForward() {
+        guard let next = forwardStack.popLast() else { return }
+        if let current = currentURL {
+            backStack.append(current)
+        }
+        isNavigating = true
+        load(from: next)
+        isNavigating = false
+    }
+
     func load(from url: URL) {
         Self.log("load(from: \(url.path))")
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
         do {
-            let content = try String(contentsOf: url, encoding: .utf8)
-            Self.log("Read \(content.count) chars from file")
             let result = try Self.htmlBody(for: url)
+            let content = try Self.readFileContent(from: url)
+            Self.log("Read \(content.count) chars from file")
             Self.log("Produced \(result.html.count) chars of HTML")
+            rawContent = content
             html = Self.wrapHTML(result.html, isMarkdown: result.isMarkdown)
             Self.log("Wrapped HTML total: \(html?.count ?? 0) chars")
             baseURL = url.deletingLastPathComponent()
             fileName = url.lastPathComponent
+            currentURL = url
             errorMessage = nil
             Self.log("Model updated successfully, fileName=\(url.lastPathComponent)")
+
+            // Note recent document
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+
+            // Bookmark parent directory for sandbox access to sibling files
+            Self.bookmarkParentDirectory(of: url)
+
+            // Auto-reload by default
+            startWatching(url: url)
         } catch {
             Self.log("ERROR: \(error.localizedDescription)")
             html = nil
@@ -93,6 +239,36 @@ final class MarkdownDocumentModel: ObservableObject {
             fileName = url.lastPathComponent
             errorMessage = "Could not render \(url.lastPathComponent): \(error.localizedDescription)"
         }
+    }
+
+    // MARK: - Live Reload
+
+    func startWatching(url: URL) {
+        stopWatching()
+        guard let fileDescriptor = open(url.path, O_EVTONLY) as Int32?,
+              fileDescriptor != -1 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: [.write, .rename],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self?.load(from: url)
+            }
+        }
+        source.setCancelHandler {
+            close(fileDescriptor)
+        }
+        source.resume()
+        fileWatcherSource = source
+        autoReload = true
+    }
+
+    func stopWatching() {
+        fileWatcherSource?.cancel()
+        fileWatcherSource = nil
+        autoReload = false
     }
 
     static let mermaidJS: String = {
@@ -791,6 +967,513 @@ final class MarkdownDocumentModel: ObservableObject {
     })();
     """
 
+    // MARK: - Custom CSS Themes
+
+    static let themesDirectory: URL = {
+        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("QuickMD/themes")
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+
+    static func availableThemes() -> [String] {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: themesDirectory.path) else { return [] }
+        return files.filter { $0.hasSuffix(".css") }.map { String($0.dropLast(4)) }.sorted()
+    }
+
+    static func customCSS(for theme: String) -> String {
+        let url = themesDirectory.appendingPathComponent("\(theme).css")
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    // MARK: - Word Wrap Toggle
+
+    static let wordWrapScript = """
+    (function() {
+      var wrapped = false;
+      function toggle() {
+        wrapped = !wrapped;
+        document.querySelectorAll('pre').forEach(function(pre) {
+          pre.style.whiteSpace = wrapped ? 'pre-wrap' : '';
+          pre.style.wordBreak = wrapped ? 'break-all' : '';
+        });
+      }
+      window.__toggleWordWrap = toggle;
+    })();
+    """
+
+    // MARK: - Anchor Links
+
+    static let anchorLinksScript = """
+    (function() {
+      var body = document.querySelector('.markdown-body');
+      if (!body) return;
+      body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function(h) {
+        if (!h.id) return;
+        var a = document.createElement('a');
+        a.className = 'heading-anchor';
+        a.href = '#' + h.id;
+        a.textContent = '#';
+        a.addEventListener('click', function(e) { e.stopPropagation(); });
+        h.insertBefore(a, h.firstChild);
+      });
+    })();
+    """
+
+    // MARK: - Emoji Shortcodes
+
+    static let emojiScript = """
+    (function() {
+      var map = {
+        '+1':'\\uD83D\\uDC4D','-1':'\\uD83D\\uDC4E','100':'\\uD83D\\uDCAF','1234':'\\uD83D\\uDD22',
+        'smile':'\\uD83D\\uDE04','laughing':'\\uD83D\\uDE06','blush':'\\uD83D\\uDE0A','smiley':'\\uD83D\\uDE03',
+        'relaxed':'\\u263A\\uFE0F','smirk':'\\uD83D\\uDE0F','heart_eyes':'\\uD83D\\uDE0D','kissing_heart':'\\uD83D\\uDE18',
+        'kissing':'\\uD83D\\uDE17','wink':'\\uD83D\\uDE09','stuck_out_tongue_winking_eye':'\\uD83D\\uDE1C',
+        'stuck_out_tongue':'\\uD83D\\uDE1B','flushed':'\\uD83D\\uDE33','grin':'\\uD83D\\uDE01',
+        'pensive':'\\uD83D\\uDE14','relieved':'\\uD83D\\uDE0C','unamused':'\\uD83D\\uDE12',
+        'disappointed':'\\uD83D\\uDE1E','persevere':'\\uD83D\\uDE23','cry':'\\uD83D\\uDE22',
+        'joy':'\\uD83D\\uDE02','sob':'\\uD83D\\uDE2D','sleepy':'\\uD83D\\uDE2A','sweat':'\\uD83D\\uDE13',
+        'cold_sweat':'\\uD83D\\uDE30','angry':'\\uD83D\\uDE20','rage':'\\uD83D\\uDE21',
+        'triumph':'\\uD83D\\uDE24','mask':'\\uD83D\\uDE37','sunglasses':'\\uD83D\\uDE0E',
+        'dizzy_face':'\\uD83D\\uDE35','imp':'\\uD83D\\uDC7F','neutral_face':'\\uD83D\\uDE10',
+        'no_mouth':'\\uD83D\\uDE36','innocent':'\\uD83D\\uDE07','alien':'\\uD83D\\uDC7D',
+        'yellow_heart':'\\uD83D\\uDC9B','blue_heart':'\\uD83D\\uDC99','purple_heart':'\\uD83D\\uDC9C',
+        'heart':'\\u2764\\uFE0F','green_heart':'\\uD83D\\uDC9A','broken_heart':'\\uD83D\\uDC94',
+        'heartbeat':'\\uD83D\\uDC93','heartpulse':'\\uD83D\\uDC97','sparkling_heart':'\\uD83D\\uDC96',
+        'star':'\\u2B50','star2':'\\uD83C\\uDF1F','sparkles':'\\u2728','sunny':'\\u2600\\uFE0F',
+        'cloud':'\\u2601\\uFE0F','zap':'\\u26A1','fire':'\\uD83D\\uDD25','snowflake':'\\u2744\\uFE0F',
+        'rainbow':'\\uD83C\\uDF08','ocean':'\\uD83C\\uDF0A','earth_americas':'\\uD83C\\uDF0E',
+        'moon':'\\uD83C\\uDF19','sun_with_face':'\\uD83C\\uDF1E',
+        'thumbsup':'\\uD83D\\uDC4D','thumbsdown':'\\uD83D\\uDC4E','ok_hand':'\\uD83D\\uDC4C',
+        'punch':'\\uD83D\\uDC4A','fist':'\\u270A','v':'\\u270C\\uFE0F','wave':'\\uD83D\\uDC4B',
+        'hand':'\\u270B','open_hands':'\\uD83D\\uDC50','point_up':'\\u261D\\uFE0F',
+        'point_down':'\\uD83D\\uDC47','point_left':'\\uD83D\\uDC48','point_right':'\\uD83D\\uDC49',
+        'raised_hands':'\\uD83D\\uDE4C','pray':'\\uD83D\\uDE4F','clap':'\\uD83D\\uDC4F',
+        'muscle':'\\uD83D\\uDCAA','metal':'\\uD83E\\uDD18','fu':'\\uD83D\\uDD95',
+        'walking':'\\uD83D\\uDEB6','runner':'\\uD83C\\uDFC3','dancer':'\\uD83D\\uDC83',
+        'couple':'\\uD83D\\uDC6B','family':'\\uD83D\\uDC6A','boy':'\\uD83D\\uDC66',
+        'girl':'\\uD83D\\uDC67','man':'\\uD83D\\uDC68','woman':'\\uD83D\\uDC69',
+        'cop':'\\uD83D\\uDC6E','angel':'\\uD83D\\uDC7C',
+        'dog':'\\uD83D\\uDC36','cat':'\\uD83D\\uDC31','mouse':'\\uD83D\\uDC2D','hamster':'\\uD83D\\uDC39',
+        'rabbit':'\\uD83D\\uDC30','bear':'\\uD83D\\uDC3B','panda_face':'\\uD83D\\uDC3C',
+        'pig':'\\uD83D\\uDC37','frog':'\\uD83D\\uDC38','monkey_face':'\\uD83D\\uDC35',
+        'chicken':'\\uD83D\\uDC14','penguin':'\\uD83D\\uDC27','bird':'\\uD83D\\uDC26',
+        'fish':'\\uD83D\\uDC1F','whale':'\\uD83D\\uDC33','bug':'\\uD83D\\uDC1B',
+        'snake':'\\uD83D\\uDC0D','turtle':'\\uD83D\\uDC22','bee':'\\uD83D\\uDC1D',
+        'cherry_blossom':'\\uD83C\\uDF38','rose':'\\uD83C\\uDF39','sunflower':'\\uD83C\\uDF3B',
+        'four_leaf_clover':'\\uD83C\\uDF40','seedling':'\\uD83C\\uDF31','evergreen_tree':'\\uD83C\\uDF32',
+        'palm_tree':'\\uD83C\\uDF34','cactus':'\\uD83C\\uDF35',
+        'apple':'\\uD83C\\uDF4E','green_apple':'\\uD83C\\uDF4F','banana':'\\uD83C\\uDF4C',
+        'grapes':'\\uD83C\\uDF47','watermelon':'\\uD83C\\uDF49','strawberry':'\\uD83C\\uDF53',
+        'lemon':'\\uD83C\\uDF4B','peach':'\\uD83C\\uDF51','pizza':'\\uD83C\\uDF55',
+        'hamburger':'\\uD83C\\uDF54','fries':'\\uD83C\\uDF5F','egg':'\\uD83C\\uDF73',
+        'coffee':'\\u2615','tea':'\\uD83C\\uDF75','beer':'\\uD83C\\uDF7A','wine_glass':'\\uD83C\\uDF77',
+        'tada':'\\uD83C\\uDF89','balloon':'\\uD83C\\uDF88','gift':'\\uD83C\\uDF81',
+        'trophy':'\\uD83C\\uDFC6','medal_sports':'\\uD83C\\uDFC5',
+        'rocket':'\\uD83D\\uDE80','airplane':'\\u2708\\uFE0F','car':'\\uD83D\\uDE97',
+        'bike':'\\uD83D\\uDEB2','ship':'\\uD83D\\uDEA2','train':'\\uD83D\\uDE82',
+        'house':'\\uD83C\\uDFE0','school':'\\uD83C\\uDFEB','office':'\\uD83C\\uDFE2',
+        'hospital':'\\uD83C\\uDFE5','church':'\\u26EA','tent':'\\u26FA',
+        'watch':'\\u231A','phone':'\\u260E\\uFE0F','computer':'\\uD83D\\uDCBB','bulb':'\\uD83D\\uDCA1',
+        'battery':'\\uD83D\\uDD0B','key':'\\uD83D\\uDD11','lock':'\\uD83D\\uDD12',
+        'unlock':'\\uD83D\\uDD13','bell':'\\uD83D\\uDD14','bookmark':'\\uD83D\\uDD16',
+        'link':'\\uD83D\\uDD17','wrench':'\\uD83D\\uDD27','hammer':'\\uD83D\\uDD28',
+        'scissors':'\\u2702\\uFE0F','pushpin':'\\uD83D\\uDCCC','paperclip':'\\uD83D\\uDCCE',
+        'pencil2':'\\u270F\\uFE0F','memo':'\\uD83D\\uDCDD','book':'\\uD83D\\uDCD6',
+        'books':'\\uD83D\\uDCDA','newspaper':'\\uD83D\\uDCF0','calendar':'\\uD83D\\uDCC5',
+        'chart_with_upwards_trend':'\\uD83D\\uDCC8','chart_with_downwards_trend':'\\uD83D\\uDCC9',
+        'email':'\\u2709\\uFE0F','inbox_tray':'\\uD83D\\uDCE5','outbox_tray':'\\uD83D\\uDCE4',
+        'package':'\\uD83D\\uDCE6','mailbox':'\\uD83D\\uDCEB',
+        'warning':'\\u26A0\\uFE0F','x':'\\u274C','o':'\\u2B55','white_check_mark':'\\u2705',
+        'heavy_check_mark':'\\u2714\\uFE0F','heavy_multiplication_x':'\\u2716\\uFE0F',
+        'bangbang':'\\u203C\\uFE0F','question':'\\u2753','exclamation':'\\u2757',
+        'grey_question':'\\u2754','grey_exclamation':'\\u2755',
+        'recycle':'\\u267B\\uFE0F','beginner':'\\uD83D\\uDD30','trident':'\\uD83D\\uDD31',
+        'checkered_flag':'\\uD83C\\uDFC1','triangular_flag_on_post':'\\uD83D\\uDEA9',
+        'arrow_up':'\\u2B06\\uFE0F','arrow_down':'\\u2B07\\uFE0F','arrow_left':'\\u2B05\\uFE0F',
+        'arrow_right':'\\u27A1\\uFE0F','arrow_upper_left':'\\u2196\\uFE0F','arrow_upper_right':'\\u2197\\uFE0F',
+        'arrow_lower_left':'\\u2199\\uFE0F','arrow_lower_right':'\\u2198\\uFE0F',
+        'information_source':'\\u2139\\uFE0F','abc':'\\uD83D\\uDD24',
+        'thinking':'\\uD83E\\uDD14','eyes':'\\uD83D\\uDC40','skull':'\\uD83D\\uDC80',
+        'ghost':'\\uD83D\\uDC7B','see_no_evil':'\\uD83D\\uDE48','hear_no_evil':'\\uD83D\\uDE49',
+        'speak_no_evil':'\\uD83D\\uDE4A','sweat_smile':'\\uD83D\\uDE05','rofl':'\\uD83E\\uDD23',
+        'slightly_smiling_face':'\\uD83D\\uDE42','upside_down_face':'\\uD83D\\uDE43',
+        'nerd_face':'\\uD83E\\uDD13','party_popper':'\\uD83C\\uDF89',
+        'raised_eyebrow':'\\uD83E\\uDD28','shrug':'\\uD83E\\uDD37','facepalm':'\\uD83E\\uDD26',
+        'wave_dash':'\\u3030\\uFE0F','copyright':'\\u00A9\\uFE0F','registered':'\\u00AE\\uFE0F',
+        'tm':'\\u2122\\uFE0F','infinity':'\\u267E\\uFE0F',
+        'art':'\\uD83C\\uDFA8','musical_note':'\\uD83C\\uDFB5','microphone':'\\uD83C\\uDFA4',
+        'headphones':'\\uD83C\\uDFA7','guitar':'\\uD83C\\uDFB8','trumpet':'\\uD83C\\uDFBA',
+        'violin':'\\uD83C\\uDFBB','game_die':'\\uD83C\\uDFB2',
+        'soccer':'\\u26BD','basketball':'\\uD83C\\uDFC0','football':'\\uD83C\\uDFC8',
+        'baseball':'\\u26BE','tennis':'\\uD83C\\uDFBE','golf':'\\u26F3',
+        'tada_party':'\\uD83C\\uDF89','confetti_ball':'\\uD83C\\uDF8A',
+        'gem':'\\uD83D\\uDC8E','ring':'\\uD83D\\uDC8D','crown':'\\uD83D\\uDC51',
+        'moneybag':'\\uD83D\\uDCB0','dollar':'\\uD83D\\uDCB5','credit_card':'\\uD83D\\uDCB3',
+        'chart':'\\uD83D\\uDCB9','bomb':'\\uD83D\\uDCA3','boom':'\\uD83D\\uDCA5',
+        'zzz':'\\uD83D\\uDCA4','dash':'\\uD83D\\uDCA8','sweat_drops':'\\uD83D\\uDCA6',
+        'notes':'\\uD83C\\uDFB6','speech_balloon':'\\uD83D\\uDCAC','thought_balloon':'\\uD83D\\uDCAD',
+        'no_entry':'\\u26D4','no_entry_sign':'\\uD83D\\uDEAB','underage':'\\uD83D\\uDD1E',
+        'anger':'\\uD83D\\uDCA2','skull_and_crossbones':'\\u2620\\uFE0F'
+      };
+      var re = /:([a-z0-9_+-]+):/g;
+      var body = document.querySelector('.markdown-body') || document.body;
+      var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+          var p = node.parentNode;
+          while (p && p !== body) {
+            var tag = p.tagName;
+            if (tag === 'PRE' || tag === 'CODE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+            p = p.parentNode;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach(function(node) {
+        var text = node.textContent;
+        if (!re.test(text)) return;
+        re.lastIndex = 0;
+        var newText = text.replace(re, function(match, code) {
+          return map[code] || match;
+        });
+        if (newText !== text) node.textContent = newText;
+      });
+    })();
+    """
+
+    // MARK: - Footnotes
+
+    static let footnotesScript = """
+    (function() {
+      var body = document.querySelector('.markdown-body');
+      if (!body) return;
+      var defs = {};
+      var paras = body.querySelectorAll('p');
+      var defParas = [];
+      paras.forEach(function(p) {
+        var text = p.textContent || '';
+        var m = text.match(/^\\[\\^([^\\]]+)\\]:\\s*(.*)/s);
+        if (m) {
+          defs[m[1]] = m[2].trim();
+          defParas.push(p);
+        }
+      });
+      if (Object.keys(defs).length === 0) return;
+      var refCount = 0;
+      var refMap = {};
+      function processNode(node) {
+        var walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+          acceptNode: function(n) {
+            var p = n.parentNode;
+            if (p.tagName === 'PRE' || p.tagName === 'CODE' || p.tagName === 'A') return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        });
+        var textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        textNodes.forEach(function(tn) {
+          var text = tn.textContent;
+          if (text.indexOf('[^') === -1) return;
+          var parts = text.split(/(\\[\\^[^\\]]+\\])/);
+          if (parts.length <= 1) return;
+          var frag = document.createDocumentFragment();
+          parts.forEach(function(part) {
+            var rm = part.match(/^\\[\\^([^\\]]+)\\]$/);
+            if (rm && defs[rm[1]] !== undefined) {
+              var id = rm[1];
+              if (!refMap[id]) { refCount++; refMap[id] = refCount; }
+              var num = refMap[id];
+              var sup = document.createElement('sup');
+              sup.className = 'footnote-ref';
+              var a = document.createElement('a');
+              a.href = '#fn-' + id;
+              a.id = 'fnref-' + id;
+              a.textContent = num;
+              sup.appendChild(a);
+              frag.appendChild(sup);
+            } else {
+              frag.appendChild(document.createTextNode(part));
+            }
+          });
+          tn.parentNode.replaceChild(frag, tn);
+        });
+      }
+      processNode(body);
+      defParas.forEach(function(p) { p.remove(); });
+      var section = document.createElement('section');
+      section.className = 'footnotes';
+      var hr = document.createElement('hr');
+      section.appendChild(hr);
+      var ol = document.createElement('ol');
+      var keys = Object.keys(refMap).sort(function(a, b) { return refMap[a] - refMap[b]; });
+      keys.forEach(function(id) {
+        var li = document.createElement('li');
+        li.id = 'fn-' + id;
+        var textSpan = document.createElement('span');
+        textSpan.textContent = defs[id] + ' ';
+        li.appendChild(textSpan);
+        var backref = document.createElement('a');
+        backref.href = '#fnref-' + id;
+        backref.className = 'footnote-backref';
+        backref.textContent = '\\u21A9';
+        li.appendChild(backref);
+        ol.appendChild(li);
+      });
+      section.appendChild(ol);
+      body.appendChild(section);
+    })();
+    """
+
+    // MARK: - Frontmatter
+
+    static let frontmatterScript = """
+    (function() {
+      var el = document.getElementById('frontmatter-data');
+      if (!el) return;
+      var raw = el.textContent;
+      if (!raw || !window.jsyaml) return;
+      try {
+        var data = jsyaml.load(raw);
+        if (!data || typeof data !== 'object') return;
+        var banner = document.createElement('div');
+        banner.className = 'frontmatter-banner';
+        if (data.title) {
+          var t = document.createElement('div');
+          t.className = 'frontmatter-title';
+          t.textContent = data.title;
+          banner.appendChild(t);
+        }
+        var meta = [];
+        if (data.author) meta.push(data.author);
+        if (data.date) meta.push(String(data.date));
+        if (meta.length > 0) {
+          var m = document.createElement('div');
+          m.className = 'frontmatter-meta';
+          m.textContent = meta.join(' \\u00B7 ');
+          banner.appendChild(m);
+        }
+        if (data.tags && Array.isArray(data.tags)) {
+          var tagsDiv = document.createElement('div');
+          tagsDiv.className = 'frontmatter-tags';
+          data.tags.forEach(function(tag) {
+            var pill = document.createElement('span');
+            pill.className = 'frontmatter-tag';
+            pill.textContent = tag;
+            tagsDiv.appendChild(pill);
+          });
+          banner.appendChild(tagsDiv);
+        }
+        var body = document.querySelector('.markdown-body');
+        if (body) {
+          var stats = body.querySelector('.reading-stats');
+          if (stats) body.insertBefore(banner, stats);
+          else body.insertBefore(banner, body.firstChild);
+        }
+      } catch(e) {}
+    })();
+    """
+
+    // MARK: - Presentation Mode
+
+    static let presentationScript = """
+    (function() {
+      var overlay, slides, currentSlide, counter;
+      function buildSlides() {
+        var body = document.querySelector('.markdown-body');
+        if (!body) return [];
+        var children = Array.from(body.children);
+        var result = [[]];
+        children.forEach(function(el) {
+          if (el.tagName === 'HR') { result.push([]); }
+          else { result[result.length - 1].push(el); }
+        });
+        return result.filter(function(s) { return s.length > 0; });
+      }
+      function showSlide(n) {
+        if (n < 0 || n >= slides.length) return;
+        currentSlide = n;
+        var content = overlay.querySelector('.pres-content');
+        while (content.firstChild) content.removeChild(content.firstChild);
+        slides[n].forEach(function(el) {
+          content.appendChild(el.cloneNode(true));
+        });
+        counter.textContent = (n + 1) + ' / ' + slides.length;
+      }
+      function start() {
+        slides = buildSlides();
+        if (slides.length === 0) return;
+        currentSlide = 0;
+        overlay = document.createElement('div');
+        overlay.className = 'pres-overlay';
+        var content = document.createElement('div');
+        content.className = 'pres-content';
+        counter = document.createElement('div');
+        counter.className = 'pres-counter';
+        var closeBtn = document.createElement('button');
+        closeBtn.className = 'pres-close';
+        closeBtn.textContent = '\\u00D7';
+        closeBtn.addEventListener('click', stop);
+        overlay.appendChild(content);
+        overlay.appendChild(counter);
+        overlay.appendChild(closeBtn);
+        document.body.appendChild(overlay);
+        showSlide(0);
+      }
+      function stop() {
+        if (overlay) { overlay.remove(); overlay = null; }
+      }
+      function next() { if (overlay && currentSlide < slides.length - 1) showSlide(currentSlide + 1); }
+      function prev() { if (overlay && currentSlide > 0) showSlide(currentSlide - 1); }
+      document.addEventListener('keydown', function(e) {
+        if (!overlay) return;
+        if (e.key === 'Escape') { stop(); }
+        else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+        else if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+      });
+      document.addEventListener('click', function(e) {
+        if (!overlay) return;
+        if (e.target === overlay || e.target.classList.contains('pres-content')) next();
+      });
+      window.__startPresentation = function() {
+        if (overlay) { stop(); } else { start(); }
+      };
+      window.__stopPresentation = stop;
+      window.__presentationActive = function() { return !!overlay; };
+    })();
+    """
+
+    static let checkboxToggleScript = """
+    (function() {
+      var checkboxes = document.querySelectorAll('.markdown-body input[type="checkbox"]');
+      checkboxes.forEach(function(cb, index) {
+        cb.disabled = false;
+        cb.style.cursor = 'pointer';
+        cb.addEventListener('change', function(e) {
+          var checked = e.target.checked;
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.checkboxToggle) {
+            window.webkit.messageHandlers.checkboxToggle.postMessage({index: index, checked: checked});
+          }
+        });
+      });
+    })();
+    """
+
+    static let editorSyncScript = """
+    (function() {
+      var syncEnabled = true;
+      window.__editorSyncPause = function() { syncEnabled = false; };
+      window.__editorSyncResume = function() { syncEnabled = true; };
+
+      // Determine the scroll container: .markdown-body when TOC layout is active,
+      // otherwise document.documentElement. The TOC layout sets overflow-y:auto on
+      // .markdown-body and overflow:hidden on html/body, so window scroll events
+      // never fire in that mode.
+      function getScrollContainer() {
+        var layout = document.getElementById('layout');
+        if (layout && layout.classList.contains('has-toc')) {
+          return document.querySelector('.markdown-body') || document.documentElement;
+        }
+        return document.documentElement;
+      }
+
+      // Expose for Swift to scroll the renderer
+      window.__getScrollContainer = getScrollContainer;
+
+      // Report scroll fraction to Swift when the user scrolls the renderer
+      var scrollTimer = null;
+      function onScroll() {
+        if (!syncEnabled) return;
+        if (scrollTimer) clearTimeout(scrollTimer);
+        scrollTimer = setTimeout(function() {
+          var el = getScrollContainer();
+          var maxScroll = el.scrollHeight - el.clientHeight;
+          if (maxScroll <= 0) return;
+          var fraction = el.scrollTop / maxScroll;
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
+            window.webkit.messageHandlers.editorSync.postMessage({type: 'scroll', fraction: fraction});
+          }
+        }, 30);
+      }
+
+      // Listen on both window and .markdown-body to cover both layouts
+      window.addEventListener('scroll', onScroll, {passive: true});
+      setTimeout(function() {
+        var mb = document.querySelector('.markdown-body');
+        if (mb) mb.addEventListener('scroll', onScroll, {passive: true});
+      }, 100);
+
+      // Expose a function for Swift to set scroll position on the correct container
+      window.__setScrollFraction = function(fraction) {
+        var el = getScrollContainer();
+        var maxScroll = el.scrollHeight - el.clientHeight;
+        if (maxScroll > 0) el.scrollTop = fraction * maxScroll;
+      };
+
+      // Double-click: find the clicked text and send surrounding words to Swift
+      document.addEventListener('dblclick', function(e) {
+        var sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        var word = sel.toString().trim();
+        if (!word) return;
+
+        var node = sel.anchorNode;
+        var textContent = (node && node.textContent) ? node.textContent : '';
+        var allText = textContent;
+        var block = node;
+        while (block && block.nodeType !== 1) block = block.parentNode;
+        var blockTags = ['P','LI','H1','H2','H3','H4','H5','H6','TD','TH','BLOCKQUOTE','PRE','DIV'];
+        while (block && blockTags.indexOf(block.tagName) === -1) block = block.parentElement;
+        if (block) allText = block.textContent || allText;
+
+        var words = allText.split(/\\s+/).filter(function(w) { return w.length > 0; });
+        var wordIdx = -1;
+        for (var i = 0; i < words.length; i++) {
+          if (words[i].indexOf(word) !== -1) { wordIdx = i; break; }
+        }
+        var before = wordIdx > 0 ? words.slice(Math.max(0, wordIdx - 3), wordIdx).join(' ') : '';
+        var after = wordIdx >= 0 ? words.slice(wordIdx + 1, wordIdx + 4).join(' ') : '';
+
+        var el = getScrollContainer();
+        var rect = sel.getRangeAt(0).getBoundingClientRect();
+        var scrollFraction = (rect.top + el.scrollTop) / el.scrollHeight;
+
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
+          window.webkit.messageHandlers.editorSync.postMessage({
+            type: 'dblclick', word: word, before: before, after: after, fraction: scrollFraction
+          });
+        }
+      });
+    })();
+    """
+
+    /// Toggle the nth task list checkbox in markdown source between [ ] and [x].
+    static func toggleCheckbox(at index: Int, checked: Bool, in text: String) -> String {
+        let pattern = checked ? "- [ ]" : "- [x]"
+        let replacement = checked ? "- [x]" : "- [ ]"
+        var count = 0
+        var result = text
+        var searchRange = result.startIndex..<result.endIndex
+        while let range = result.range(of: pattern, range: searchRange) {
+            if count == index {
+                result.replaceSubrange(range, with: replacement)
+                break
+            }
+            count += 1
+            searchRange = range.upperBound..<result.endIndex
+        }
+        return result
+    }
+
+    static func htmlBodyPublic(for url: URL) throws -> (html: String, isMarkdown: Bool) {
+        try htmlBody(for: url)
+    }
+
+    static func wrapHTMLPublic(_ body: String, isMarkdown: Bool) -> String {
+        wrapHTML(body, isMarkdown: isMarkdown)
+    }
+
     private static func wrapHTML(_ body: String, isMarkdown: Bool) -> String {
         let tocMarkup = isMarkdown ? """
             <div id="toc-container">
@@ -1230,6 +1913,111 @@ final class MarkdownDocumentModel: ObservableObject {
               html[data-theme="dark"] #speak-btn.paused { background: #5a4e00; border-color: #f9a825; color: #f9a825; }
               html[data-theme="light"] #speak-btn { background: #f6f8fa; border-color: #d0d7de; color: #9ca3af; }
               html[data-theme="light"] #speak-btn:hover { background: #e8e8e8; color: #656d76; }
+              /* Print stylesheet */
+              @media print {
+                #toc-container, .copy-btn, #speak-btn, #find-bar, #jump-bar,
+                .reading-stats, .pres-overlay, .mermaid-overlay { display: none !important; }
+                body { background: white !important; color: black !important; }
+                .markdown-body { padding: 0 !important; }
+                #layout { display: block !important; height: auto !important; }
+                #layout.has-toc .markdown-body { overflow: visible !important; }
+                h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
+                pre, table, blockquote, img { page-break-inside: avoid; }
+                a[href]::after { content: ' (' attr(href) ')'; font-size: 0.85em; color: #666; }
+                a[href^="#"]::after { content: ''; }
+                pre { border: 1px solid #ccc !important; }
+              }
+              /* Task lists */
+              .markdown-body li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.5em; }
+              .markdown-body input[type="checkbox"] {
+                margin-right: 0.4em; vertical-align: middle;
+                width: 1em; height: 1em; accent-color: #0969da;
+              }
+              /* Heading anchor links */
+              .heading-anchor {
+                color: #d0d7de; text-decoration: none; font-weight: 400;
+                padding-right: 0.3em; opacity: 0; transition: opacity 0.15s;
+              }
+              .markdown-body h1:hover .heading-anchor,
+              .markdown-body h2:hover .heading-anchor,
+              .markdown-body h3:hover .heading-anchor,
+              .markdown-body h4:hover .heading-anchor,
+              .markdown-body h5:hover .heading-anchor,
+              .markdown-body h6:hover .heading-anchor { opacity: 1; }
+              .heading-anchor:hover { color: #0969da; text-decoration: none; }
+              @media (prefers-color-scheme: dark) {
+                .heading-anchor { color: #444c56; }
+                .heading-anchor:hover { color: #58a6ff; }
+              }
+              html[data-theme="dark"] .heading-anchor { color: #444c56; }
+              html[data-theme="dark"] .heading-anchor:hover { color: #58a6ff; }
+              /* Footnotes */
+              .footnote-ref a {
+                color: #0969da; text-decoration: none; font-size: 0.85em;
+                padding: 0 2px;
+              }
+              .footnote-ref a:hover { text-decoration: underline; }
+              .footnotes { margin-top: 2em; }
+              .footnotes hr { border: none; border-top: 1px solid #d0d7de; margin-bottom: 1em; }
+              .footnotes ol { font-size: 0.9em; color: #656d76; }
+              .footnote-backref { text-decoration: none; margin-left: 4px; }
+              @media (prefers-color-scheme: dark) {
+                .footnotes hr { border-top-color: #444c56; }
+                .footnotes ol { color: #999; }
+                .footnote-ref a { color: #58a6ff; }
+              }
+              html[data-theme="dark"] .footnotes hr { border-top-color: #444c56; }
+              html[data-theme="dark"] .footnotes ol { color: #999; }
+              html[data-theme="dark"] .footnote-ref a { color: #58a6ff; }
+              /* Frontmatter banner */
+              .frontmatter-banner {
+                padding: 16px 0; margin-bottom: 16px;
+                border-bottom: 1px solid #d0d7de;
+              }
+              .frontmatter-title { font-size: 0.9em; font-weight: 600; color: #656d76; margin-bottom: 4px; }
+              .frontmatter-meta { font-size: 0.8em; color: #999; margin-bottom: 8px; }
+              .frontmatter-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+              .frontmatter-tag {
+                font-size: 0.75em; padding: 2px 8px; border-radius: 12px;
+                background: #dbeafe; color: #1e40af;
+              }
+              @media (prefers-color-scheme: dark) {
+                .frontmatter-banner { border-bottom-color: #444c56; }
+                .frontmatter-title { color: #999; }
+                .frontmatter-meta { color: #666; }
+                .frontmatter-tag { background: #1e3a5f; color: #93c5fd; }
+              }
+              html[data-theme="dark"] .frontmatter-banner { border-bottom-color: #444c56; }
+              html[data-theme="dark"] .frontmatter-title { color: #999; }
+              html[data-theme="dark"] .frontmatter-tag { background: #1e3a5f; color: #93c5fd; }
+              /* Presentation mode */
+              .pres-overlay {
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: #fff; z-index: 10000;
+                display: flex; align-items: center; justify-content: center;
+              }
+              .pres-content {
+                max-width: 80%; max-height: 80%;
+                font-size: 1.5em; overflow: auto;
+                padding: 40px;
+              }
+              .pres-counter {
+                position: fixed; bottom: 20px; right: 20px;
+                font-size: 14px; color: #999;
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+              }
+              .pres-close {
+                position: fixed; top: 16px; right: 16px;
+                background: none; border: none; font-size: 28px;
+                cursor: pointer; color: #999; z-index: 10001;
+              }
+              .pres-close:hover { color: #333; }
+              @media (prefers-color-scheme: dark) {
+                .pres-overlay { background: #1e1e1e; color: #d4d4d4; }
+                .pres-close:hover { color: #d4d4d4; }
+              }
+              html[data-theme="dark"] .pres-overlay { background: #1e1e1e; color: #d4d4d4; }
+              html[data-theme="dark"] .pres-close:hover { color: #d4d4d4; }
             </style>
           </head>
           <body>

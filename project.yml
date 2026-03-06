@@ -2,11 +2,14 @@ name: QuickMD
 options:
   bundleIdPrefix: com.pedro
   deploymentTarget:
-    macOS: '13.0'
+    macOS: '14.0'
 packages:
   swift-markdown:
     url: https://github.com/swiftlang/swift-markdown.git
     from: 0.6.0
+  CodeEditorView:
+    url: https://github.com/mchakravarty/CodeEditorView.git
+    branch: main
 targets:
   QuickMDApp:
     type: application
@@ -30,6 +33,10 @@ targets:
       - target: QuickMDPreviewExtension
       - package: swift-markdown
         product: Markdown
+      - package: CodeEditorView
+        product: CodeEditorView
+      - package: CodeEditorView
+        product: LanguageSupport
 
   QuickMDPreviewExtension:
     type: app-extension

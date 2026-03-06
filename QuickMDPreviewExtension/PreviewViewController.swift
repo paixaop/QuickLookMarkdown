@@ -45,12 +45,55 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         "dot": "dot", "gv": "graphviz",
     ]
 
+    private static func readFileContent(from url: URL) throws -> String {
+        if let content = try? String(contentsOf: url, encoding: .utf8) {
+            return content
+        }
+        let data = try Data(contentsOf: url)
+        let encodings: [String.Encoding] = [.utf16, .isoLatin1, .windowsCP1252, .macOSRoman]
+        for encoding in encodings {
+            if let content = String(data: data, encoding: encoding) {
+                return content
+            }
+        }
+        throw NSError(domain: "QuickMD", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unable to detect file encoding"])
+    }
+
+    private static func stripFrontmatter(_ content: String) -> (body: String, frontmatter: String?) {
+        guard content.hasPrefix("---\n") || content.hasPrefix("---\r\n") else {
+            return (content, nil)
+        }
+        let lines = content.components(separatedBy: "\n")
+        var endIndex: Int?
+        for i in 1..<lines.count {
+            if lines[i].trimmingCharacters(in: .whitespaces) == "---" {
+                endIndex = i
+                break
+            }
+        }
+        guard let end = endIndex else { return (content, nil) }
+        let yamlLines = lines[1..<end]
+        let yaml = yamlLines.joined(separator: "\n")
+        let bodyLines = lines[(end + 1)...]
+        let body = bodyLines.joined(separator: "\n")
+        return (body, yaml)
+    }
+
     private static func htmlBody(for url: URL) throws -> (html: String, isMarkdown: Bool) {
-        let content = try String(contentsOf: url, encoding: .utf8)
+        let content = try readFileContent(from: url)
         let ext = url.pathExtension.lowercased()
 
         if markdownExtensions.contains(ext) {
-            return (HTMLFormatter.format(content), true)
+            let (body, frontmatter) = stripFrontmatter(content)
+            var html = HTMLFormatter.format(body)
+            if let fm = frontmatter {
+                let escaped = fm
+                    .replacingOccurrences(of: "&", with: "&amp;")
+                    .replacingOccurrences(of: "<", with: "&lt;")
+                    .replacingOccurrences(of: ">", with: "&gt;")
+                html = "<div id=\"frontmatter-data\" style=\"display:none\">\(escaped)</div>\n" + html
+            }
+            return (html, true)
         }
 
         let lang = extensionToLanguage[ext] ?? ""
@@ -204,6 +247,212 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
           document.addEventListener('mouseup', onUp);
         });
       }
+    })();
+    """
+
+    // MARK: - Emoji Shortcodes
+
+    private static let emojiScript = """
+    (function() {
+      var map = {
+        '+1':'\\uD83D\\uDC4D','-1':'\\uD83D\\uDC4E','100':'\\uD83D\\uDCAF',
+        'smile':'\\uD83D\\uDE04','laughing':'\\uD83D\\uDE06','blush':'\\uD83D\\uDE0A','smiley':'\\uD83D\\uDE03',
+        'wink':'\\uD83D\\uDE09','heart_eyes':'\\uD83D\\uDE0D','sunglasses':'\\uD83D\\uDE0E',
+        'joy':'\\uD83D\\uDE02','cry':'\\uD83D\\uDE22','sob':'\\uD83D\\uDE2D',
+        'angry':'\\uD83D\\uDE20','rage':'\\uD83D\\uDE21','thinking':'\\uD83E\\uDD14',
+        'heart':'\\u2764\\uFE0F','star':'\\u2B50','sparkles':'\\u2728',
+        'fire':'\\uD83D\\uDD25','zap':'\\u26A1','rocket':'\\uD83D\\uDE80',
+        'thumbsup':'\\uD83D\\uDC4D','thumbsdown':'\\uD83D\\uDC4E','ok_hand':'\\uD83D\\uDC4C',
+        'wave':'\\uD83D\\uDC4B','clap':'\\uD83D\\uDC4F','muscle':'\\uD83D\\uDCAA',
+        'tada':'\\uD83C\\uDF89','warning':'\\u26A0\\uFE0F','x':'\\u274C',
+        'white_check_mark':'\\u2705','heavy_check_mark':'\\u2714\\uFE0F',
+        'bug':'\\uD83D\\uDC1B','memo':'\\uD83D\\uDCDD','book':'\\uD83D\\uDCD6',
+        'link':'\\uD83D\\uDD17','lock':'\\uD83D\\uDD12','key':'\\uD83D\\uDD11',
+        'bulb':'\\uD83D\\uDCA1','computer':'\\uD83D\\uDCBB','eyes':'\\uD83D\\uDC40',
+        'skull':'\\uD83D\\uDC80','boom':'\\uD83D\\uDCA5','gem':'\\uD83D\\uDC8E',
+        'coffee':'\\u2615','pizza':'\\uD83C\\uDF55','beer':'\\uD83C\\uDF7A',
+        'trophy':'\\uD83C\\uDFC6','crown':'\\uD83D\\uDC51','rainbow':'\\uD83C\\uDF08',
+        'sunny':'\\u2600\\uFE0F','cloud':'\\u2601\\uFE0F','snowflake':'\\u2744\\uFE0F',
+        'dog':'\\uD83D\\uDC36','cat':'\\uD83D\\uDC31','penguin':'\\uD83D\\uDC27',
+        'arrow_up':'\\u2B06\\uFE0F','arrow_down':'\\u2B07\\uFE0F',
+        'arrow_left':'\\u2B05\\uFE0F','arrow_right':'\\u27A1\\uFE0F',
+        'question':'\\u2753','exclamation':'\\u2757','no_entry':'\\u26D4',
+        'recycle':'\\u267B\\uFE0F','copyright':'\\u00A9\\uFE0F','tm':'\\u2122\\uFE0F'
+      };
+      var re = /:([a-z0-9_+-]+):/g;
+      var body = document.querySelector('.markdown-body') || document.body;
+      var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+          var p = node.parentNode;
+          while (p && p !== body) {
+            var tag = p.tagName;
+            if (tag === 'PRE' || tag === 'CODE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+            p = p.parentNode;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      nodes.forEach(function(node) {
+        var text = node.textContent;
+        if (!re.test(text)) return;
+        re.lastIndex = 0;
+        var newText = text.replace(re, function(match, code) {
+          return map[code] || match;
+        });
+        if (newText !== text) node.textContent = newText;
+      });
+    })();
+    """
+
+    // MARK: - Footnotes
+
+    private static let footnotesScript = """
+    (function() {
+      var body = document.querySelector('.markdown-body');
+      if (!body) return;
+      var defs = {};
+      var paras = body.querySelectorAll('p');
+      var defParas = [];
+      paras.forEach(function(p) {
+        var text = p.textContent || '';
+        var m = text.match(/^\\[\\^([^\\]]+)\\]:\\s*(.*)/s);
+        if (m) {
+          defs[m[1]] = m[2].trim();
+          defParas.push(p);
+        }
+      });
+      if (Object.keys(defs).length === 0) return;
+      var refCount = 0;
+      var refMap = {};
+      function processNode(node) {
+        var walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+          acceptNode: function(n) {
+            var p = n.parentNode;
+            if (p.tagName === 'PRE' || p.tagName === 'CODE' || p.tagName === 'A') return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        });
+        var textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        textNodes.forEach(function(tn) {
+          var text = tn.textContent;
+          if (text.indexOf('[^') === -1) return;
+          var parts = text.split(/(\\[\\^[^\\]]+\\])/);
+          if (parts.length <= 1) return;
+          var frag = document.createDocumentFragment();
+          parts.forEach(function(part) {
+            var rm = part.match(/^\\[\\^([^\\]]+)\\]$/);
+            if (rm && defs[rm[1]] !== undefined) {
+              var id = rm[1];
+              if (!refMap[id]) { refCount++; refMap[id] = refCount; }
+              var num = refMap[id];
+              var sup = document.createElement('sup');
+              sup.className = 'footnote-ref';
+              var a = document.createElement('a');
+              a.href = '#fn-' + id;
+              a.id = 'fnref-' + id;
+              a.textContent = num;
+              sup.appendChild(a);
+              frag.appendChild(sup);
+            } else {
+              frag.appendChild(document.createTextNode(part));
+            }
+          });
+          tn.parentNode.replaceChild(frag, tn);
+        });
+      }
+      processNode(body);
+      defParas.forEach(function(p) { p.remove(); });
+      var section = document.createElement('section');
+      section.className = 'footnotes';
+      var hr = document.createElement('hr');
+      section.appendChild(hr);
+      var ol = document.createElement('ol');
+      var keys = Object.keys(refMap).sort(function(a, b) { return refMap[a] - refMap[b]; });
+      keys.forEach(function(id) {
+        var li = document.createElement('li');
+        li.id = 'fn-' + id;
+        var textSpan = document.createElement('span');
+        textSpan.textContent = defs[id] + ' ';
+        li.appendChild(textSpan);
+        var backref = document.createElement('a');
+        backref.href = '#fnref-' + id;
+        backref.className = 'footnote-backref';
+        backref.textContent = '\\u21A9';
+        li.appendChild(backref);
+        ol.appendChild(li);
+      });
+      section.appendChild(ol);
+      body.appendChild(section);
+    })();
+    """
+
+    // MARK: - Frontmatter
+
+    private static let frontmatterScript = """
+    (function() {
+      var el = document.getElementById('frontmatter-data');
+      if (!el) return;
+      var raw = el.textContent;
+      if (!raw || !window.jsyaml) return;
+      try {
+        var data = jsyaml.load(raw);
+        if (!data || typeof data !== 'object') return;
+        var banner = document.createElement('div');
+        banner.className = 'frontmatter-banner';
+        if (data.title) {
+          var t = document.createElement('div');
+          t.className = 'frontmatter-title';
+          t.textContent = data.title;
+          banner.appendChild(t);
+        }
+        var meta = [];
+        if (data.author) meta.push(data.author);
+        if (data.date) meta.push(String(data.date));
+        if (meta.length > 0) {
+          var m = document.createElement('div');
+          m.className = 'frontmatter-meta';
+          m.textContent = meta.join(' \\u00B7 ');
+          banner.appendChild(m);
+        }
+        if (data.tags && Array.isArray(data.tags)) {
+          var tagsDiv = document.createElement('div');
+          tagsDiv.className = 'frontmatter-tags';
+          data.tags.forEach(function(tag) {
+            var pill = document.createElement('span');
+            pill.className = 'frontmatter-tag';
+            pill.textContent = tag;
+            tagsDiv.appendChild(pill);
+          });
+          banner.appendChild(tagsDiv);
+        }
+        var body = document.querySelector('.markdown-body');
+        if (body) {
+          var stats = body.querySelector('.reading-stats');
+          if (stats) body.insertBefore(banner, stats);
+          else body.insertBefore(banner, body.firstChild);
+        }
+      } catch(e) {}
+    })();
+    """
+
+    // MARK: - Anchor Links
+
+    private static let anchorLinksScript = """
+    (function() {
+      var body = document.querySelector('.markdown-body');
+      if (!body) return;
+      body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function(h) {
+        if (!h.id) return;
+        var a = document.createElement('a');
+        a.className = 'heading-anchor';
+        a.href = '#' + h.id;
+        a.textContent = '#';
+        a.addEventListener('click', function(e) { e.stopPropagation(); });
+        h.insertBefore(a, h.firstChild);
+      });
     })();
     """
 
@@ -733,6 +982,30 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
 
         let tocBlock = isMarkdown ? "<script>\(tocScript)</script>" : ""
 
+        let emojiBlock = """
+            <script>
+            \(emojiScript)
+            </script>
+        """
+
+        let footnotesBlock = """
+            <script>
+            \(footnotesScript)
+            </script>
+        """
+
+        let frontmatterBlock = """
+            <script>
+            \(frontmatterScript)
+            </script>
+        """
+
+        let anchorLinksBlock = """
+            <script>
+            \(anchorLinksScript)
+            </script>
+        """
+
         let fileType = isMarkdown ? "markdown" : "code"
         return """
         <!doctype html>
@@ -1026,6 +1299,80 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               html[data-theme="light"] .hljs-strong{color:#24292e;font-weight:700}
               html[data-theme="light"] .hljs-addition{color:#22863a;background-color:#f0fff4}
               html[data-theme="light"] .hljs-deletion{color:#b31d28;background-color:#ffeef0}
+              /* Print stylesheet */
+              @media print {
+                #toc-container, .copy-btn, #find-bar, #jump-bar,
+                .reading-stats, .mermaid-overlay { display: none !important; }
+                body { background: white !important; color: black !important; }
+                .markdown-body { padding: 0 !important; }
+                #layout { display: block !important; height: auto !important; }
+                #layout.has-toc .markdown-body { overflow: visible !important; }
+                h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
+                pre, table, blockquote, img { page-break-inside: avoid; }
+                a[href]::after { content: ' (' attr(href) ')'; font-size: 0.85em; color: #666; }
+                a[href^="#"]::after { content: ''; }
+                pre { border: 1px solid #ccc !important; }
+              }
+              /* Task lists */
+              .markdown-body li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.5em; }
+              .markdown-body input[type="checkbox"] {
+                margin-right: 0.4em; vertical-align: middle;
+                width: 1em; height: 1em; accent-color: #0969da;
+              }
+              /* Heading anchor links */
+              .heading-anchor {
+                color: #d0d7de; text-decoration: none; font-weight: 400;
+                padding-right: 0.3em; opacity: 0; transition: opacity 0.15s;
+              }
+              .markdown-body h1:hover .heading-anchor,
+              .markdown-body h2:hover .heading-anchor,
+              .markdown-body h3:hover .heading-anchor,
+              .markdown-body h4:hover .heading-anchor,
+              .markdown-body h5:hover .heading-anchor,
+              .markdown-body h6:hover .heading-anchor { opacity: 1; }
+              .heading-anchor:hover { color: #0969da; text-decoration: none; }
+              @media (prefers-color-scheme: dark) {
+                .heading-anchor { color: #444c56; }
+                .heading-anchor:hover { color: #58a6ff; }
+              }
+              html[data-theme="dark"] .heading-anchor { color: #444c56; }
+              html[data-theme="dark"] .heading-anchor:hover { color: #58a6ff; }
+              /* Footnotes */
+              .footnote-ref a {
+                color: #0969da; text-decoration: none; font-size: 0.85em; padding: 0 2px;
+              }
+              .footnote-ref a:hover { text-decoration: underline; }
+              .footnotes { margin-top: 2em; }
+              .footnotes hr { border: none; border-top: 1px solid #d0d7de; margin-bottom: 1em; }
+              .footnotes ol { font-size: 0.9em; color: #656d76; }
+              .footnote-backref { text-decoration: none; margin-left: 4px; }
+              @media (prefers-color-scheme: dark) {
+                .footnotes hr { border-top-color: #444c56; }
+                .footnotes ol { color: #999; }
+                .footnote-ref a { color: #58a6ff; }
+              }
+              html[data-theme="dark"] .footnotes hr { border-top-color: #444c56; }
+              html[data-theme="dark"] .footnotes ol { color: #999; }
+              html[data-theme="dark"] .footnote-ref a { color: #58a6ff; }
+              /* Frontmatter banner */
+              .frontmatter-banner {
+                padding: 16px 0; margin-bottom: 16px; border-bottom: 1px solid #d0d7de;
+              }
+              .frontmatter-title { font-size: 0.9em; font-weight: 600; color: #656d76; margin-bottom: 4px; }
+              .frontmatter-meta { font-size: 0.8em; color: #999; margin-bottom: 8px; }
+              .frontmatter-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+              .frontmatter-tag {
+                font-size: 0.75em; padding: 2px 8px; border-radius: 12px;
+                background: #dbeafe; color: #1e40af;
+              }
+              @media (prefers-color-scheme: dark) {
+                .frontmatter-banner { border-bottom-color: #444c56; }
+                .frontmatter-title { color: #999; }
+                .frontmatter-tag { background: #1e3a5f; color: #93c5fd; }
+              }
+              html[data-theme="dark"] .frontmatter-banner { border-bottom-color: #444c56; }
+              html[data-theme="dark"] .frontmatter-title { color: #999; }
+              html[data-theme="dark"] .frontmatter-tag { background: #1e3a5f; color: #93c5fd; }
             </style>
           </head>
           <body>
@@ -1042,6 +1389,10 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             \(fontSizeBlock)
             \(jumpToLineBlock)
             \(findBlock)
+            \(emojiBlock)
+            \(footnotesBlock)
+            \(frontmatterBlock)
+            \(anchorLinksBlock)
           </body>
         </html>
         """
