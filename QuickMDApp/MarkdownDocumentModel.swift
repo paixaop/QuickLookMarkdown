@@ -254,7 +254,16 @@ final class MarkdownDocumentModel: ObservableObject {
         )
         source.setEventHandler { [weak self] in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self?.load(from: url)
+                // Capture scroll position before reload so it can be restored
+                if let webView = WebViewStore.shared.webView {
+                    webView.evaluateJavaScript("window.__getScrollFraction ? __getScrollFraction() : (document.documentElement.scrollTop / Math.max(1, document.documentElement.scrollHeight - document.documentElement.clientHeight))") { result, _ in
+                        WebViewStore.shared.preReloadScrollFraction = result as? Double ?? 0
+                        WebViewStore.shared.isFileWatcherReload = true
+                        self?.load(from: url)
+                    }
+                } else {
+                    self?.load(from: url)
+                }
             }
         }
         source.setCancelHandler {

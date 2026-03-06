@@ -73,6 +73,10 @@ class WebViewStore: ObservableObject {
     var lastEditorFraction: CGFloat = 0
     /// True when an HTML reload is triggered by editor typing (not navigation)
     var isEditReload = false
+    /// True when an HTML reload is triggered by the file watcher
+    var isFileWatcherReload = false
+    /// Scroll fraction captured before a file watcher reload
+    var preReloadScrollFraction: Double = 0
     /// Callback to show the editor panel (set by ContentView)
     var showEditorCallback: (() -> Void)?
 }
@@ -297,19 +301,33 @@ struct WebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            guard WebViewStore.shared.isEditReload else { return }
-            // Restore scroll position to match the editor after an edit-driven reload
-            let fraction = WebViewStore.shared.lastEditorFraction
-            let js = """
-            (function() {
-                if (window.__editorSyncPause) __editorSyncPause();
-                if (window.__setScrollFraction) __setScrollFraction(\(fraction));
-                setTimeout(function() { if (window.__editorSyncResume) __editorSyncResume(); }, 200);
-            })();
-            """
-            webView.evaluateJavaScript(js) { _, _ in
-                DispatchQueue.main.async {
-                    WebViewStore.shared.isEditReload = false
+            let store = WebViewStore.shared
+
+            if store.isEditReload {
+                // Restore scroll position to match the editor after an edit-driven reload
+                let fraction = store.lastEditorFraction
+                let js = """
+                (function() {
+                    if (window.__editorSyncPause) __editorSyncPause();
+                    if (window.__setScrollFraction) __setScrollFraction(\(fraction));
+                    setTimeout(function() { if (window.__editorSyncResume) __editorSyncResume(); }, 200);
+                })();
+                """
+                webView.evaluateJavaScript(js) { _, _ in
+                    DispatchQueue.main.async { store.isEditReload = false }
+                }
+            } else if store.isFileWatcherReload {
+                // Restore scroll position after file watcher reload
+                let fraction = store.preReloadScrollFraction
+                let js = """
+                (function() {
+                    if (window.__editorSyncPause) __editorSyncPause();
+                    if (window.__setScrollFraction) __setScrollFraction(\(fraction));
+                    setTimeout(function() { if (window.__editorSyncResume) __editorSyncResume(); }, 200);
+                })();
+                """
+                webView.evaluateJavaScript(js) { _, _ in
+                    DispatchQueue.main.async { store.isFileWatcherReload = false }
                 }
             }
         }
