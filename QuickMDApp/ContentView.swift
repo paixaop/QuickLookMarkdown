@@ -65,6 +65,8 @@ class WebViewStore: ObservableObject {
     var lastEditorFraction: CGFloat = 0
     /// True when an HTML reload is triggered by editor typing (not navigation)
     var isEditReload = false
+    /// Callback to show the editor panel (set by ContentView)
+    var showEditorCallback: (() -> Void)?
 }
 
 struct WebView: NSViewRepresentable {
@@ -102,7 +104,16 @@ struct WebView: NSViewRepresentable {
                     let before = body["before"] as? String ?? ""
                     let after = body["after"] as? String ?? ""
                     let fraction = body["fraction"] as? Double ?? 0
-                    jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+
+                    // If editor is not visible, show it first, then jump after a delay
+                    if findEditorTextView() == nil {
+                        WebViewStore.shared.showEditorCallback?()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                            self.jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+                        }
+                    } else {
+                        jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+                    }
                 }
 
             default:
@@ -651,6 +662,9 @@ struct ContentView: View {
         }
         .onAppear {
             AppDelegate.activeModel = model
+            WebViewStore.shared.showEditorCallback = {
+                showEditor = true
+            }
             if let url = AppDelegate.pendingURL {
                 MarkdownDocumentModel.log("onAppear: loading pendingURL \(url.path)")
                 model.load(from: url)
