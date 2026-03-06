@@ -969,6 +969,72 @@ final class MarkdownDocumentModel: ObservableObject {
 
     // MARK: - Custom CSS Themes
 
+    // MARK: - Built-in Themes
+
+    static let builtInThemes: [(name: String, css: String)] = [
+        ("Dracula", """
+        .markdown-body { background: #282a36; color: #f8f8f2; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #bd93f9; border-color: #44475a; }
+        .markdown-body a { color: #8be9fd; }
+        .markdown-body pre, .markdown-body code { background: #44475a; }
+        .markdown-body pre code.hljs { background: transparent; }
+        .markdown-body blockquote { border-left-color: #6272a4; color: #6272a4; }
+        .markdown-body table th, .markdown-body table td { border-color: #44475a; }
+        .markdown-body table tr { background: #282a36; }
+        .markdown-body table tr:nth-child(2n) { background: #2e303e; }
+        .markdown-body hr { background: #44475a; }
+        .markdown-body strong { color: #ffb86c; }
+        .markdown-body em { color: #ff79c6; }
+        """),
+        ("Solarized Light", """
+        .markdown-body { background: #fdf6e3; color: #657b83; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #268bd2; border-color: #eee8d5; }
+        .markdown-body a { color: #268bd2; }
+        .markdown-body pre, .markdown-body code { background: #eee8d5; }
+        .markdown-body pre code.hljs { background: transparent; }
+        .markdown-body blockquote { border-left-color: #93a1a1; color: #93a1a1; }
+        .markdown-body table th, .markdown-body table td { border-color: #eee8d5; }
+        .markdown-body hr { background: #eee8d5; }
+        """),
+        ("Solarized Dark", """
+        .markdown-body { background: #002b36; color: #839496; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #268bd2; border-color: #073642; }
+        .markdown-body a { color: #2aa198; }
+        .markdown-body pre, .markdown-body code { background: #073642; }
+        .markdown-body pre code.hljs { background: transparent; }
+        .markdown-body blockquote { border-left-color: #586e75; color: #586e75; }
+        .markdown-body table th, .markdown-body table td { border-color: #073642; }
+        .markdown-body table tr { background: #002b36; }
+        .markdown-body table tr:nth-child(2n) { background: #073642; }
+        .markdown-body hr { background: #073642; }
+        """),
+        ("Nord", """
+        .markdown-body { background: #2e3440; color: #d8dee9; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #88c0d0; border-color: #3b4252; }
+        .markdown-body a { color: #88c0d0; }
+        .markdown-body pre, .markdown-body code { background: #3b4252; }
+        .markdown-body pre code.hljs { background: transparent; }
+        .markdown-body blockquote { border-left-color: #4c566a; color: #616e88; }
+        .markdown-body table th, .markdown-body table td { border-color: #3b4252; }
+        .markdown-body table tr { background: #2e3440; }
+        .markdown-body table tr:nth-child(2n) { background: #3b4252; }
+        .markdown-body hr { background: #3b4252; }
+        .markdown-body strong { color: #81a1c1; }
+        """),
+        ("Sepia", """
+        .markdown-body { background: #f5f0e8; color: #5b4636; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #8b4513; border-color: #e8ddd0; }
+        .markdown-body a { color: #b8860b; }
+        .markdown-body pre, .markdown-body code { background: #ede5d8; }
+        .markdown-body pre code.hljs { background: transparent; }
+        .markdown-body blockquote { border-left-color: #c4a882; color: #8b7355; }
+        .markdown-body table th, .markdown-body table td { border-color: #e8ddd0; }
+        .markdown-body table tr { background: #f5f0e8; }
+        .markdown-body table tr:nth-child(2n) { background: #ede5d8; }
+        .markdown-body hr { background: #e8ddd0; }
+        """),
+    ]
+
     static let themesDirectory: URL = {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("QuickMD/themes")

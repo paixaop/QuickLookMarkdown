@@ -93,6 +93,14 @@ private func evalJS(_ code: String) {
     WebViewStore.shared.webView?.evaluateJavaScript(code) { _, _ in }
 }
 
+private func applyCustomCSS(_ css: String) {
+    let escaped = css
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "'", with: "\\'")
+        .replacingOccurrences(of: "\n", with: "\\n")
+    evalJS("(function(){var el=document.getElementById('custom-theme');if(!el){el=document.createElement('style');el.id='custom-theme';document.head.appendChild(el);}el.textContent='\(escaped)';})()")
+}
+
 private func applySpellCheck(_ enabled: Bool) {
     guard let window = NSApp.keyWindow else { return }
     if let tv = findEditorTextViewIn(window.contentView) {
@@ -221,24 +229,34 @@ struct QuickMDApp: App {
                 .keyboardShortcut("e", modifiers: [.command, .shift])
             }
             CommandMenu("Theme") {
-                Button("System") {
+                Button("System (Default)") {
                     theme = "system"
                     evalJS("if(window.__setTheme) __setTheme('system')")
                     evalJS("document.getElementById('custom-theme')?.remove()")
                 }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
-                Button("Light") {
+                Button("Force Light") {
                     theme = "light"
                     evalJS("if(window.__setTheme) __setTheme('light')")
                     evalJS("document.getElementById('custom-theme')?.remove()")
                 }
                 .keyboardShortcut("l", modifiers: [.command, .option])
-                Button("Dark") {
+                Button("Force Dark") {
                     theme = "dark"
                     evalJS("if(window.__setTheme) __setTheme('dark')")
                     evalJS("document.getElementById('custom-theme')?.remove()")
                 }
                 .keyboardShortcut("d", modifiers: [.command, .option])
+
+                Divider()
+
+                // Built-in color themes
+                ForEach(MarkdownDocumentModel.builtInThemes, id: \.name) { builtIn in
+                    Button(builtIn.name) {
+                        theme = "builtin:\(builtIn.name)"
+                        applyCustomCSS(builtIn.css)
+                    }
+                }
 
                 let customThemes = MarkdownDocumentModel.availableThemes()
                 if !customThemes.isEmpty {
@@ -247,12 +265,29 @@ struct QuickMDApp: App {
                         Button(name) {
                             theme = "custom:\(name)"
                             let css = MarkdownDocumentModel.customCSS(for: name)
-                                .replacingOccurrences(of: "\\", with: "\\\\")
-                                .replacingOccurrences(of: "'", with: "\\'")
-                                .replacingOccurrences(of: "\n", with: "\\n")
-                            evalJS("(function(){var el=document.getElementById('custom-theme');if(!el){el=document.createElement('style');el.id='custom-theme';document.head.appendChild(el);}el.textContent='\(css)';})()")
+                            applyCustomCSS(css)
                         }
                     }
+                }
+
+                Divider()
+
+                Button("Custom CSS\u{2026}") {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.init(filenameExtension: "css") ?? .plainText]
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK, let url = panel.url {
+                        let dest = MarkdownDocumentModel.themesDirectory.appendingPathComponent(url.lastPathComponent)
+                        try? FileManager.default.copyItem(at: url, to: dest)
+                        let name = url.deletingPathExtension().lastPathComponent
+                        theme = "custom:\(name)"
+                        let css = MarkdownDocumentModel.customCSS(for: name)
+                        applyCustomCSS(css)
+                    }
+                }
+
+                Button("Open Themes Folder") {
+                    NSWorkspace.shared.open(MarkdownDocumentModel.themesDirectory)
                 }
             }
             CommandGroup(after: .toolbar) {
