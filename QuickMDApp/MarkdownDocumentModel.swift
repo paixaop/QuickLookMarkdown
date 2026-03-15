@@ -164,6 +164,21 @@ final class MarkdownDocumentModel: ObservableObject {
     @Published var currentURL: URL?
     @Published var rawContent: String = ""
     @Published var autoReload = false
+    let undoManager = UndoManager()
+
+    /// Set rawContent with undo support. Use for programmatic changes (AI, toolbar actions).
+    func setContent(_ newContent: String, actionName: String = "AI Transform") {
+        let oldContent = rawContent
+        undoManager.registerUndo(withTarget: self) { target in
+            target.setContent(oldContent, actionName: actionName)
+        }
+        undoManager.setActionName(actionName)
+        rawContent = newContent
+        if let url = currentURL {
+            try? newContent.write(to: url, atomically: true, encoding: .utf8)
+        }
+        rerender()
+    }
     private var fileWatcherSource: DispatchSourceFileSystemObject?
 
     // MARK: - Navigation History
@@ -204,6 +219,18 @@ final class MarkdownDocumentModel: ObservableObject {
         isNavigating = true
         load(from: next)
         isNavigating = false
+    }
+
+    /// Re-render HTML from current rawContent without reloading from disk.
+    func rerender() {
+        guard let url = currentURL else { return }
+        let ext = url.pathExtension.lowercased()
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
+        try? rawContent.write(to: tempURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        if let result = try? Self.htmlBody(for: tempURL) {
+            html = Self.wrapHTML(result.html, isMarkdown: result.isMarkdown)
+        }
     }
 
     func load(from url: URL) {
@@ -321,6 +348,10 @@ final class MarkdownDocumentModel: ObservableObject {
         loadResource("viz-standalone", ext: "js", label: "viz-standalone.js")
     }()
 
+    static let morphdomJS: String = {
+        loadResource("morphdom-umd.min", ext: "js", label: "morphdom")
+    }()
+
     static let highlightGitHubCSS: String = {
         loadResource("highlight-github", ext: "css", label: "highlight GitHub CSS")
     }()
@@ -364,12 +395,13 @@ final class MarkdownDocumentModel: ObservableObject {
         var graphDefinition = code.textContent || '';
         var host = document.createElement('div');
         host.className = 'mermaid';
+        host.dataset.source = graphDefinition;
         var pre = code.closest('pre');
         if (pre) {
           pre.replaceWith(host);
           try {
             mermaid.render('mermaid-' + idx + '-' + Date.now(), graphDefinition)
-              .then(function(result) { host.innerHTML = result.svg; })
+              .then(function(result) { host.innerHTML = result.svg; })  // trusted local content from user's own markdown
               .catch(function() { host.textContent = 'Mermaid render error'; });
           } catch(e) { host.textContent = 'Mermaid render error'; }
         }
@@ -528,6 +560,7 @@ final class MarkdownDocumentModel: ObservableObject {
       if (window.hljs) {
         document.querySelectorAll('pre code').forEach(function(block) {
           if (!block.classList.contains('language-mermaid')) {
+            block.dataset.rawText = block.textContent;
             hljs.highlightElement(block);
           }
         });
@@ -866,14 +899,93 @@ final class MarkdownDocumentModel: ObservableObject {
       if (!container) return;
       var content = document.querySelector('.markdown-body');
       if (!content) return;
+      var layout = document.getElementById('layout');
+      if (!layout) return;
+
+      // Expose __buildTOC for incremental updates
+      window.__buildTOC = function() {
+        var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
+        var tree = document.getElementById('toc-tree');
+        if (!tree) return;
+        tree.innerHTML = '';
+        if (headings.length === 0) {
+          container.classList.add('hidden');
+          layout.classList.remove('has-toc');
+          return;
+        }
+        container.classList.remove('hidden');
+        layout.classList.add('has-toc');
+        // Assign IDs
+        var slugCounts = {};
+        headings.forEach(function(h) {
+          var text = h.textContent || '';
+          var slug = text.toLowerCase().trim()
+            .replace(/[^\\w\\s-]/g, '').replace(/[\\s]+/g, '-').replace(/^-+|-+$/g, '');
+          if (!slug) slug = 'heading';
+          if (slugCounts[slug] != null) { slugCounts[slug]++; slug += '-' + slugCounts[slug]; }
+          else { slugCounts[slug] = 0; }
+          h.id = slug;
+        });
+        var items = [];
+        headings.forEach(function(h) {
+          items.push({ el: h, level: parseInt(h.tagName.charAt(1)), children: [] });
+        });
+        items.forEach(function(item, idx) {
+          var minLevel = items[0].level;
+          var indent = item.level - minLevel;
+          var hasChildren = (idx + 1 < items.length && items[idx + 1].level > item.level);
+          var row = document.createElement('div');
+          row.className = 'toc-item';
+          row.setAttribute('data-heading-id', item.el.id);
+          row.style.paddingLeft = (8 + indent * 14) + 'px';
+          var toggle = document.createElement('span');
+          toggle.className = 'toc-toggle';
+          if (hasChildren) {
+            toggle.textContent = '\\u25B6';
+            toggle.addEventListener('click', function(e) {
+              e.stopPropagation();
+              row.classList.toggle('collapsed');
+              var myLevel = item.level;
+              var sibling = row.nextElementSibling;
+              while (sibling && sibling.classList.contains('toc-item')) {
+                var sibLevel = parseInt(sibling.getAttribute('data-level'));
+                if (sibLevel <= myLevel) break;
+                sibling.style.display = row.classList.contains('collapsed') ? 'none' : 'flex';
+                sibling = sibling.nextElementSibling;
+              }
+            });
+          } else { toggle.classList.add('no-children'); }
+          row.appendChild(toggle);
+          var label = document.createElement('span');
+          label.className = 'toc-label';
+          label.textContent = item.el.textContent;
+          label.addEventListener('click', function() { item.el.scrollIntoView({ behavior: 'smooth' }); });
+          row.appendChild(label);
+          row.setAttribute('data-level', item.level);
+          tree.appendChild(row);
+        });
+        // Re-observe headings
+        if (window.__tocObserver) window.__tocObserver.disconnect();
+        var tocItems = tree.querySelectorAll('.toc-item');
+        window.__tocObserver = new IntersectionObserver(function(entries) {
+          entries.forEach(function(entry) {
+            if (entry.isIntersecting) {
+              tocItems.forEach(function(ti) { ti.classList.remove('active'); });
+              var id = entry.target.id;
+              var match = tree.querySelector('.toc-item[data-heading-id="' + id + '"]');
+              if (match) match.classList.add('active');
+            }
+          });
+        }, { root: content, rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
+        headings.forEach(function(h) { window.__tocObserver.observe(h); });
+      };
+
       var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
       if (headings.length === 0) {
         container.classList.add('hidden');
         layout.classList.remove('has-toc');
         return;
       }
-      var layout = document.getElementById('layout');
-      if (!layout) return;
       layout.classList.add('has-toc');
       // Assign IDs (GitHub-style slugs)
       var slugCounts = {};
@@ -1088,17 +1200,21 @@ final class MarkdownDocumentModel: ObservableObject {
 
     static let anchorLinksScript = """
     (function() {
-      var body = document.querySelector('.markdown-body');
-      if (!body) return;
-      body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function(h) {
-        if (!h.id) return;
-        var a = document.createElement('a');
-        a.className = 'heading-anchor';
-        a.href = '#' + h.id;
-        a.textContent = '#';
-        a.addEventListener('click', function(e) { e.stopPropagation(); });
-        h.insertBefore(a, h.firstChild);
-      });
+      window.__setupAnchorLinks = function() {
+        var body = document.querySelector('.markdown-body');
+        if (!body) return;
+        body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function(h) {
+          if (!h.id) return;
+          if (h.querySelector('.heading-anchor')) return;
+          var a = document.createElement('a');
+          a.className = 'heading-anchor';
+          a.href = '#' + h.id;
+          a.textContent = '#';
+          a.addEventListener('click', function(e) { e.stopPropagation(); });
+          h.insertBefore(a, h.firstChild);
+        });
+      };
+      __setupAnchorLinks();
     })();
     """
 
@@ -1199,29 +1315,32 @@ final class MarkdownDocumentModel: ObservableObject {
         'anger':'\\uD83D\\uDCA2','skull_and_crossbones':'\\u2620\\uFE0F'
       };
       var re = /:([a-z0-9_+-]+):/g;
-      var body = document.querySelector('.markdown-body') || document.body;
-      var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
-        acceptNode: function(node) {
-          var p = node.parentNode;
-          while (p && p !== body) {
-            var tag = p.tagName;
-            if (tag === 'PRE' || tag === 'CODE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
-            p = p.parentNode;
+      window.__applyEmoji = function(container) {
+        var body = container || document.querySelector('.markdown-body') || document.body;
+        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+          acceptNode: function(node) {
+            var p = node.parentNode;
+            while (p && p !== body) {
+              var tag = p.tagName;
+              if (tag === 'PRE' || tag === 'CODE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+              p = p.parentNode;
+            }
+            return NodeFilter.FILTER_ACCEPT;
           }
-          return NodeFilter.FILTER_ACCEPT;
-        }
-      });
-      var nodes = [];
-      while (walker.nextNode()) nodes.push(walker.currentNode);
-      nodes.forEach(function(node) {
-        var text = node.textContent;
-        if (!re.test(text)) return;
-        re.lastIndex = 0;
-        var newText = text.replace(re, function(match, code) {
-          return map[code] || match;
         });
-        if (newText !== text) node.textContent = newText;
-      });
+        var nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        nodes.forEach(function(node) {
+          var text = node.textContent;
+          if (!re.test(text)) return;
+          re.lastIndex = 0;
+          var newText = text.replace(re, function(match, code) {
+            return map[code] || match;
+          });
+          if (newText !== text) node.textContent = newText;
+        });
+      };
+      __applyEmoji();
     })();
     """
 
@@ -1229,8 +1348,12 @@ final class MarkdownDocumentModel: ObservableObject {
 
     static let footnotesScript = """
     (function() {
-      var body = document.querySelector('.markdown-body');
-      if (!body) return;
+      window.__setupFootnotes = function() {
+        var body = document.querySelector('.markdown-body');
+        if (!body) return;
+        // Remove existing footnotes section before rebuilding
+        var existing = body.querySelector('section.footnotes');
+        if (existing) existing.remove();
       var defs = {};
       var paras = body.querySelectorAll('p');
       var defParas = [];
@@ -1305,6 +1428,8 @@ final class MarkdownDocumentModel: ObservableObject {
       });
       section.appendChild(ol);
       body.appendChild(section);
+      };
+      __setupFootnotes();
     })();
     """
 
@@ -1312,6 +1437,10 @@ final class MarkdownDocumentModel: ObservableObject {
 
     static let frontmatterScript = """
     (function() {
+      window.__setupFrontmatter = function() {
+        // Remove existing banner before rebuilding
+        var existingBanner = document.querySelector('.frontmatter-banner');
+        if (existingBanner) existingBanner.remove();
       var el = document.getElementById('frontmatter-data');
       if (!el) return;
       var raw = el.textContent;
@@ -1354,6 +1483,8 @@ final class MarkdownDocumentModel: ObservableObject {
           else body.insertBefore(banner, body.firstChild);
         }
       } catch(e) {}
+      };
+      __setupFrontmatter();
     })();
     """
 
@@ -1426,19 +1557,45 @@ final class MarkdownDocumentModel: ObservableObject {
     })();
     """
 
+    // Intercept link clicks via JS and forward to Swift, because WKWebView
+    // may silently block file:// navigations from loadHTMLString pages
+    // before decidePolicyFor is ever called.
+    static let linkClickScript = """
+    (function() {
+      document.addEventListener('click', function(e) {
+        var a = e.target.closest('a[href]');
+        if (!a) return;
+        var href = a.href;
+        if (!href) return;
+        // Let anchor links work normally
+        if (href.indexOf('#') === 0 || (a.getAttribute('href') || '').indexOf('#') === 0) return;
+        // Same-page anchor links
+        if (a.hash && a.pathname === location.pathname) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.linkClick) {
+          window.webkit.messageHandlers.linkClick.postMessage({ url: href });
+        }
+      }, true);
+    })();
+    """
+
     static let checkboxToggleScript = """
     (function() {
-      var checkboxes = document.querySelectorAll('.markdown-body input[type="checkbox"]');
-      checkboxes.forEach(function(cb, index) {
-        cb.disabled = false;
-        cb.style.cursor = 'pointer';
-        cb.addEventListener('change', function(e) {
-          var checked = e.target.checked;
-          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.checkboxToggle) {
-            window.webkit.messageHandlers.checkboxToggle.postMessage({index: index, checked: checked});
-          }
+      window.__setupCheckboxes = function() {
+        var checkboxes = document.querySelectorAll('.markdown-body input[type="checkbox"]');
+        checkboxes.forEach(function(cb, index) {
+          cb.disabled = false;
+          cb.style.cursor = 'pointer';
+          cb.addEventListener('change', function(e) {
+            var checked = e.target.checked;
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.checkboxToggle) {
+              window.webkit.messageHandlers.checkboxToggle.postMessage({index: index, checked: checked});
+            }
+          });
         });
-      });
+      };
+      __setupCheckboxes();
     })();
     """
 
@@ -1493,40 +1650,273 @@ final class MarkdownDocumentModel: ObservableObject {
         if (maxScroll > 0) el.scrollTop = fraction * maxScroll;
       };
 
-      // Double-click: find the clicked text and send surrounding words to Swift
+      // Double-click: find the clicked text and send block context to Swift
       document.addEventListener('dblclick', function(e) {
         var sel = window.getSelection();
         if (!sel || sel.rangeCount === 0) return;
         var word = sel.toString().trim();
         if (!word) return;
 
+        // Find the enclosing block element to get paragraph-level context
         var node = sel.anchorNode;
-        var textContent = (node && node.textContent) ? node.textContent : '';
-        var allText = textContent;
         var block = node;
         while (block && block.nodeType !== 1) block = block.parentNode;
         var blockTags = ['P','LI','H1','H2','H3','H4','H5','H6','TD','TH','BLOCKQUOTE','PRE','DIV'];
         while (block && blockTags.indexOf(block.tagName) === -1) block = block.parentElement;
-        if (block) allText = block.textContent || allText;
+        var blockText = block ? (block.textContent || '').trim() : '';
 
-        var words = allText.split(/\\s+/).filter(function(w) { return w.length > 0; });
+        // Get surrounding words for additional context
+        var words = blockText.split(/\\s+/).filter(function(w) { return w.length > 0; });
         var wordIdx = -1;
         for (var i = 0; i < words.length; i++) {
           if (words[i].indexOf(word) !== -1) { wordIdx = i; break; }
         }
-        var before = wordIdx > 0 ? words.slice(Math.max(0, wordIdx - 3), wordIdx).join(' ') : '';
-        var after = wordIdx >= 0 ? words.slice(wordIdx + 1, wordIdx + 4).join(' ') : '';
+        var before = wordIdx > 0 ? words.slice(Math.max(0, wordIdx - 5), wordIdx).join(' ') : '';
+        var after = wordIdx >= 0 ? words.slice(wordIdx + 1, wordIdx + 6).join(' ') : '';
 
-        var el = getScrollContainer();
-        var rect = sel.getRangeAt(0).getBoundingClientRect();
-        var scrollFraction = (rect.top + el.scrollTop) / el.scrollHeight;
+        // Count which block this is among all blocks (gives structural position)
+        var article = document.querySelector('article.markdown-body');
+        var allBlocks = article ? article.querySelectorAll('p,li,h1,h2,h3,h4,h5,h6,td,th,blockquote,pre') : [];
+        var blockIndex = -1;
+        for (var i = 0; i < allBlocks.length; i++) {
+          if (allBlocks[i] === block || allBlocks[i].contains(block)) { blockIndex = i; break; }
+        }
 
         if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
           window.webkit.messageHandlers.editorSync.postMessage({
-            type: 'dblclick', word: word, before: before, after: after, fraction: scrollFraction
+            type: 'dblclick', word: word, before: before, after: after,
+            blockText: blockText, blockIndex: blockIndex, totalBlocks: allBlocks.length
           });
         }
       });
+    })();
+    """
+
+    /// Incremental content update: replaces article content and re-runs post-processing scripts.
+    /// This avoids a full page reload which causes flickering during live editing.
+    /// Note: The HTML is generated from the user's own markdown via the Down library (trusted content),
+    /// and is injected via evaluateJavaScript from Swift — not from external/untrusted sources.
+    static let contentUpdateScript = """
+    (function() {
+      // Helper: highlight a single code block (pretty-print + hljs)
+      function highlightCode(code) {
+        if (code.classList.contains('language-json')) {
+          try { var obj = JSON.parse(code.textContent); code.textContent = JSON.stringify(obj, null, 2); } catch(e) {}
+        }
+        if ((code.classList.contains('language-yaml') || code.classList.contains('language-yml')) && window.jsyaml) {
+          try { var obj = jsyaml.load(code.textContent); code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 }); } catch(e) {}
+        }
+        if (window.hljs && !code.classList.contains('language-mermaid')) {
+          code.dataset.rawText = code.textContent;
+          hljs.highlightElement(code);
+        }
+      }
+
+      // Helper: add copy button to a <pre> if not already present
+      function addCopyButton(pre) {
+        if (pre.querySelector('.copy-btn')) return;
+        var code = pre.querySelector('code');
+        if (!code || code.classList.contains('language-mermaid')) return;
+        pre.style.position = 'relative';
+        var btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.textContent = 'Copy';
+        btn.addEventListener('click', function(e) {
+          e.preventDefault(); e.stopPropagation();
+          var text = code.textContent || '';
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function() {
+              btn.textContent = 'Copied!'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+            });
+          }
+        });
+        pre.appendChild(btn);
+      }
+
+      // Helper: render a mermaid code block
+      function renderMermaid(code, idx) {
+        var graphDefinition = code.textContent || '';
+        var host = document.createElement('div');
+        host.className = 'mermaid';
+        host.dataset.source = graphDefinition;
+        var pre = code.closest('pre');
+        if (pre) {
+          pre.replaceWith(host);
+          try {
+            mermaid.render('mermaid-upd-' + idx + '-' + Date.now(), graphDefinition)
+              .then(function(result) { host.innerHTML = result.svg; })
+              .catch(function() { host.textContent = 'Mermaid render error'; });
+          } catch(e) { host.textContent = 'Mermaid render error'; }
+        }
+      }
+
+      window.__updateContent = function(html) {
+        var article = document.querySelector('article.markdown-body');
+        if (!article) return;
+        var scrollEl = document.scrollingElement || document.documentElement;
+        var savedScroll = scrollEl.scrollTop;
+
+        // Track what changed for selective post-processing
+        var changedCodeBlocks = [];
+        var changedMermaidBlocks = [];
+        var headingsChanged = false;
+        var anyNodeChanged = false;
+
+        if (typeof morphdom === 'function') {
+          // Build a temporary container to parse new HTML
+          var template = document.createElement('article');
+          template.className = article.className;
+          template.innerHTML = html;
+
+          // Pre-process: convert mermaid <pre><code> in template to <div class="mermaid" data-source="...">
+          // so morphdom can match them against already-rendered mermaid divs in the DOM
+          template.querySelectorAll('pre > code.language-mermaid').forEach(function(code) {
+            var src = code.textContent || '';
+            var div = document.createElement('div');
+            div.className = 'mermaid';
+            div.dataset.source = src;
+            div.textContent = src;
+            code.closest('pre').replaceWith(div);
+          });
+
+          // Apply emoji to template before morphing so text nodes match
+          if (window.__applyEmoji) __applyEmoji(template);
+
+          morphdom(article, template, {
+            childrenOnly: true,
+            onBeforeElUpdated: function(fromEl, toEl) {
+              // Skip already-highlighted code blocks whose raw text hasn't changed
+              if (fromEl.tagName === 'CODE' && fromEl.parentElement && fromEl.parentElement.tagName === 'PRE') {
+                if (fromEl.dataset.rawText && fromEl.dataset.rawText === toEl.textContent) {
+                  return false;
+                }
+              }
+              // Skip mermaid divs whose source hasn't changed
+              if (fromEl.classList && fromEl.classList.contains('mermaid') && fromEl.dataset.source) {
+                if (fromEl.dataset.source === toEl.dataset.source) {
+                  return false;
+                }
+              }
+              return true;
+            },
+            onElUpdated: function(el) {
+              anyNodeChanged = true;
+              if (el.tagName === 'CODE' && el.parentElement && el.parentElement.tagName === 'PRE') {
+                changedCodeBlocks.push(el);
+              }
+              if (el.classList && el.classList.contains('mermaid') && el.dataset.source) {
+                changedMermaidBlocks.push(el);
+              }
+              if (/^H[1-6]$/.test(el.tagName)) headingsChanged = true;
+            },
+            onNodeAdded: function(node) {
+              anyNodeChanged = true;
+              if (node.nodeType !== 1) return node;
+              if (node.tagName === 'CODE' && node.parentElement && node.parentElement.tagName === 'PRE') {
+                changedCodeBlocks.push(node);
+              }
+              if (node.tagName === 'PRE') {
+                var code = node.querySelector('code');
+                if (code) changedCodeBlocks.push(code);
+              }
+              if (node.classList && node.classList.contains('mermaid') && node.dataset.source) {
+                changedMermaidBlocks.push(node);
+              }
+              if (/^H[1-6]$/.test(node.tagName)) headingsChanged = true;
+              // Check children for headings
+              if (node.querySelectorAll) {
+                if (node.querySelectorAll('h1,h2,h3,h4,h5,h6').length > 0) headingsChanged = true;
+                node.querySelectorAll('pre > code').forEach(function(c) { changedCodeBlocks.push(c); });
+                node.querySelectorAll('.mermaid[data-source]').forEach(function(m) { changedMermaidBlocks.push(m); });
+              }
+              return node;
+            },
+            onBeforeNodeDiscarded: function(node) {
+              if (node.nodeType === 1 && /^H[1-6]$/.test(node.tagName)) headingsChanged = true;
+              return true;
+            }
+          });
+
+          // Selectively highlight only changed code blocks
+          changedCodeBlocks.forEach(function(code) {
+            if (!code.classList.contains('language-mermaid')) {
+              highlightCode(code);
+            }
+          });
+
+          // Add copy buttons to parents of changed code blocks + any new pres
+          changedCodeBlocks.forEach(function(code) {
+            var pre = code.closest('pre');
+            if (pre) addCopyButton(pre);
+          });
+
+          // Re-render only changed mermaid blocks
+          if (window.mermaid && changedMermaidBlocks.length > 0) {
+            var dt = document.documentElement.getAttribute('data-theme');
+            var mermaidTheme;
+            if (dt === 'dark') { mermaidTheme = 'dark'; }
+            else if (dt === 'light') { mermaidTheme = 'neutral'; }
+            else { mermaidTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'neutral'; }
+            mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: mermaidTheme });
+            changedMermaidBlocks.forEach(function(div, idx) {
+              var src = div.dataset.source || '';
+              try {
+                mermaid.render('mermaid-upd-' + idx + '-' + Date.now(), src)
+                  .then(function(result) { div.innerHTML = result.svg; })
+                  .catch(function() { div.textContent = 'Mermaid render error'; });
+              } catch(e) { div.textContent = 'Mermaid render error'; }
+            });
+          }
+
+          // Selective post-processing
+          if (window.__setupCheckboxes) __setupCheckboxes();
+          if (headingsChanged) {
+            if (window.__buildTOC) __buildTOC();
+            if (window.__setupAnchorLinks) __setupAnchorLinks();
+          }
+          if (window.__setupFootnotes) __setupFootnotes();
+          if (window.__setupFrontmatter) __setupFrontmatter();
+
+        } else {
+          // Fallback: no morphdom available, replace innerHTML
+          article.innerHTML = html;
+          if (window.__applyEmoji) __applyEmoji();
+
+          document.querySelectorAll('pre > code.language-json').forEach(function(code) {
+            try { var obj = JSON.parse(code.textContent); code.textContent = JSON.stringify(obj, null, 2); } catch(e) {}
+          });
+          if (window.jsyaml) {
+            document.querySelectorAll('pre > code.language-yaml, pre > code.language-yml').forEach(function(code) {
+              try { var obj = jsyaml.load(code.textContent); code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 }); } catch(e) {}
+            });
+          }
+          if (window.hljs) {
+            document.querySelectorAll('pre code').forEach(function(block) {
+              if (!block.classList.contains('language-mermaid')) {
+                block.dataset.rawText = block.textContent;
+                hljs.highlightElement(block);
+              }
+            });
+          }
+          document.querySelectorAll('pre > code').forEach(function(code) {
+            if (code.classList.contains('language-mermaid')) return;
+            var pre = code.parentElement;
+            if (pre) addCopyButton(pre);
+          });
+          if (window.mermaid) {
+            document.querySelectorAll('pre > code.language-mermaid').forEach(function(code, idx) {
+              renderMermaid(code, idx);
+            });
+          }
+          if (window.__setupCheckboxes) __setupCheckboxes();
+          if (window.__buildTOC) __buildTOC();
+          if (window.__setupAnchorLinks) __setupAnchorLinks();
+          if (window.__setupFootnotes) __setupFootnotes();
+          if (window.__setupFrontmatter) __setupFrontmatter();
+        }
+
+        scrollEl.scrollTop = savedScroll;
+      };
     })();
     """
 
@@ -1550,6 +1940,20 @@ final class MarkdownDocumentModel: ObservableObject {
 
     static func htmlBodyPublic(for url: URL) throws -> (html: String, isMarkdown: Bool) {
         try htmlBody(for: url)
+    }
+
+    /// Generate just the body HTML from markdown text (for incremental updates without full page reload).
+    static func markdownBodyHTML(from text: String) -> String {
+        let (body, frontmatter) = stripFrontmatter(text)
+        var html = HTMLFormatter.format(body)
+        if let fm = frontmatter {
+            let escaped = fm
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            html = "<div id=\"frontmatter-data\" style=\"display:none\">\(escaped)</div>\n" + html
+        }
+        return html
     }
 
     static func wrapHTMLPublic(_ body: String, isMarkdown: Bool) -> String {

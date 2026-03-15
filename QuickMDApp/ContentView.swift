@@ -104,6 +104,11 @@ struct WebView: NSViewRepresentable {
                     try? updated.write(to: url, atomically: true, encoding: .utf8)
                 }
 
+            case "linkClick":
+                guard let urlString = body["url"] as? String,
+                      let url = URL(string: urlString) else { return }
+                handleLinkClick(url)
+
             case "editorSync":
                 guard let type = body["type"] as? String else { return }
                 if type == "scroll" {
@@ -115,21 +120,63 @@ struct WebView: NSViewRepresentable {
                     guard let word = body["word"] as? String else { return }
                     let before = body["before"] as? String ?? ""
                     let after = body["after"] as? String ?? ""
-                    let fraction = body["fraction"] as? Double ?? 0
+                    let blockText = body["blockText"] as? String ?? ""
+                    let blockIndex = body["blockIndex"] as? Int ?? -1
+                    let totalBlocks = body["totalBlocks"] as? Int ?? 0
 
                     // If editor is not visible, show it first, then jump after a delay
                     if findEditorTextView() == nil {
                         WebViewStore.shared.showEditorCallback?()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
-                            self.jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+                            self.jumpEditorToWord(word, before: before, after: after, blockText: blockText, blockIndex: blockIndex, totalBlocks: totalBlocks)
                         }
                     } else {
-                        jumpEditorToWord(word, before: before, after: after, fraction: fraction)
+                        jumpEditorToWord(word, before: before, after: after, blockText: blockText, blockIndex: blockIndex, totalBlocks: totalBlocks)
                     }
                 }
 
             default:
                 break
+            }
+        }
+
+        // MARK: - Link click handling
+
+        private func handleLinkClick(_ url: URL) {
+            if url.isFileURL {
+                openFileLink(url)
+            } else {
+                NSWorkspace.shared.open(url)
+            }
+        }
+
+        private func openFileLink(_ url: URL) {
+            let standardized = url.standardizedFileURL
+
+            // Check if already open in an existing tab/window
+            for window in NSApp.windows {
+                if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+                    window.makeKeyAndOrderFront(nil)
+                    if let tabGroup = window.tabGroup {
+                        tabGroup.selectedWindow = window
+                    }
+                    return
+                }
+            }
+
+            // Gain sandbox access via bookmarked parent directory
+            let dirURL = MarkdownDocumentModel.accessDirectoryForFile(url)
+            let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+
+            if openInNewTab {
+                AppDelegate.pendingDirAccess = dirURL
+                AppDelegate.pendingURL = url
+                NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
+            } else {
+                if let model = AppDelegate.activeModel {
+                    model.navigateTo(url)
+                }
+                if let dirURL { dirURL.stopAccessingSecurityScopedResource() }
             }
         }
 
@@ -154,7 +201,7 @@ struct WebView: NSViewRepresentable {
 
         // MARK: - Double-click → jump to word in editor
 
-        private func jumpEditorToWord(_ word: String, before: String, after: String, fraction: Double) {
+        private func jumpEditorToWord(_ word: String, before: String, after: String, blockText: String, blockIndex: Int, totalBlocks: Int) {
             guard let model = AppDelegate.activeModel,
                   let textView = findEditorTextView() else { return }
             let source = model.rawContent
@@ -173,46 +220,91 @@ struct WebView: NSViewRepresentable {
 
             guard !occurrences.isEmpty else { return }
 
-            // Use document position fraction as primary locator:
-            // estimate where in the source this word should be
-            let targetPos = fraction * Double(max(1, nsSource.length))
+            // If only one occurrence, use it directly
+            if occurrences.count == 1 {
+                selectAndReveal(occurrences[0], in: textView)
+                return
+            }
 
-            // Find the occurrence closest to the estimated source position
-            var bestRange = occurrences[0]
-            var bestDistance = abs(Double(bestRange.location) - targetPos)
+            // Strategy 1: Find the block text in source, then find word within that block
+            if !blockText.isEmpty {
+                // Normalize whitespace for fuzzy matching
+                let normalizedBlock = blockText.components(separatedBy: .whitespacesAndNewlines)
+                    .filter { !$0.isEmpty }.joined(separator: " ").lowercased()
 
-            if occurrences.count > 1 {
-                let beforeWords = before.split(separator: " ").map { $0.lowercased() }
-                let afterWords = after.split(separator: " ").map { $0.lowercased() }
+                // Try to find a region in source that matches the block content.
+                // Extract significant words from the block (first 6 + last 3 for uniqueness)
+                let blockWords = normalizedBlock.split(separator: " ").map(String.init)
+                if blockWords.count >= 3 {
+                    let searchPhrase = blockWords.prefix(6).joined(separator: " ")
+                    // Search source line-by-line for a line containing these words
+                    let lines = source.components(separatedBy: .newlines)
+                    var bestLine: Int? = nil
+                    var bestLineScore = 0
+                    for (i, line) in lines.enumerated() {
+                        let lowLine = line.lowercased()
+                        if lowLine.contains(searchPhrase) {
+                            bestLine = i
+                            break
+                        }
+                        // Partial match: count how many block words appear
+                        var score = 0
+                        for w in blockWords.prefix(8) where lowLine.contains(w) { score += 1 }
+                        if score > bestLineScore { bestLineScore = score; bestLine = i }
+                    }
 
-                for occ in occurrences {
-                    let distance = abs(Double(occ.location) - targetPos)
+                    if let lineIdx = bestLine {
+                        // Calculate character offset of this line
+                        var charOffset = 0
+                        for i in 0..<lineIdx {
+                            charOffset += lines[i].count + 1 // +1 for newline
+                        }
+                        let lineEnd = charOffset + lines[lineIdx].count
 
-                    if distance < bestDistance - Double(nsSource.length) * 0.02 {
-                        // Clearly closer — use it
-                        bestDistance = distance
-                        bestRange = occ
-                    } else if abs(distance - bestDistance) <= Double(nsSource.length) * 0.02 {
-                        // Similar distance — use context words as tiebreaker
-                        let occScore = contextScore(for: occ, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
-                        let bestScore = contextScore(for: bestRange, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
-                        if occScore > bestScore || (occScore == bestScore && distance < bestDistance) {
-                            bestDistance = distance
-                            bestRange = occ
+                        // Find the word occurrence closest to this line
+                        let nearOccurrences = occurrences.filter { $0.location >= max(0, charOffset - 50) && $0.location <= lineEnd + 50 }
+                        if let match = nearOccurrences.first {
+                            selectAndReveal(match, in: textView)
+                            return
                         }
                     }
                 }
             }
 
+            // Strategy 2: Use block index as fraction to estimate position
+            if blockIndex >= 0 && totalBlocks > 0 {
+                let fraction = Double(blockIndex) / Double(max(1, totalBlocks))
+                let targetPos = fraction * Double(nsSource.length)
+                let best = occurrences.min(by: { abs(Double($0.location) - targetPos) < abs(Double($1.location) - targetPos) })!
+                selectAndReveal(best, in: textView)
+                return
+            }
+
+            // Fallback: use context words to score
+            let beforeWords = before.split(separator: " ").map { $0.lowercased() }
+            let afterWords = after.split(separator: " ").map { $0.lowercased() }
+            var bestRange = occurrences[0]
+            var bestScore = contextScore(for: bestRange, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
+            for occ in occurrences.dropFirst() {
+                let score = contextScore(for: occ, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
+                if score > bestScore {
+                    bestScore = score
+                    bestRange = occ
+                }
+            }
+            selectAndReveal(bestRange, in: textView)
+        }
+
+        private func selectAndReveal(_ range: NSRange, in textView: NSTextView) {
             textView.window?.makeFirstResponder(textView)
-            textView.setSelectedRange(bestRange)
-            textView.scrollRangeToVisible(bestRange)
-            textView.showFindIndicator(for: bestRange)
+            textView.setSelectedRange(range)
+            textView.scrollRangeToVisible(range)
+            textView.showFindIndicator(for: range)
         }
 
         private func contextScore(for range: NSRange, in source: NSString, beforeWords: [String], afterWords: [String]) -> Int {
-            let ctxStart = max(0, range.location - 200)
-            let ctxEnd = min(source.length, range.location + range.length + 200)
+            let ctxStart = max(0, range.location - 300)
+            let ctxEnd = min(source.length, range.location + range.length + 300)
             let ctx = source.substring(with: NSRange(location: ctxStart, length: ctxEnd - ctxStart)).lowercased()
             var score = 0
             for w in beforeWords where ctx.contains(w) { score += 1 }
@@ -259,44 +351,8 @@ struct WebView: NSViewRepresentable {
                 return
             }
 
-            // For file URLs, open within the app
-            if url.isFileURL {
-                let standardized = url.standardizedFileURL
-
-                // Check if already open in an existing tab/window
-                for window in NSApp.windows {
-                    if let represented = window.representedURL, represented.standardizedFileURL == standardized {
-                        window.makeKeyAndOrderFront(nil)
-                        if let tabGroup = window.tabGroup {
-                            tabGroup.selectedWindow = window
-                        }
-                        decisionHandler(.cancel)
-                        return
-                    }
-                }
-
-                // Gain sandbox access via bookmarked parent directory
-                let dirURL = MarkdownDocumentModel.accessDirectoryForFile(url)
-                let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
-
-                if openInNewTab {
-                    // Keep directory scope alive until the new tab loads
-                    AppDelegate.pendingDirAccess = dirURL
-                    AppDelegate.pendingURL = url
-                    NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
-                } else {
-                    if let model = AppDelegate.activeModel {
-                        model.navigateTo(url)
-                    }
-                    if let dirURL { dirURL.stopAccessingSecurityScopedResource() }
-                }
-
-                decisionHandler(.cancel)
-                return
-            }
-
-            // Open web URLs in the default browser
-            NSWorkspace.shared.open(url)
+            // Handle via shared link click logic (file links open in-app, web links in browser)
+            handleLinkClick(url)
             decisionHandler(.cancel)
         }
 
@@ -497,7 +553,14 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
 
-        // 22. Checkbox toggle (enables clicking checkboxes to modify source)
+        // 22. Link click interceptor (file:// links may be silently blocked by WKWebView)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.linkClickScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+        config.userContentController.add(context.coordinator, name: "linkClick")
+
+        // 23. Checkbox toggle (enables clicking checkboxes to modify source)
         config.userContentController.addUserScript(WKUserScript(
             source: MarkdownDocumentModel.checkboxToggleScript,
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
@@ -510,6 +573,20 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
         config.userContentController.add(context.coordinator, name: "editorSync")
+
+        // 24. morphdom (incremental DOM diffing library)
+        let morphdomJS = MarkdownDocumentModel.morphdomJS
+        if !morphdomJS.isEmpty {
+            config.userContentController.addUserScript(WKUserScript(
+                source: morphdomJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true
+            ))
+        }
+
+        // 25. Incremental content update (uses morphdom for selective DOM updates)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.contentUpdateScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
 
         let view = ZoomableWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
@@ -735,20 +812,20 @@ struct ContentView: View {
                         // Debounce re-render since CodeEditorView fires on every keystroke
                         editorDebounceTask?.cancel()
                         editorDebounceTask = Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3s
+                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
                             guard !Task.isCancelled else { return }
                             if let url = model.currentURL {
                                 let ext = url.pathExtension.lowercased()
                                 if ["md", "markdown", "mdown", "mkd"].contains(ext) {
-                                    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + ext)
-                                    try? newValue.write(to: tempURL, atomically: true, encoding: .utf8)
-                                    let result = try? MarkdownDocumentModel.htmlBodyPublic(for: tempURL)
-                                    if let r = result {
-                                        // Flag as edit-driven so didFinish restores scroll position
-                                        WebViewStore.shared.isEditReload = true
-                                        model.html = MarkdownDocumentModel.wrapHTMLPublic(r.html, isMarkdown: r.isMarkdown)
-                                    }
-                                    try? FileManager.default.removeItem(at: tempURL)
+                                    // Generate only the body HTML, not the full page
+                                    let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: newValue)
+                                    // Use incremental JS update instead of full loadHTMLString
+                                    guard let webView = WebViewStore.shared.webView else { return }
+                                    let escaped = bodyHTML
+                                        .replacingOccurrences(of: "\\", with: "\\\\")
+                                        .replacingOccurrences(of: "`", with: "\\`")
+                                        .replacingOccurrences(of: "${", with: "\\${")
+                                    webView.evaluateJavaScript("if(window.__updateContent) __updateContent(`\(escaped)`)") { _, _ in }
                                 }
                             }
                         }
