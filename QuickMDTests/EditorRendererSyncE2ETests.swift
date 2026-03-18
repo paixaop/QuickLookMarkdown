@@ -514,4 +514,341 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         let uniqueLines = Set(foundLines)
         XCTAssertGreaterThanOrEqual(uniqueLines.count, 4, "Should disambiguate 'testing' across at least 4 different source lines, got: \(foundLines)")
     }
+
+    // =========================================================================
+    // MARK: - E2E: Comment placement on architecture-style document
+    // =========================================================================
+
+    /// Fixture: architecture spec with HTML comment header, heading with &,
+    /// bullet list with bold + inline formatting, table, and cross-references.
+    private let architectureFixture = """
+    <!-- Migrated from: design-overview.md on 2026-02-20 -->
+
+    # Principles & Design Goals
+
+    - **Reliability-first** distributed task scheduler for AI workloads
+    - **Zero-downtime** deployments — rolling updates with health checks
+    - **Low latency** request routing with in-memory caching on hot path
+    - **Plugin-extensible** middleware via sandboxed WASM modules and declarative rules
+    - **End-to-end encryption** across all internal service communication
+    - **Observability** via structured logging, OpenTelemetry traces, and Prometheus metrics
+    - **Configuration as code** — all settings stored in version-controlled YAML
+    - **Tenant isolation** — each workspace runs in a dedicated namespace
+    - **Rate limiting** with per-client token bucket and sliding window counters
+    - **Backward compatible** — public API changes require deprecation cycle (minimum 2 releases)
+    - **Composable pipeline** — processors consume [TypedMessage](../04-components/typed-message.md) by content type, not by transport. Adding protocols is a 1-file change.
+
+    ## Deployment Model
+
+    v3 uses a multi-region active-active architecture. Each region operates independently with eventual consistency. All API keys, quotas, and routing rules within a region belong to one control plane. There is no cross-region request forwarding, no shared state between regions, and no global lock coordination. Regions requiring synchronization use explicit replication streams.
+
+    ## Team Responsibilities
+
+    | Team | Function | Key Concern |
+    |---|---|---|
+    | Platform Engineers | Build and maintain the core scheduler | Request routing accuracy, failover latency, resource utilization |
+    | DevOps | Deploy and operate production clusters | Zero-downtime deploys, rollback procedures, capacity planning |
+    | Security | Define and enforce access policies | mTLS enforcement, secret rotation, audit trail completeness |
+    | Compliance | Ensure regulatory adherence | Data residency rules, encryption at rest (AES-256), retention policies |
+    | Plugin Authors | Extend functionality via WASM plugins | SDK stability, sandbox resource limits, versioned plugin registry |
+
+    Quality attributes per team are documented in [Section 8 — Quality Model](../08-quality-model/README.md).
+    """
+
+    /// Test that each list item in the fixture gets a unique data-source-line.
+    func testArchitectureFixtureListItemsHaveUniqueSourceLines() throws {
+        let (html, _) = try loadMarkdown(architectureFixture)
+
+        // Each <li> should have a data-source-line attribute
+        let liPattern = try NSRegularExpression(pattern: #"<li data-source-line="(\d+)""#)
+        let nsHTML = html as NSString
+        let matches = liPattern.matches(in: html, range: NSRange(location: 0, length: nsHTML.length))
+        let liLines = matches.map { Int(nsHTML.substring(with: $0.range(at: 1)))! }
+
+        XCTAssertEqual(liLines.count, 11, "Should have 11 list items, got \(liLines.count)")
+        // All should be unique
+        let uniqueLines = Set(liLines)
+        XCTAssertEqual(uniqueLines.count, 11, "All 11 list items should have unique source lines")
+    }
+
+    /// Test selecting each list item's bold keyword and verifying correct source line mapping.
+    func testArchitectureFixtureSelectEachListItemBoldKeyword() throws {
+        let (_, model) = try loadMarkdown(architectureFixture)
+
+        // The bold keywords in each list item (first word after **)
+        let boldKeywords = [
+            "Reliability-first",
+            "Zero-downtime",
+            "Low latency",       // two words
+            "Plugin-extensible",
+            "End-to-end encryption", // multi-word
+            "Observability",
+            "Configuration as code", // multi-word
+            "Tenant isolation",
+            "Rate limiting",
+            "Backward compatible",
+            "Composable pipeline"
+        ]
+
+        var foundSourceLines: [Int] = []
+
+        for (i, keyword) in boldKeywords.enumerated() {
+            // Select the keyword — use just the first word for reliable window.find()
+            let searchWord = keyword.components(separatedBy: " ").first!
+            guard selectText(searchWord, occurrence: 1) else {
+                XCTFail("Failed to select '\(searchWord)' for list item \(i)")
+                continue
+            }
+            guard let info = getSelectionSourceInfo() else {
+                XCTFail("No source info for '\(searchWord)' in list item \(i)")
+                continue
+            }
+            XCTAssertGreaterThan(info.sourceLine, 0, "List item \(i) (\(searchWord)) should have positive source line")
+            foundSourceLines.append(info.sourceLine)
+        }
+
+        // All source lines should be different (each list item on its own line)
+        let unique = Set(foundSourceLines)
+        XCTAssertEqual(unique.count, foundSourceLines.count,
+                       "Each list item should have a unique source line. Got: \(foundSourceLines)")
+    }
+
+    /// E2E: simulate adding a comment to each list item via findWordRange (the same path as addCommentToSource).
+    func testArchitectureFixtureCommentEachListItem() throws {
+        let (_, model) = try loadMarkdown(architectureFixture)
+        let source = model.rawContent
+
+        // For each list item, select a unique word, get source info, then verify findWordRange
+        // picks a position INSIDE that specific list item line
+        let uniqueWords = [
+            "Reliability-first",
+            "Zero-downtime",
+            "latency",
+            "Plugin-extensible",
+            "End-to-end",
+            "Observability",
+            "Configuration",
+            "Tenant",
+            "limiting",
+            "Backward",
+            "Composable"
+        ]
+
+        let lines = source.components(separatedBy: "\n")
+
+        for (i, word) in uniqueWords.enumerated() {
+            guard selectText(word, occurrence: 1) else {
+                XCTFail("Cannot select '\(word)' for item \(i)")
+                continue
+            }
+            guard let info = getSelectionSourceInfo() else {
+                XCTFail("No source info for '\(word)' at item \(i)")
+                continue
+            }
+
+            // Use findWordRange — same algorithm as addCommentToSource
+            guard let range = WebView.Coordinator.findWordRange(
+                word: word,
+                in: source,
+                sourceLine: info.sourceLine,
+                offsetInBlock: info.offsetInBlock,
+                frontmatterLineCount: model.frontmatterLineCount
+            ) else {
+                XCTFail("findWordRange returned nil for '\(word)' at line \(info.sourceLine)")
+                continue
+            }
+
+            // Verify the found range is actually within the correct list item line
+            let matched = (source as NSString).substring(with: range)
+            XCTAssertTrue(matched.lowercased().contains(word.lowercased()),
+                          "Matched text '\(matched)' should contain '\(word)'")
+
+            // Verify the range falls on a line that starts with "- " (a list item)
+            let adjustedLine = info.sourceLine + model.frontmatterLineCount - 1
+            if adjustedLine >= 0 && adjustedLine < lines.count {
+                let line = lines[adjustedLine]
+                XCTAssertTrue(line.trimmingCharacters(in: .whitespaces).hasPrefix("- "),
+                              "Source line \(adjustedLine) should be a list item: '\(line)'")
+                XCTAssertTrue(line.contains(word),
+                              "Source line should contain '\(word)': '\(line)'")
+            }
+
+            // Verify the range location is within the line's character range in the source
+            var lineStart = 0
+            for j in 0..<adjustedLine { lineStart += lines[j].count + 1 }
+            let lineEnd = lineStart + lines[adjustedLine].count
+            XCTAssertGreaterThanOrEqual(range.location, lineStart,
+                                        "'\(word)' range start \(range.location) should be >= line start \(lineStart)")
+            XCTAssertLessThanOrEqual(range.location + range.length, lineEnd + 1,
+                                     "'\(word)' range end \(range.location + range.length) should be <= line end \(lineEnd)")
+        }
+    }
+
+    /// E2E: verify addComment actually produces correct markdown with comment markers for each list item.
+    func testArchitectureFixtureAddCommentProducesCorrectMarkdown() throws {
+        let (_, model) = try loadMarkdown(architectureFixture)
+        var source = model.rawContent
+
+        // Add a comment to the first list item's bold word
+        guard selectText("Reliability-first", occurrence: 1) else {
+            XCTFail("Cannot select Reliability-first"); return
+        }
+        guard let info = getSelectionSourceInfo() else {
+            XCTFail("No source info"); return
+        }
+        guard let range = WebView.Coordinator.findWordRange(
+            word: "Reliability-first",
+            in: source,
+            sourceLine: info.sourceLine,
+            offsetInBlock: info.offsetInBlock,
+            frontmatterLineCount: model.frontmatterLineCount
+        ) else {
+            XCTFail("findWordRange returned nil"); return
+        }
+
+        let updated = MarkdownDocumentModel.addComment(around: range, comment: "needs review", in: source)
+        XCTAssertTrue(updated.contains("<!-- COMMENT: needs review -->"), "Should have comment marker")
+        XCTAssertTrue(updated.contains("Reliability-first"), "Should preserve the text")
+        XCTAssertTrue(updated.contains("<!-- /COMMENT -->"), "Should have closing marker")
+
+        // The comment should be on the first list item line
+        let updatedLines = updated.components(separatedBy: "\n")
+        let commentLine = updatedLines.first(where: { $0.contains("<!-- COMMENT: needs review -->") })
+        XCTAssertNotNil(commentLine, "Should find the comment line")
+        XCTAssertTrue(commentLine!.contains("- **"), "Comment should be on a list item line")
+    }
+
+    /// E2E: verify the heading with & character gets correct source line.
+    func testArchitectureFixtureHeadingWithAmpersand() throws {
+        let (_, _) = try loadMarkdown(architectureFixture)
+
+        // Select "Principles" from the heading "# Principles & Design Goals"
+        guard selectText("Principles", occurrence: 1) else {
+            XCTFail("Cannot select 'Principles'"); return
+        }
+        let info = getSelectionSourceInfo()
+        XCTAssertNotNil(info, "Should get source info for heading text")
+        XCTAssertGreaterThan(info?.sourceLine ?? 0, 0, "Should have valid source line")
+    }
+
+    /// E2E: verify the HTML comment at top does NOT interfere with comment annotations.
+    func testArchitectureFixtureHTMLCommentDoesNotInterfere() throws {
+        let (_, _) = try loadMarkdown(architectureFixture)
+
+        // The <!-- Migrated from: ... --> should NOT produce <mark class="qmd-comment"> elements in the DOM
+        let markCount = evalJS("document.querySelectorAll('.qmd-comment').length") as? Int ?? 0
+        XCTAssertEqual(markCount, 0, "HTML comment should not produce comment annotation marks in DOM")
+
+        // Heading should still render
+        let hasHeading = evalJS("document.querySelector('h1') !== null") as? Bool ?? false
+        XCTAssertTrue(hasHeading, "Heading should still render")
+    }
+
+    /// E2E: verify table cells have source lines and don't confuse the comment algorithm.
+    func testArchitectureFixtureTableCellsHaveSourceLines() throws {
+        let (html, model) = try loadMarkdown(architectureFixture)
+
+        XCTAssertTrue(html.contains("<td data-source-line="), "Table cells should have source lines")
+        XCTAssertTrue(html.contains("<th data-source-line="), "Table headers should have source lines")
+
+        // Select a word that appears in both the list and the table
+        // "sandbox" appears in list item 4 and table row 5
+        guard selectText("sandbox", occurrence: 1) else {
+            XCTFail("Cannot select first 'sandbox'"); return
+        }
+        let info1 = getSelectionSourceInfo()
+
+        guard selectText("sandbox", occurrence: 2) else {
+            // May not have a second occurrence — that's OK
+            return
+        }
+        let info2 = getSelectionSourceInfo()
+
+        if let i1 = info1, let i2 = info2 {
+            XCTAssertNotEqual(i1.sourceLine, i2.sourceLine,
+                              "Same word in list vs table should have different source lines")
+        }
+    }
+
+    /// E2E: verify cross-reference link renders and doesn't break source line mapping.
+    func testArchitectureFixtureCrossReferenceLink() throws {
+        let (html, _) = try loadMarkdown(architectureFixture)
+
+        // The last list item has a [TypedMessage](url) link
+        XCTAssertTrue(html.contains("TypedMessage"), "Should render link text")
+        XCTAssertTrue(html.contains("typed-message.md"), "Should preserve link href")
+
+        // Select TypedMessage — should have a valid source line
+        guard selectText("TypedMessage", occurrence: 1) else {
+            XCTFail("Cannot select TypedMessage"); return
+        }
+        let info = getSelectionSourceInfo()
+        XCTAssertNotNil(info, "Should get source info for link text inside list item")
+    }
+
+    /// E2E: stress test — add comments to ALL 11 list items and verify each one lands correctly.
+    func testArchitectureFixtureCommentAll11ListItems() throws {
+        let (_, model) = try loadMarkdown(architectureFixture)
+        let source = model.rawContent
+        let lines = source.components(separatedBy: "\n")
+
+        // Find unique words for each list item that won't match elsewhere
+        let targets = [
+            "Reliability-first",
+            "Zero-downtime",
+            "latency",
+            "Plugin-extensible",
+            "encryption",
+            "Observability",
+            "Configuration",
+            "namespace",
+            "limiting",
+            "deprecation",
+            "Composable"
+        ]
+
+        var allRanges: [(word: String, range: NSRange, sourceLine: Int)] = []
+
+        for (i, word) in targets.enumerated() {
+            guard selectText(word, occurrence: 1) else {
+                XCTFail("Cannot select '\(word)' (#\(i))"); continue
+            }
+            guard let info = getSelectionSourceInfo() else {
+                XCTFail("No source info for '\(word)' (#\(i))"); continue
+            }
+            guard let range = WebView.Coordinator.findWordRange(
+                word: word, in: source,
+                sourceLine: info.sourceLine,
+                offsetInBlock: info.offsetInBlock,
+                frontmatterLineCount: model.frontmatterLineCount
+            ) else {
+                XCTFail("findWordRange nil for '\(word)' (#\(i))"); continue
+            }
+            allRanges.append((word: word, range: range, sourceLine: info.sourceLine))
+        }
+
+        XCTAssertEqual(allRanges.count, 11, "Should find ranges for all 11 list items")
+
+        // Verify no two ranges overlap
+        let sorted = allRanges.sorted(by: { $0.range.location < $1.range.location })
+        for i in 0..<(sorted.count - 1) {
+            let end = sorted[i].range.location + sorted[i].range.length
+            XCTAssertLessThanOrEqual(end, sorted[i + 1].range.location,
+                                     "Range for '\(sorted[i].word)' should not overlap with '\(sorted[i + 1].word)'")
+        }
+
+        // Verify all source lines are different
+        let sourceLines = allRanges.map(\.sourceLine)
+        XCTAssertEqual(Set(sourceLines).count, 11,
+                       "All 11 items should have unique source lines: \(sourceLines)")
+
+        // Verify each range is on a list item line
+        for item in allRanges {
+            let adjLine = item.sourceLine + model.frontmatterLineCount - 1
+            if adjLine >= 0 && adjLine < lines.count {
+                XCTAssertTrue(lines[adjLine].trimmingCharacters(in: .whitespaces).hasPrefix("- "),
+                              "'\(item.word)' should be on a list item line, got: '\(lines[adjLine])'")
+            }
+        }
+    }
 }
