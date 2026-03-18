@@ -1,5 +1,10 @@
 # QuickMD - Project Notes
 
+## GitHub
+
+- **Always use the `paixaop` GitHub account** for this repo (not `darksectorai`). Run `gh auth switch --user paixaop` before any `gh` commands if needed.
+- Remote: `https://github.com/paixaop/QuickLookMarkdown.git`
+
 ## Build & Install
 
 - Uses XcodeGen: `xcodegen generate` then `xcodebuild`
