@@ -3,6 +3,13 @@ import UniformTypeIdentifiers
 import WebKit
 import CodeEditorView
 
+// MARK: - Comment Notification Names
+
+extension Notification.Name {
+    static let addCommentAction = Notification.Name("addCommentAction")
+    static let removeCommentAction = Notification.Name("removeCommentAction")
+}
+
 // MARK: - FocusedValue for active document model
 
 private struct FocusedModelKey: FocusedValueKey {
@@ -62,6 +69,98 @@ class ZoomableWebView: WKWebView {
         }
         return super.performKeyEquivalent(with: event)
     }
+
+    /// Reference to the coordinator for comment actions
+    weak var commentCoordinator: WebView.Coordinator?
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        // Get mouse position in web view coordinates
+        let locationInView = convert(event.locationInWindow, from: nil)
+        let jsX = locationInView.x
+        let jsY = bounds.height - locationInView.y  // Flip Y for web coordinates
+
+        // Check if there's a comment at the click point
+        let group = DispatchGroup()
+        var commentAtPoint: [String: Any]? = nil
+        var selectedText: String = ""
+
+        group.enter()
+        evaluateJavaScript("window.__getCommentAtPoint ? __getCommentAtPoint(\(jsX), \(jsY)) : null") { result, _ in
+            if let dict = result as? [String: Any] {
+                commentAtPoint = dict
+            }
+            group.leave()
+        }
+
+        group.enter()
+        evaluateJavaScript("window.__getSelectionText ? __getSelectionText() : ''") { result, _ in
+            selectedText = result as? String ?? ""
+            group.leave()
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+
+            // Insert at the top of the menu
+            var insertIndex = 0
+
+            if let commentInfo = commentAtPoint {
+                let editItem = NSMenuItem(title: "Edit Comment\u{2026}", action: #selector(self.editCommentAction(_:)), keyEquivalent: "")
+                editItem.target = self
+                editItem.representedObject = commentInfo
+                menu.insertItem(editItem, at: insertIndex)
+                insertIndex += 1
+
+                let deleteItem = NSMenuItem(title: "Delete Comment", action: #selector(self.deleteCommentAction(_:)), keyEquivalent: "")
+                deleteItem.target = self
+                deleteItem.representedObject = commentInfo
+                menu.insertItem(deleteItem, at: insertIndex)
+                insertIndex += 1
+
+                menu.insertItem(NSMenuItem.separator(), at: insertIndex)
+            } else if !selectedText.isEmpty {
+                let addItem = NSMenuItem(title: "Add Comment\u{2026}", action: #selector(self.addCommentAction(_:)), keyEquivalent: "")
+                addItem.target = self
+                addItem.representedObject = selectedText
+                menu.insertItem(addItem, at: insertIndex)
+                insertIndex += 1
+
+                menu.insertItem(NSMenuItem.separator(), at: insertIndex)
+            }
+        }
+
+        super.willOpenMenu(menu, with: event)
+    }
+
+    @objc private func addCommentAction(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        // Try to get source line info for precise comment placement
+        evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { [weak self] result, _ in
+            var sourceLine = -1
+            var offsetInBlock = -1
+            if let info = result as? [String: Any] {
+                sourceLine = info["sourceLine"] as? Int ?? -1
+                offsetInBlock = info["offsetInBlock"] as? Int ?? -1
+            }
+            self?.commentCoordinator?.showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock)
+        }
+    }
+
+    @objc private func editCommentAction(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Any] else { return }
+        let index = info["index"] as? Int ?? 0
+        let comment = info["comment"] as? String ?? ""
+        let text = info["text"] as? String ?? ""
+        commentCoordinator?.showCommentEditor(index: index, comment: comment, annotatedText: text, isNew: false)
+    }
+
+    @objc private func deleteCommentAction(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: Any] else { return }
+        let index = info["index"] as? Int ?? 0
+        guard let model = AppDelegate.activeModel else { return }
+        let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
+        model.setContent(updated, actionName: "Remove Comment")
+    }
 }
 
 class WebViewStore: ObservableObject {
@@ -109,6 +208,36 @@ struct WebView: NSViewRepresentable {
                       let url = URL(string: urlString) else { return }
                 handleLinkClick(url)
 
+            case "commentAction":
+                guard let type = body["type"] as? String else { return }
+                if type == "click" {
+                    let index = body["index"] as? Int ?? 0
+                    let comment = body["comment"] as? String ?? ""
+                    let text = body["text"] as? String ?? ""
+                    showCommentEditor(index: index, comment: comment, annotatedText: text, isNew: false)
+                } else if type == "add" {
+                    let text = body["text"] as? String ?? ""
+                    showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true)
+                } else if type == "sidebarClick" {
+                    // Jump editor to comment at index
+                    let index = body["index"] as? Int ?? 0
+                    guard let model = AppDelegate.activeModel else { return }
+                    let comments = MarkdownDocumentModel.parseComments(in: model.rawContent)
+                    guard index < comments.count else { return }
+                    let comment = comments[index]
+                    // Find the editor text view and jump to the comment
+                    if let textView = self.findEditorTextView() {
+                        textView.setSelectedRange(comment.range)
+                        textView.scrollRangeToVisible(comment.range)
+                    }
+                } else if type == "sidebarDelete" {
+                    let index = body["index"] as? Int ?? 0
+                    guard let model = AppDelegate.activeModel else { return }
+                    let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
+                    model.setContent(updated, actionName: "Remove Comment")
+                    self.forceRefreshContent(model: model)
+                }
+
             case "editorSync":
                 guard let type = body["type"] as? String else { return }
                 if type == "scroll" {
@@ -118,20 +247,18 @@ struct WebView: NSViewRepresentable {
                     scrollEditorToFraction(CGFloat(fraction))
                 } else if type == "dblclick" {
                     guard let word = body["word"] as? String else { return }
-                    let before = body["before"] as? String ?? ""
-                    let after = body["after"] as? String ?? ""
-                    let blockText = body["blockText"] as? String ?? ""
-                    let blockIndex = body["blockIndex"] as? Int ?? -1
-                    let totalBlocks = body["totalBlocks"] as? Int ?? 0
+                    let sourceLine = body["sourceLine"] as? Int ?? -1
+                    let sourceCol = body["sourceCol"] as? Int ?? -1
+                    let offsetInBlock = body["offsetInBlock"] as? Int ?? -1
 
                     // If editor is not visible, show it first, then jump after a delay
                     if findEditorTextView() == nil {
                         WebViewStore.shared.showEditorCallback?()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
-                            self.jumpEditorToWord(word, before: before, after: after, blockText: blockText, blockIndex: blockIndex, totalBlocks: totalBlocks)
+                            self.jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock)
                         }
                     } else {
-                        jumpEditorToWord(word, before: before, after: after, blockText: blockText, blockIndex: blockIndex, totalBlocks: totalBlocks)
+                        jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock)
                     }
                 }
 
@@ -156,6 +283,11 @@ struct WebView: NSViewRepresentable {
             // Check if already open in an existing tab/window
             for window in NSApp.windows {
                 if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+                    // Track the tab we came from for back/forward
+                    if let model = AppDelegate.activeModel, let current = model.currentURL {
+                        model.backStack.append(current)
+                        model.forwardStack.removeAll()
+                    }
                     window.makeKeyAndOrderFront(nil)
                     if let tabGroup = window.tabGroup {
                         tabGroup.selectedWindow = window
@@ -169,6 +301,11 @@ struct WebView: NSViewRepresentable {
             let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
 
             if openInNewTab {
+                // Track navigation history so back/forward can switch tabs
+                if let model = AppDelegate.activeModel, let current = model.currentURL {
+                    model.backStack.append(current)
+                    model.forwardStack.removeAll()
+                }
                 AppDelegate.pendingDirAccess = dirURL
                 AppDelegate.pendingURL = url
                 NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
@@ -201,10 +338,18 @@ struct WebView: NSViewRepresentable {
 
         // MARK: - Double-click → jump to word in editor
 
-        private func jumpEditorToWord(_ word: String, before: String, after: String, blockText: String, blockIndex: Int, totalBlocks: Int) {
+        private func jumpEditorToWord(_ word: String, sourceLine: Int, sourceCol: Int, offsetInBlock: Int) {
             guard let model = AppDelegate.activeModel,
                   let textView = findEditorTextView() else { return }
             let source = model.rawContent
+            if let range = Self.findWordRange(word: word, in: source, sourceLine: sourceLine, offsetInBlock: offsetInBlock, frontmatterLineCount: model.frontmatterLineCount) {
+                selectAndReveal(range, in: textView)
+            }
+        }
+
+        /// Find the NSRange of a word in the source text using source-line mapping.
+        /// Extracted as a static method for testability.
+        static func findWordRange(word: String, in source: String, sourceLine: Int, offsetInBlock: Int, frontmatterLineCount: Int) -> NSRange? {
             let nsSource = source as NSString
 
             // Find all occurrences of the word in source
@@ -218,81 +363,55 @@ struct WebView: NSViewRepresentable {
                 searchStart = range.location + range.length
             }
 
-            guard !occurrences.isEmpty else { return }
+            guard !occurrences.isEmpty else { return nil }
 
             // If only one occurrence, use it directly
             if occurrences.count == 1 {
-                selectAndReveal(occurrences[0], in: textView)
-                return
+                return occurrences[0]
             }
 
-            // Strategy 1: Find the block text in source, then find word within that block
-            if !blockText.isEmpty {
-                // Normalize whitespace for fuzzy matching
-                let normalizedBlock = blockText.components(separatedBy: .whitespacesAndNewlines)
-                    .filter { !$0.isEmpty }.joined(separator: " ").lowercased()
-
-                // Try to find a region in source that matches the block content.
-                // Extract significant words from the block (first 6 + last 3 for uniqueness)
-                let blockWords = normalizedBlock.split(separator: " ").map(String.init)
-                if blockWords.count >= 3 {
-                    let searchPhrase = blockWords.prefix(6).joined(separator: " ")
-                    // Search source line-by-line for a line containing these words
-                    let lines = source.components(separatedBy: .newlines)
-                    var bestLine: Int? = nil
-                    var bestLineScore = 0
-                    for (i, line) in lines.enumerated() {
-                        let lowLine = line.lowercased()
-                        if lowLine.contains(searchPhrase) {
-                            bestLine = i
-                            break
-                        }
-                        // Partial match: count how many block words appear
-                        var score = 0
-                        for w in blockWords.prefix(8) where lowLine.contains(w) { score += 1 }
-                        if score > bestLineScore { bestLineScore = score; bestLine = i }
-                    }
-
-                    if let lineIdx = bestLine {
-                        // Calculate character offset of this line
-                        var charOffset = 0
-                        for i in 0..<lineIdx {
-                            charOffset += lines[i].count + 1 // +1 for newline
-                        }
-                        let lineEnd = charOffset + lines[lineIdx].count
-
-                        // Find the word occurrence closest to this line
-                        let nearOccurrences = occurrences.filter { $0.location >= max(0, charOffset - 50) && $0.location <= lineEnd + 50 }
-                        if let match = nearOccurrences.first {
-                            selectAndReveal(match, in: textView)
-                            return
-                        }
-                    }
+            // If we have a source line, use it for precise matching
+            if sourceLine > 0 {
+                let lines = source.components(separatedBy: "\n")
+                let adjustedLine = sourceLine + frontmatterLineCount - 1 // 0-based
+                guard adjustedLine >= 0 && adjustedLine < lines.count else {
+                    // Fallback to closest-to-middle
+                    let mid = nsSource.length / 2
+                    return occurrences.min(by: { abs($0.location - mid) < abs($1.location - mid) })
                 }
-            }
 
-            // Strategy 2: Use block index as fraction to estimate position
-            if blockIndex >= 0 && totalBlocks > 0 {
-                let fraction = Double(blockIndex) / Double(max(1, totalBlocks))
-                let targetPos = fraction * Double(nsSource.length)
-                let best = occurrences.min(by: { abs(Double($0.location) - targetPos) < abs(Double($1.location) - targetPos) })!
-                selectAndReveal(best, in: textView)
-                return
-            }
-
-            // Fallback: use context words to score
-            let beforeWords = before.split(separator: " ").map { $0.lowercased() }
-            let afterWords = after.split(separator: " ").map { $0.lowercased() }
-            var bestRange = occurrences[0]
-            var bestScore = contextScore(for: bestRange, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
-            for occ in occurrences.dropFirst() {
-                let score = contextScore(for: occ, in: nsSource, beforeWords: beforeWords, afterWords: afterWords)
-                if score > bestScore {
-                    bestScore = score
-                    bestRange = occ
+                // Calculate character offset of this line
+                var lineCharOffset = 0
+                for i in 0..<adjustedLine {
+                    lineCharOffset += lines[i].count + 1 // +1 for newline
                 }
+
+                // Find the block's extent: from this line until the next blank line or heading
+                var blockEndOffset = lineCharOffset
+                for i in adjustedLine..<lines.count {
+                    let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                    if i > adjustedLine && (trimmed.isEmpty || trimmed.hasPrefix("#")) { break }
+                    blockEndOffset += lines[i].count + 1
+                }
+
+                // Filter occurrences to those within this block range (with small margin)
+                let blockOccurrences = occurrences.filter {
+                    $0.location >= max(0, lineCharOffset - 5) && $0.location < blockEndOffset + 5
+                }
+
+                if blockOccurrences.count == 1 {
+                    return blockOccurrences[0]
+                }
+
+                // Use offsetInBlock to pick the closest occurrence
+                let candidates = blockOccurrences.isEmpty ? occurrences : blockOccurrences
+                let targetPos = lineCharOffset + max(0, offsetInBlock)
+                return candidates.min(by: { abs($0.location - targetPos) < abs($1.location - targetPos) })
             }
-            selectAndReveal(bestRange, in: textView)
+
+            // Final fallback: pick occurrence nearest to document middle fraction
+            let mid = nsSource.length / 2
+            return occurrences.min(by: { abs($0.location - mid) < abs($1.location - mid) })
         }
 
         private func selectAndReveal(_ range: NSRange, in textView: NSTextView) {
@@ -302,14 +421,103 @@ struct WebView: NSViewRepresentable {
             textView.showFindIndicator(for: range)
         }
 
-        private func contextScore(for range: NSRange, in source: NSString, beforeWords: [String], afterWords: [String]) -> Int {
-            let ctxStart = max(0, range.location - 300)
-            let ctxEnd = min(source.length, range.location + range.length + 300)
-            let ctx = source.substring(with: NSRange(location: ctxStart, length: ctxEnd - ctxStart)).lowercased()
-            var score = 0
-            for w in beforeWords where ctx.contains(w) { score += 1 }
-            for w in afterWords where ctx.contains(w) { score += 1 }
-            return score
+        // MARK: - Comment Editor
+
+        func showCommentEditor(index: Int, comment: String, annotatedText: String, isNew: Bool, sourceLine: Int = -1, offsetInBlock: Int = -1) {
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                styleMask: [.titled, .closable, .resizable],
+                backing: .buffered, defer: false
+            )
+            panel.title = isNew ? "Add Comment" : "Edit Comment"
+            panel.isFloatingPanel = true
+            panel.becomesKeyOnlyIfNeeded = false
+            panel.level = .floating
+
+            // Position near the mouse
+            let mouseLocation = NSEvent.mouseLocation
+            panel.setFrameOrigin(NSPoint(x: mouseLocation.x - 180, y: mouseLocation.y - 240))
+
+            let view = CommentEditorView(
+                annotatedText: annotatedText,
+                initialComment: comment,
+                isNew: isNew,
+                onSave: { newComment in
+                    panel.close()
+                    guard let model = AppDelegate.activeModel else { return }
+                    if isNew {
+                        self.addCommentToSource(text: annotatedText, comment: newComment, model: model, sourceLine: sourceLine, offsetInBlock: offsetInBlock)
+                    } else {
+                        let updated = MarkdownDocumentModel.updateComment(at: index, newComment: newComment, in: model.rawContent)
+                        model.setContent(updated, actionName: "Update Comment")
+                    }
+                    self.forceRefreshContent(model: model)
+                },
+                onDelete: isNew ? nil : {
+                    panel.close()
+                    guard let model = AppDelegate.activeModel else { return }
+                    let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
+                    model.setContent(updated, actionName: "Remove Comment")
+                    self.forceRefreshContent(model: model)
+                },
+                onCancel: { panel.close() }
+            )
+
+            panel.contentView = NSHostingView(rootView: view)
+            panel.makeKeyAndOrderFront(nil)
+        }
+
+        private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1) {
+            let source = model.rawContent
+            let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // If we have source line info, use it to narrow the search
+            if sourceLine > 0 {
+                let lines = source.components(separatedBy: "\n")
+                let adjustedLine = sourceLine + model.frontmatterLineCount - 1
+                if adjustedLine >= 0 && adjustedLine < lines.count {
+                    var lineCharOffset = 0
+                    for i in 0..<adjustedLine { lineCharOffset += lines[i].count + 1 }
+                    // Find block extent
+                    var blockEndOffset = lineCharOffset
+                    for i in adjustedLine..<lines.count {
+                        let t = lines[i].trimmingCharacters(in: .whitespaces)
+                        if i > adjustedLine && (t.isEmpty || t.hasPrefix("#")) { break }
+                        blockEndOffset += lines[i].count + 1
+                    }
+                    // Search within block range
+                    let nsSource = source as NSString
+                    let rangeStart = max(0, lineCharOffset - 5)
+                    let rangeEnd = min(nsSource.length, blockEndOffset + 5)
+                    let searchRange = NSRange(location: rangeStart, length: rangeEnd - rangeStart)
+                    let found = nsSource.range(of: trimmedText, options: [.caseInsensitive], range: searchRange)
+                    if found.location != NSNotFound {
+                        let updated = MarkdownDocumentModel.addComment(around: found, comment: comment, in: source)
+                        model.setContent(updated, actionName: "Add Comment")
+                        return
+                    }
+                }
+            }
+
+            // Fallback: original approach - exact match then case-insensitive
+            let candidates: [String.CompareOptions] = [[], .caseInsensitive]
+            for opts in candidates {
+                if let range = source.range(of: trimmedText, options: opts) {
+                    let nsRange = NSRange(range, in: source)
+                    let updated = MarkdownDocumentModel.addComment(around: nsRange, comment: comment, in: source)
+                    model.setContent(updated, actionName: "Add Comment")
+                    return
+                }
+            }
+
+            // Final fallback: try to find in editor selection if available
+            if let textView = findEditorTextView() {
+                let selectedRange = textView.selectedRange()
+                if selectedRange.length > 0 {
+                    let updated = MarkdownDocumentModel.addComment(around: selectedRange, comment: comment, in: source)
+                    model.setContent(updated, actionName: "Add Comment")
+                }
+            }
         }
 
         private func findEditorTextView() -> NSTextView? {
@@ -331,6 +539,17 @@ struct WebView: NSViewRepresentable {
                 if let found = findTextViewIn(sub) { return found }
             }
             return nil
+        }
+
+        /// Force an immediate incremental content refresh in the WebView after comment changes.
+        private func forceRefreshContent(model: MarkdownDocumentModel) {
+            guard let webView = WebViewStore.shared.webView else { return }
+            let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: model.rawContent)
+            let escaped = bodyHTML
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "`", with: "\\`")
+                .replacingOccurrences(of: "${", with: "\\${")
+            webView.evaluateJavaScript("if(window.__updateContent) __updateContent(`\(escaped)`)") { _, _ in }
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -574,7 +793,26 @@ struct WebView: NSViewRepresentable {
         ))
         config.userContentController.add(context.coordinator, name: "editorSync")
 
-        // 24. morphdom (incremental DOM diffing library)
+        // 24. Comment annotations (hover tooltips, click-to-edit, context menu)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.commentScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+        config.userContentController.add(context.coordinator, name: "commentAction")
+
+        // 24b. Comments sidebar panel
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.commentsSidebarScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 24c. Sidebar arrangement (flexible positioning)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.sidebarArrangeScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 25. morphdom (incremental DOM diffing library)
         let morphdomJS = MarkdownDocumentModel.morphdomJS
         if !morphdomJS.isEmpty {
             config.userContentController.addUserScript(WKUserScript(
@@ -589,6 +827,7 @@ struct WebView: NSViewRepresentable {
         ))
 
         let view = ZoomableWebView(frame: .zero, configuration: config)
+        view.commentCoordinator = context.coordinator
         view.navigationDelegate = context.coordinator
         context.coordinator.lastHTML = html
         context.coordinator.lastTheme = theme
@@ -644,6 +883,61 @@ struct WebView: NSViewRepresentable {
     }
 }
 
+// MARK: - Comment Editor View
+
+struct CommentEditorView: View {
+    let annotatedText: String
+    @State var commentText: String
+    let isNew: Bool
+    var onSave: (String) -> Void
+    var onDelete: (() -> Void)?
+    var onCancel: () -> Void
+
+    init(annotatedText: String, initialComment: String, isNew: Bool, onSave: @escaping (String) -> Void, onDelete: (() -> Void)?, onCancel: @escaping () -> Void) {
+        self.annotatedText = annotatedText
+        self._commentText = State(initialValue: initialComment)
+        self.isNew = isNew
+        self.onSave = onSave
+        self.onDelete = onDelete
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(isNew ? "Add Comment" : "Edit Comment")
+                .font(.headline)
+
+            // Show the annotated text for context
+            GroupBox {
+                Text(annotatedText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            TextEditor(text: $commentText)
+                .font(.system(size: 13))
+                .frame(minHeight: 60, maxHeight: 120)
+                .border(Color(nsColor: .separatorColor))
+
+            HStack {
+                if let onDelete {
+                    Button("Delete", role: .destructive) { onDelete() }
+                }
+                Spacer()
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.escape, modifiers: [])
+                Button("Save \u{2318}\u{21A9}") { onSave(commentText) }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(commentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 340)
+    }
+}
+
 // MARK: - Search Bar
 
 struct SearchBar: View {
@@ -662,25 +956,30 @@ struct SearchBar: View {
                 .focused($isFocused)
                 .onSubmit { navigateNext() }
                 .onChange(of: query) { _ in performSearch() }
+                .accessibilityLabel("Search text")
             if matchCount > 0 {
                 Text("\(currentIndex + 1)/\(matchCount)")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel("Match \(currentIndex + 1) of \(matchCount)")
             }
             Button(action: navigatePrev) {
                 Image(systemName: "chevron.up")
             }
             .buttonStyle(.borderless)
             .disabled(matchCount == 0)
+            .accessibilityLabel("Previous match")
             Button(action: navigateNext) {
                 Image(systemName: "chevron.down")
             }
             .buttonStyle(.borderless)
             .disabled(matchCount == 0)
+            .accessibilityLabel("Next match")
             Button(action: close) {
                 Image(systemName: "xmark")
             }
             .buttonStyle(.borderless)
+            .accessibilityLabel("Close search")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -809,6 +1108,11 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .onChange(of: model.rawContent) { newValue in
+                        // Mark window as having unsaved changes
+                        if let window = WebViewStore.shared.webView?.window {
+                            window.isDocumentEdited = true
+                        }
+                        model.isDirty = true
                         // Debounce re-render since CodeEditorView fires on every keystroke
                         editorDebounceTask?.cancel()
                         editorDebounceTask = Task { @MainActor in
@@ -835,21 +1139,63 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("QuickLook Markdown")
-                        .font(.title2)
-                        .bold()
+                // Welcome screen when no file is open
+                VStack(spacing: 20) {
+                    Spacer()
+                    Image(systemName: "doc.richtext")
+                        .font(.system(size: 60))
+                        .foregroundStyle(.tertiary)
+                    Text("QuickMD")
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
                     if let errorMessage = model.errorMessage {
                         Text(errorMessage)
                             .foregroundStyle(.red)
                     } else {
-                        Text("Drop a file here or use File \u{203A} Open.")
+                        Text("Open a markdown file to get started")
+                            .font(.title3)
                             .foregroundStyle(.secondary)
                     }
+                    Button("Open File\u{2026}") {
+                        NSApp.sendAction(#selector(NSDocumentController.openDocument(_:)), to: nil, from: nil)
+                    }
+                    .controlSize(.large)
+
+                    let recentURLs = NSDocumentController.shared.recentDocumentURLs
+                    if !recentURLs.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Recent Files")
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 8)
+                            ForEach(recentURLs.prefix(5), id: \.self) { url in
+                                Button(action: { model.load(from: url) }) {
+                                    HStack {
+                                        Image(systemName: "doc")
+                                            .foregroundStyle(.secondary)
+                                        Text(url.lastPathComponent)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text(url.deletingLastPathComponent().lastPathComponent)
+                                            .font(.caption)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .frame(maxWidth: 350)
+                    }
+
                     Spacer()
+                    Text("You can also drag files onto this window")
+                        .font(.caption)
+                        .foregroundStyle(.quaternary)
+                        .padding(.bottom, 20)
                 }
-                .padding(24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Welcome screen")
             }
         } // Group
         } // VStack
@@ -860,12 +1206,14 @@ struct ContentView: View {
                 }
                 .disabled(!model.canGoBack)
                 .help("Back (⌘[)")
+                .accessibilityLabel("Go back")
 
                 Button(action: { model.goForward() }) {
                     Image(systemName: "chevron.right")
                 }
                 .disabled(!model.canGoForward)
                 .help("Forward (⌘])")
+                .accessibilityLabel("Go forward")
             }
         }
         .focusedValue(\.documentModel, model)
@@ -941,6 +1289,75 @@ struct ContentView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .init("saveDocument"))) { _ in
+            // Save document when triggered (e.g., Save All & Quit)
+            if let url = model.currentURL {
+                try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
+                model.markClean()
+                if let window = WebViewStore.shared.webView?.window {
+                    window.isDocumentEdited = false
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .addCommentAction)) { _ in
+            // Add comment from editor selection
+            guard let window = NSApp.keyWindow,
+                  let textView = findEditorTextViewInContentView(window.contentView),
+                  textView.selectedRange().length > 0,
+                  let selectedText = (textView.string as NSString?)?.substring(with: textView.selectedRange()) else { return }
+            let selectedRange = textView.selectedRange()
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                styleMask: [.titled, .closable, .resizable],
+                backing: .buffered, defer: false
+            )
+            panel.title = "Add Comment"
+            panel.isFloatingPanel = true
+            panel.becomesKeyOnlyIfNeeded = false
+            panel.level = .floating
+            let mouseLocation = NSEvent.mouseLocation
+            panel.setFrameOrigin(NSPoint(x: mouseLocation.x - 180, y: mouseLocation.y - 240))
+            let view = CommentEditorView(
+                annotatedText: selectedText,
+                initialComment: "",
+                isNew: true,
+                onSave: { comment in
+                    panel.close()
+                    let prefix = "<!-- COMMENT: \(comment) -->"
+                    let suffix = "<!-- /COMMENT -->"
+                    let wrapped = "\(prefix)\(selectedText)\(suffix)"
+                    textView.insertText(wrapped, replacementRange: selectedRange)
+                },
+                onDelete: nil,
+                onCancel: { panel.close() }
+            )
+            panel.contentView = NSHostingView(rootView: view)
+            panel.makeKeyAndOrderFront(nil)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .removeCommentAction)) { _ in
+            // Remove the comment at the cursor position in the editor
+            guard let window = NSApp.keyWindow,
+                  let textView = findEditorTextViewInContentView(window.contentView) else { return }
+            let cursorLocation = textView.selectedRange().location
+            let comments = MarkdownDocumentModel.parseComments(in: model.rawContent)
+            // Find the comment whose range contains the cursor
+            for (i, c) in comments.enumerated() {
+                if cursorLocation >= c.range.location && cursorLocation < c.range.location + c.range.length {
+                    let updated = MarkdownDocumentModel.removeComment(at: i, in: model.rawContent)
+                    model.setContent(updated, actionName: "Remove Comment")
+                    break
+                }
+            }
+        }
+    }
+
+    private func findEditorTextViewInContentView(_ view: NSView?) -> NSTextView? {
+        guard let view = view else { return nil }
+        if let tv = view as? NSTextView, tv.isEditable { return tv }
+        for sub in view.subviews {
+            if let found = findEditorTextViewInContentView(sub) { return found }
+        }
+        return nil
     }
 
 }

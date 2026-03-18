@@ -35,9 +35,9 @@ final class MarkdownDocumentModelTests: XCTestCase {
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("<h1>"), "Should render h1")
-        XCTAssertTrue(html.contains("<h2>"), "Should render h2")
-        XCTAssertTrue(html.contains("<p>"), "Should render paragraph")
+        XCTAssertTrue(html.contains("<h1"), "Should render h1")
+        XCTAssertTrue(html.contains("<h2"), "Should render h2")
+        XCTAssertTrue(html.contains("<p"), "Should render paragraph")
     }
 
     func testMarkdownTablesRendered() throws {
@@ -51,9 +51,9 @@ final class MarkdownDocumentModelTests: XCTestCase {
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("<table>"), "Should render table")
-        XCTAssertTrue(html.contains("<th>"), "Should render table header")
-        XCTAssertTrue(html.contains("<td>"), "Should render table data")
+        XCTAssertTrue(html.contains("<table"), "Should render table")
+        XCTAssertTrue(html.contains("<th"), "Should render table header")
+        XCTAssertTrue(html.contains("<td"), "Should render table data")
     }
 
     func testMarkdownCodeBlockRendered() throws {
@@ -87,7 +87,7 @@ final class MarkdownDocumentModelTests: XCTestCase {
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("<blockquote>"), "Should render blockquote")
+        XCTAssertTrue(html.contains("<blockquote"), "Should render blockquote")
     }
 
     func testMarkdownImageRendered() throws {
@@ -107,9 +107,9 @@ final class MarkdownDocumentModelTests: XCTestCase {
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("<ul>"), "Should render unordered list")
-        XCTAssertTrue(html.contains("<ol>"), "Should render ordered list")
-        XCTAssertTrue(html.contains("<li>"), "Should render list items")
+        XCTAssertTrue(html.contains("<ul"), "Should render unordered list")
+        XCTAssertTrue(html.contains("<ol"), "Should render ordered list")
+        XCTAssertTrue(html.contains("<li"), "Should render list items")
     }
 
     func testMarkdownHorizontalRuleRendered() throws {
@@ -421,13 +421,13 @@ final class MarkdownDocumentModelTests: XCTestCase {
         let mdModel = MarkdownDocumentModel()
         mdModel.load(from: mdUrl)
         let mdHtml = try XCTUnwrap(mdModel.html)
-        XCTAssertTrue(mdHtml.contains("<div id=\"toc-container\">"), "Markdown should have TOC container element")
+        XCTAssertTrue(mdHtml.contains("id=\"sidebar-container\""), "Markdown should have sidebar container element")
 
         let pyUrl = writeTempFile("print(1)", ext: "py")
         let pyModel = MarkdownDocumentModel()
         pyModel.load(from: pyUrl)
         let pyHtml = try XCTUnwrap(pyModel.html)
-        XCTAssertFalse(pyHtml.contains("<div id=\"toc-container\">"), "Code files should NOT have TOC container element")
+        XCTAssertFalse(pyHtml.contains("id=\"sidebar-container\""), "Code files should NOT have sidebar container element")
     }
 
     func testTOCScriptGeneratesSlugIDs() {
@@ -437,11 +437,11 @@ final class MarkdownDocumentModelTests: XCTestCase {
 
     func testTOCScriptContent() {
         let script = MarkdownDocumentModel.tocScript
-        XCTAssertTrue(script.contains("toc-container"), "Should reference TOC container")
+        XCTAssertTrue(script.contains("sidebar-container"), "Should reference sidebar container")
         XCTAssertTrue(script.contains("toc-tree"), "Should reference TOC tree")
         XCTAssertTrue(script.contains("IntersectionObserver"), "Should use IntersectionObserver for active tracking")
-        XCTAssertTrue(script.contains("toc-resize"), "Should support resize handle")
-        XCTAssertTrue(script.contains("toc-toggle"), "Should support toggle button")
+        XCTAssertTrue(script.contains("has-sidebar"), "Should support sidebar layout class")
+        XCTAssertTrue(script.contains("scrollIntoView"), "Should scroll to heading on click")
         XCTAssertTrue(script.contains("scrollIntoView"), "Should scroll to heading on click")
     }
 
@@ -451,10 +451,10 @@ final class MarkdownDocumentModelTests: XCTestCase {
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("id=\"toc-toggle\""), "Should have toggle button")
-        XCTAssertTrue(html.contains("id=\"toc-nav\""), "Should have nav element")
-        XCTAssertTrue(html.contains("id=\"toc-tree\""), "Should have tree element")
-        XCTAssertTrue(html.contains("id=\"toc-resize\""), "Should have resize handle")
+        XCTAssertTrue(html.contains("id=\"sidebar-icons\""), "Should have icon tab bar")
+        XCTAssertTrue(html.contains("id=\"sidebar-panels\""), "Should have panels container")
+        XCTAssertTrue(html.contains("id=\"toc-panel\""), "Should have TOC panel")
+        XCTAssertTrue(html.contains("id=\"sidebar-resize\""), "Should have resize handle")
         XCTAssertTrue(html.contains("id=\"layout\""), "Should have layout wrapper")
     }
 
@@ -636,7 +636,7 @@ final class MarkdownDocumentModelTests: XCTestCase {
         let html = try XCTUnwrap(model.html)
         XCTAssertTrue(html.contains("frontmatter-data"), "Should have hidden frontmatter div")
         XCTAssertTrue(html.contains("title: Test"), "Should contain escaped frontmatter YAML")
-        XCTAssertTrue(html.contains("<h1>"), "Should render the body heading")
+        XCTAssertTrue(html.contains("<h1"), "Should render the body heading")
     }
 
     func testFrontmatterNotPresentWhenMissing() throws {
@@ -1129,7 +1129,7 @@ final class MarkdownDocumentModelTests: XCTestCase {
         let url = writeTempFile("# Public API", ext: "md")
         let (body, isMarkdown) = try MarkdownDocumentModel.htmlBodyPublic(for: url)
         XCTAssertTrue(isMarkdown, "Should detect markdown")
-        XCTAssertTrue(body.contains("<h1>"), "Should render heading")
+        XCTAssertTrue(body.contains("<h1"), "Should render heading")
     }
 
     func testHtmlBodyPublicForCode() throws {
@@ -1367,6 +1367,247 @@ final class MarkdownDocumentModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
         let size = try FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? Int ?? 0
         XCTAssertGreaterThan(size, 1000, "Exported HTML should be substantial")
+    }
+
+    // MARK: - Comment Annotations
+
+    func testPreprocessCommentsSingleComment() {
+        let md = "Hello <!-- COMMENT: my note -->world<!-- /COMMENT --> end"
+        let result = MarkdownDocumentModel.preprocessComments(md)
+        XCTAssertTrue(result.contains("<mark class=\"qmd-comment\" data-comment=\"my note\">world</mark>"))
+        XCTAssertFalse(result.contains("<!-- COMMENT"))
+    }
+
+    func testPreprocessCommentsMultipleComments() {
+        let md = "<!-- COMMENT: a -->first<!-- /COMMENT --> mid <!-- COMMENT: b -->second<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.preprocessComments(md)
+        XCTAssertTrue(result.contains("data-comment=\"a\">first</mark>"))
+        XCTAssertTrue(result.contains("data-comment=\"b\">second</mark>"))
+    }
+
+    func testPreprocessCommentsNoComments() {
+        let md = "# Hello\nJust regular markdown"
+        let result = MarkdownDocumentModel.preprocessComments(md)
+        XCTAssertEqual(result, md)
+    }
+
+    func testPreprocessCommentsHTMLEscapesComment() {
+        let md = "<!-- COMMENT: has <b>&amp; \"quotes\" -->text<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.preprocessComments(md)
+        XCTAssertTrue(result.contains("data-comment=\"has &lt;b&gt;&amp;amp; &quot;quotes&quot;\""))
+    }
+
+    func testPreprocessCommentsMultilineAnnotatedText() {
+        let md = "<!-- COMMENT: note -->line1\nline2<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.preprocessComments(md)
+        XCTAssertTrue(result.contains(">line1\nline2</mark>"))
+    }
+
+    func testAddCommentWrapsText() {
+        let text = "Hello world end"
+        let range = NSRange(location: 6, length: 5) // "world"
+        let result = MarkdownDocumentModel.addComment(around: range, comment: "my note", in: text)
+        XCTAssertEqual(result, "Hello <!-- COMMENT: my note -->world<!-- /COMMENT --> end")
+    }
+
+    func testAddCommentAtStart() {
+        let text = "Hello world"
+        let range = NSRange(location: 0, length: 5) // "Hello"
+        let result = MarkdownDocumentModel.addComment(around: range, comment: "start", in: text)
+        XCTAssertEqual(result, "<!-- COMMENT: start -->Hello<!-- /COMMENT --> world")
+    }
+
+    func testAddCommentAtEnd() {
+        let text = "Hello world"
+        let range = NSRange(location: 6, length: 5) // "world"
+        let result = MarkdownDocumentModel.addComment(around: range, comment: "end note", in: text)
+        XCTAssertEqual(result, "Hello <!-- COMMENT: end note -->world<!-- /COMMENT -->")
+    }
+
+    func testRemoveCommentKeepsText() {
+        let text = "Hello <!-- COMMENT: note -->world<!-- /COMMENT --> end"
+        let result = MarkdownDocumentModel.removeComment(at: 0, in: text)
+        XCTAssertEqual(result, "Hello world end")
+    }
+
+    func testRemoveCommentFirstOfMultiple() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT --> <!-- COMMENT: b -->second<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.removeComment(at: 0, in: text)
+        XCTAssertTrue(result.contains("first"))
+        XCTAssertTrue(result.contains("<!-- COMMENT: b -->second<!-- /COMMENT -->"))
+        XCTAssertFalse(result.contains("<!-- COMMENT: a -->"))
+    }
+
+    func testRemoveCommentSecondOfMultiple() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT --> <!-- COMMENT: b -->second<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.removeComment(at: 1, in: text)
+        XCTAssertTrue(result.contains("<!-- COMMENT: a -->first<!-- /COMMENT -->"))
+        XCTAssertTrue(result.contains("second"))
+        XCTAssertFalse(result.contains("<!-- COMMENT: b -->"))
+    }
+
+    func testRemoveCommentInvalidIndex() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.removeComment(at: 5, in: text)
+        XCTAssertEqual(result, text, "Invalid index should return unchanged text")
+    }
+
+    func testUpdateCommentChangesText() {
+        let text = "Hello <!-- COMMENT: old -->world<!-- /COMMENT --> end"
+        let result = MarkdownDocumentModel.updateComment(at: 0, newComment: "new note", in: text)
+        XCTAssertEqual(result, "Hello <!-- COMMENT: new note -->world<!-- /COMMENT --> end")
+    }
+
+    func testUpdateCommentSecondOfMultiple() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT --> <!-- COMMENT: b -->second<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.updateComment(at: 1, newComment: "updated", in: text)
+        XCTAssertTrue(result.contains("<!-- COMMENT: a -->first<!-- /COMMENT -->"))
+        XCTAssertTrue(result.contains("<!-- COMMENT: updated -->second<!-- /COMMENT -->"))
+    }
+
+    func testUpdateCommentInvalidIndex() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.updateComment(at: 5, newComment: "x", in: text)
+        XCTAssertEqual(result, text, "Invalid index should return unchanged text")
+    }
+
+    func testParseCommentsFindsAll() {
+        let text = "<!-- COMMENT: a -->first<!-- /COMMENT --> mid <!-- COMMENT: b -->second<!-- /COMMENT -->"
+        let comments = MarkdownDocumentModel.parseComments(in: text)
+        XCTAssertEqual(comments.count, 2)
+        XCTAssertEqual(comments[0].comment, "a")
+        XCTAssertEqual(comments[0].annotatedText, "first")
+        XCTAssertEqual(comments[1].comment, "b")
+        XCTAssertEqual(comments[1].annotatedText, "second")
+    }
+
+    func testParseCommentsEmpty() {
+        let comments = MarkdownDocumentModel.parseComments(in: "No comments here")
+        XCTAssertTrue(comments.isEmpty)
+    }
+
+    func testParseCommentsRangesAreCorrect() {
+        let text = "pre <!-- COMMENT: x -->hello<!-- /COMMENT --> post"
+        let comments = MarkdownDocumentModel.parseComments(in: text)
+        XCTAssertEqual(comments.count, 1)
+        let nsText = text as NSString
+        let matched = nsText.substring(with: comments[0].range)
+        XCTAssertEqual(matched, "<!-- COMMENT: x -->hello<!-- /COMMENT -->")
+    }
+
+    func testCommentRoundTrip() {
+        // Add a comment, then update it, then remove it — should return to original
+        let original = "The quick brown fox"
+        let range = NSRange(location: 4, length: 5) // "quick"
+        let added = MarkdownDocumentModel.addComment(around: range, comment: "fast", in: original)
+        XCTAssertTrue(added.contains("<!-- COMMENT: fast -->quick<!-- /COMMENT -->"))
+
+        let updated = MarkdownDocumentModel.updateComment(at: 0, newComment: "speedy", in: added)
+        XCTAssertTrue(updated.contains("<!-- COMMENT: speedy -->quick<!-- /COMMENT -->"))
+
+        let removed = MarkdownDocumentModel.removeComment(at: 0, in: updated)
+        XCTAssertEqual(removed, original)
+    }
+
+    func testCommentInRenderedHTML() throws {
+        let md = "Hello <!-- COMMENT: note -->world<!-- /COMMENT --> end"
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+
+        let html = try XCTUnwrap(model.html)
+        XCTAssertTrue(html.contains("qmd-comment"), "Should have comment mark class")
+        XCTAssertTrue(html.contains("data-comment=\"note\""), "Should have comment data attribute")
+        XCTAssertFalse(html.contains("<!-- COMMENT"), "Comment markers should be preprocessed away")
+    }
+
+    func testCommentSidebarHTMLPresent() throws {
+        let md = "# Title\nSome text"
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+
+        let html = try XCTUnwrap(model.html)
+        XCTAssertTrue(html.contains("id=\"sidebar-container\""), "Should have sidebar container")
+        XCTAssertTrue(html.contains("id=\"comments-panel\""), "Should have comments panel")
+        XCTAssertTrue(html.contains("id=\"toc-panel\""), "Should have TOC panel")
+        XCTAssertTrue(html.contains("sidebar-icon"), "Should have sidebar icons")
+    }
+
+    func testCommentSidebarScriptInjected() {
+        // commentsSidebarScript is injected via WKUserScript, not in page HTML
+        // Verify the static property contains the expected functions
+        let script = MarkdownDocumentModel.commentsSidebarScript
+        XCTAssertTrue(script.contains("__buildCommentsList"), "Should have comments sidebar script")
+        XCTAssertTrue(script.contains("__highlightCommentInSidebar"), "Should have highlight function")
+    }
+
+    func testCommentFlashAnimationCSS() throws {
+        let md = "# Title\nSome text"
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+
+        let html = try XCTUnwrap(model.html)
+        XCTAssertTrue(html.contains("qmd-comment-flash"), "Should have flash animation class")
+        XCTAssertTrue(html.contains("comment-flash"), "Should have flash keyframes")
+    }
+
+    func testCommentContextMenuHelpers() {
+        let script = MarkdownDocumentModel.commentScript
+        XCTAssertTrue(script.contains("__getSelectionText"), "Should have selection text helper")
+        XCTAssertTrue(script.contains("__getCommentAtPoint"), "Should have comment-at-point helper")
+        XCTAssertFalse(script.contains("contextmenu"), "Should NOT have contextmenu listener")
+    }
+
+    func testSidebarArrangeScript() {
+        let script = MarkdownDocumentModel.sidebarArrangeScript
+        XCTAssertTrue(script.contains("sidebar-icon"), "Should handle icon tabs")
+        XCTAssertTrue(script.contains("sidebar-panel"), "Should handle panel switching")
+        XCTAssertTrue(script.contains("__showCommentsPanel"), "Should expose show comments function")
+        XCTAssertTrue(script.contains("__toggleSidebar"), "Should expose toggle sidebar function")
+        XCTAssertTrue(script.contains("sidebar-resize"), "Should handle resize")
+    }
+
+    func testCommentsSidebarScript() {
+        let script = MarkdownDocumentModel.commentsSidebarScript
+        XCTAssertTrue(script.contains("__buildCommentsList"), "Should have build function")
+        XCTAssertTrue(script.contains("__highlightCommentInSidebar"), "Should have highlight function")
+        XCTAssertTrue(script.contains("comment-item"), "Should create comment items")
+        XCTAssertTrue(script.contains("comment-annotated"), "Should show annotated text")
+        XCTAssertTrue(script.contains("comment-text"), "Should show comment text")
+        XCTAssertTrue(script.contains("sidebarClick"), "Should post sidebarClick message")
+        XCTAssertTrue(script.contains("sidebarDelete"), "Should post sidebarDelete message")
+        XCTAssertTrue(script.contains("comment-badge"), "Should update badge count")
+    }
+
+    func testMultipleCommentsPreprocessOrder() {
+        let text = "<!-- COMMENT: first -->A<!-- /COMMENT --> B <!-- COMMENT: second -->C<!-- /COMMENT --> D <!-- COMMENT: third -->E<!-- /COMMENT -->"
+        let result = MarkdownDocumentModel.preprocessComments(text)
+        // All three should be processed
+        XCTAssertTrue(result.contains("data-comment=\"first\">A</mark>"))
+        XCTAssertTrue(result.contains("data-comment=\"second\">C</mark>"))
+        XCTAssertTrue(result.contains("data-comment=\"third\">E</mark>"))
+        // No raw comment markers should remain
+        XCTAssertFalse(result.contains("<!-- COMMENT"))
+        XCTAssertFalse(result.contains("<!-- /COMMENT"))
+    }
+
+    func testCommentWithSpecialMarkdown() {
+        // Comment around bold text
+        let text = "Hello <!-- COMMENT: emphasis -->**bold text**<!-- /COMMENT --> end"
+        let result = MarkdownDocumentModel.preprocessComments(text)
+        XCTAssertTrue(result.contains("<mark class=\"qmd-comment\" data-comment=\"emphasis\">**bold text**</mark>"))
+    }
+
+    func testSetContentUpdatesRawContent() {
+        let model = MarkdownDocumentModel()
+        let url = writeTempFile("original", ext: "md")
+        model.load(from: url)
+        XCTAssertEqual(model.rawContent, "original")
+
+        model.setContent("modified", actionName: "Test")
+        XCTAssertEqual(model.rawContent, "modified")
     }
 
     // MARK: - Helpers

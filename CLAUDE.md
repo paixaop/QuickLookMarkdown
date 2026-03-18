@@ -5,6 +5,7 @@
 - Uses XcodeGen: `xcodegen generate` then `xcodebuild`
 - App product name is `QuickMD` (bundle ID: `com.pedro.QuickMDApp`)
 - No paid developer certificate — build with ad-hoc signing: `CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM=""`
+- **Always run `make install` after building** to copy the app to /Applications and re-register the Quick Look extension. The app must be installed to test properly.
 
 ## Quick Look Extension — How to Override the System Markdown Previewer
 
@@ -108,6 +109,61 @@ The highlight.js theme CSS loads first, then our custom `<style>` block override
 The app registers as default handler (`LSHandlerRank: Owner`) for markdown, JSON, and YAML. For source code files it registers as `Alternate` (won't steal default from Xcode/editors). The extension's `QLSupportedContentTypes` includes all the same types for Quick Look previews.
 
 The `extensionToLanguage` dictionary in both `MarkdownDocumentModel.swift` and `PreviewViewController.swift` maps file extensions to highlight.js language names. Add new languages by adding entries there and corresponding UTIs to Info.plist + project.yml.
+
+## Testing
+
+### Rules — READ BEFORE WRITING TESTS
+
+1. **Every feature MUST have a WKWebView E2E test.** Unit tests alone are not sufficient. If your code produces HTML or runs JS in the browser, test it in a real `WKWebView`. See `EditorRendererSyncE2ETests.swift` for the pattern.
+
+2. **E2E test pattern:**
+   - Create a `WKWebView` in the test
+   - Load rendered HTML via `MarkdownDocumentModel` (use `loadHTMLString`)
+   - Inject all JS scripts (`editorSyncScript`, `commentScript`, `commentsSidebarScript`, `sidebarArrangeScript`)
+   - Wait for load (use `expectation` with ~1.5s timeout)
+   - Use `evaluateJavaScript` to interact with the DOM (select text, click elements, read attributes)
+   - Verify the JS functions return correct values
+   - Verify the Swift algorithm produces the correct result from the JS output
+
+3. **Test the full pipeline, not just functions.** A test that calls `SourceMappedHTMLFormatter.format()` and checks the output is a unit test. An E2E test loads that HTML into a WKWebView, selects text with `window.find()`, calls `__getSelectionSourceInfo()`, and verifies the source line mapping is correct end-to-end.
+
+4. **Use `window.find(text, caseSensitive, backwards, wrap)` to select text in the WebView.** This is how you simulate clicking/selecting words. Use the `occurrence` parameter pattern to select the nth occurrence.
+
+5. **Test duplicate/ambiguous cases.** If a word appears multiple times, test that each occurrence maps to the correct source position. This is the most important class of E2E tests.
+
+6. **Test edge cases in the browser, not just in Swift.** Markdown formatting (`**bold**`, `[link](url)`, `# heading`), comment annotations, frontmatter, nested structures — all affect how the DOM looks. The browser may handle these differently than you expect.
+
+7. **Expose testable static functions.** When testing algorithms that live inside UI code (like `jumpEditorToWord` on the Coordinator), extract the core logic into a `static func` so tests can call it without needing a full UI context. Example: `WebView.Coordinator.findWordRange(word:in:sourceLine:offsetInBlock:frontmatterLineCount:)`.
+
+### Test Structure
+
+- `QuickMDTests/MarkdownDocumentModelTests.swift` — Unit tests for the model (140+ tests)
+- `QuickMDTests/EditorRendererSyncTests.swift` — Unit tests for sync algorithm edge cases (71 tests)
+- `QuickMDTests/EditorRendererSyncE2ETests.swift` — **WKWebView E2E tests** for full browser pipeline (25 tests)
+- `QuickMDUITests/QuickMDUITests.swift` — XCUITest app-level tests (menus, shortcuts, file opening)
+- `QuickMDUITests/Fixtures/` — Test markdown files (basic.md, linked.md, comments.md, headings.md, formatting.md, frontmatter.md, empty.md, large.md)
+
+### Running Tests
+
+```bash
+# Unit + E2E tests (both run in-process, E2E uses real WKWebView)
+xcodebuild test -scheme QuickMDApp -only-testing QuickMDTests \
+  CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+  CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION=YES SWIFT_VERSION=5.0 \
+  SWIFT_ENABLE_EXPLICIT_MODULES=NO ENABLE_TESTABILITY=YES
+
+# UI tests (launches app, requires accessibility permissions)
+xcodebuild test -scheme QuickMDApp -only-testing QuickMDUITests \
+  CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+  CODE_SIGN_ALLOW_ENTITLEMENTS_MODIFICATION=YES SWIFT_VERSION=5.0
+```
+
+### When to Write Tests
+
+- **New JS feature** → Write an E2E test that loads HTML into WKWebView and exercises the JS
+- **New Swift algorithm** → Extract as static func, write unit test + E2E test
+- **Bug fix** → Write a test that reproduces the bug first, then fix it
+- **Changed HTML structure** → Update existing tests that check for specific HTML tags (e.g., `<h1>` → `<h1 data-source-line=` after adding source mapping)
 
 ## Architecture
 
