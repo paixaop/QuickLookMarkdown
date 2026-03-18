@@ -510,54 +510,22 @@ struct WebView: NSViewRepresentable {
         private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1) {
             let source = model.rawContent
             // Decode HTML entities that may come from WebView selection
-            let decodedText = text
+            let trimmedText = text
                 .replacingOccurrences(of: "&amp;", with: "&")
                 .replacingOccurrences(of: "&lt;", with: "<")
                 .replacingOccurrences(of: "&gt;", with: ">")
                 .replacingOccurrences(of: "&quot;", with: "\"")
                 .replacingOccurrences(of: "&#39;", with: "'")
-            let trimmedText = decodedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // If we have source line info, use it to narrow the search
-            if sourceLine > 0 {
-                let lines = source.components(separatedBy: "\n")
-                let adjustedLine = sourceLine + model.frontmatterLineCount - 1
-                if adjustedLine >= 0 && adjustedLine < lines.count {
-                    var lineCharOffset = 0
-                    for i in 0..<adjustedLine { lineCharOffset += lines[i].count + 1 }
-                    // Find block extent
-                    var blockEndOffset = lineCharOffset
-                    for i in adjustedLine..<lines.count {
-                        let t = lines[i].trimmingCharacters(in: .whitespaces)
-                        if i > adjustedLine && (t.isEmpty || t.hasPrefix("#")) { break }
-                        blockEndOffset += lines[i].count + 1
-                    }
-                    // Search within block range
-                    let nsSource = source as NSString
-                    let rangeStart = max(0, lineCharOffset - 5)
-                    let rangeEnd = min(nsSource.length, blockEndOffset + 5)
-                    let searchRange = NSRange(location: rangeStart, length: rangeEnd - rangeStart)
-                    let found = nsSource.range(of: trimmedText, options: [.caseInsensitive], range: searchRange)
-                    if found.location != NSNotFound {
-                        let updated = MarkdownDocumentModel.addComment(around: found, comment: comment, in: source)
-                        model.setContent(updated, actionName: "Add Comment")
-                        return
-                    }
-                }
+            // Use the same source-line mapping algorithm as double-click sync
+            if let range = Self.findWordRange(word: trimmedText, in: source, sourceLine: sourceLine, offsetInBlock: offsetInBlock, frontmatterLineCount: model.frontmatterLineCount) {
+                let updated = MarkdownDocumentModel.addComment(around: range, comment: comment, in: source)
+                model.setContent(updated, actionName: "Add Comment")
+                return
             }
 
-            // Fallback: original approach - exact match then case-insensitive
-            let candidates: [String.CompareOptions] = [[], .caseInsensitive]
-            for opts in candidates {
-                if let range = source.range(of: trimmedText, options: opts) {
-                    let nsRange = NSRange(range, in: source)
-                    let updated = MarkdownDocumentModel.addComment(around: nsRange, comment: comment, in: source)
-                    model.setContent(updated, actionName: "Add Comment")
-                    return
-                }
-            }
-
-            // Final fallback: try to find in editor selection if available
+            // Fallback: try editor selection (user selected text in the editor, not renderer)
             if let textView = findEditorTextView() {
                 let selectedRange = textView.selectedRange()
                 if selectedRange.length > 0 {
