@@ -752,15 +752,23 @@ struct QuickMDApp: App {
             }
             CommandGroup(after: .toolbar) {
                 Button("Back") {
-                    activeModel?.goBack()
+                    let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+                    if openInNewTab {
+                        WebViewStore.shared.goBackTab()
+                    } else {
+                        activeModel?.goBack()
+                    }
                 }
                 .keyboardShortcut("[")
-                .disabled(activeModel?.canGoBack != true)
                 Button("Forward") {
-                    activeModel?.goForward()
+                    let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+                    if openInNewTab {
+                        WebViewStore.shared.goForwardTab()
+                    } else {
+                        activeModel?.goForward()
+                    }
                 }
                 .keyboardShortcut("]")
-                .disabled(activeModel?.canGoForward != true)
                 Divider()
                 Button("Zoom In") {
                     WebViewStore.shared.webView?.zoomIn()

@@ -178,6 +178,48 @@ class WebViewStore: ObservableObject {
     var preReloadScrollFraction: Double = 0
     /// Callback to show the editor panel (set by ContentView)
     var showEditorCallback: (() -> Void)?
+
+    // MARK: - Shared tab navigation history (for back/forward across tabs)
+
+    @Published var tabBackStack: [URL] = []
+    @Published var tabForwardStack: [URL] = []
+    var canGoBackTab: Bool { !tabBackStack.isEmpty }
+    var canGoForwardTab: Bool { !tabForwardStack.isEmpty }
+
+    func pushTabHistory(_ url: URL) {
+        tabBackStack.append(url)
+        tabForwardStack.removeAll()
+    }
+
+    func goBackTab() {
+        guard let prev = tabBackStack.popLast() else { return }
+        // Push current window's URL to forward stack
+        if let current = NSApp.keyWindow?.representedURL {
+            tabForwardStack.append(current)
+        }
+        switchToTab(prev)
+    }
+
+    func goForwardTab() {
+        guard let next = tabForwardStack.popLast() else { return }
+        if let current = NSApp.keyWindow?.representedURL {
+            tabBackStack.append(current)
+        }
+        switchToTab(next)
+    }
+
+    private func switchToTab(_ url: URL) {
+        let standardized = url.standardizedFileURL
+        for window in NSApp.windows {
+            if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+                window.makeKeyAndOrderFront(nil)
+                if let tabGroup = window.tabGroup {
+                    tabGroup.selectedWindow = window
+                }
+                return
+            }
+        }
+    }
 }
 
 struct WebView: NSViewRepresentable {
@@ -283,10 +325,9 @@ struct WebView: NSViewRepresentable {
             // Check if already open in an existing tab/window
             for window in NSApp.windows {
                 if let represented = window.representedURL, represented.standardizedFileURL == standardized {
-                    // Track the tab we came from for back/forward
-                    if let model = AppDelegate.activeModel, let current = model.currentURL {
-                        model.backStack.append(current)
-                        model.forwardStack.removeAll()
+                    // Track in shared tab history for back/forward
+                    if let current = AppDelegate.activeModel?.currentURL {
+                        WebViewStore.shared.pushTabHistory(current)
                     }
                     window.makeKeyAndOrderFront(nil)
                     if let tabGroup = window.tabGroup {
@@ -301,10 +342,9 @@ struct WebView: NSViewRepresentable {
             let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
 
             if openInNewTab {
-                // Track navigation history so back/forward can switch tabs
-                if let model = AppDelegate.activeModel, let current = model.currentURL {
-                    model.backStack.append(current)
-                    model.forwardStack.removeAll()
+                // Track in shared tab history for back/forward
+                if let current = AppDelegate.activeModel?.currentURL {
+                    WebViewStore.shared.pushTabHistory(current)
                 }
                 AppDelegate.pendingDirAccess = dirURL
                 AppDelegate.pendingURL = url
@@ -469,7 +509,14 @@ struct WebView: NSViewRepresentable {
 
         private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1) {
             let source = model.rawContent
-            let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Decode HTML entities that may come from WebView selection
+            let decodedText = text
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&#39;", with: "'")
+            let trimmedText = decodedText.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // If we have source line info, use it to narrow the search
             if sourceLine > 0 {
@@ -1065,6 +1112,7 @@ struct SearchBar: View {
 
 struct ContentView: View {
     @StateObject private var model = MarkdownDocumentModel()
+    @ObservedObject private var webViewStore = WebViewStore.shared
     @AppStorage("theme") var theme = "system"
     @State private var showEditor = false
     @State private var editorPosition = CodeEditor.Position()
@@ -1201,17 +1249,22 @@ struct ContentView: View {
         } // VStack
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
-                Button(action: { model.goBack() }) {
+                let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+                Button(action: {
+                    if openInNewTab { webViewStore.goBackTab() } else { model.goBack() }
+                }) {
                     Image(systemName: "chevron.left")
                 }
-                .disabled(!model.canGoBack)
+                .disabled(openInNewTab ? !webViewStore.canGoBackTab : !model.canGoBack)
                 .help("Back (⌘[)")
                 .accessibilityLabel("Go back")
 
-                Button(action: { model.goForward() }) {
+                Button(action: {
+                    if openInNewTab { webViewStore.goForwardTab() } else { model.goForward() }
+                }) {
                     Image(systemName: "chevron.right")
                 }
-                .disabled(!model.canGoForward)
+                .disabled(openInNewTab ? !webViewStore.canGoForwardTab : !model.canGoForward)
                 .help("Forward (⌘])")
                 .accessibilityLabel("Go forward")
             }
