@@ -85,7 +85,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
 
         if markdownExtensions.contains(ext) {
             let (body, frontmatter) = stripFrontmatter(content)
-            var html = HTMLFormatter.format(body)
+            let processed = Self.preprocessComments(body)
+            var html = HTMLFormatter.format(processed)
             if let fm = frontmatter {
                 let escaped = fm
                     .replacingOccurrences(of: "&", with: "&amp;")
@@ -133,23 +134,48 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         }
     }
 
+    // MARK: - Comment Pre-processing
+
+    /// Replace comment markers with styled HTML spans (mirrors MarkdownDocumentModel.preprocessComments).
+    private static func preprocessComments(_ markdown: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<!--\s*COMMENT:\s*(.*?)\s*-->([\s\S]*?)<!--\s*/COMMENT\s*-->"#,
+            options: []
+        ) else { return markdown }
+        let nsMarkdown = markdown as NSString
+        var result = markdown
+        let matches = regex.matches(in: markdown, range: NSRange(location: 0, length: nsMarkdown.length))
+        for match in matches.reversed() {
+            let commentText = nsMarkdown.substring(with: match.range(at: 1))
+            let annotatedText = nsMarkdown.substring(with: match.range(at: 2))
+            let escapedComment = commentText
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            let replacement = "<mark class=\"qmd-comment\" data-comment=\"\(escapedComment)\" title=\"\(escapedComment)\">\(annotatedText)</mark>"
+            let range = Range(match.range, in: result)!
+            result.replaceSubrange(range, with: replacement)
+        }
+        return result
+    }
+
     // MARK: - Scripts
 
     private static let tocScript = """
     (function() {
-      var container = document.getElementById('toc-container');
+      var container = document.getElementById('sidebar-container');
       if (!container) return;
       var content = document.querySelector('.markdown-body');
       if (!content) return;
       var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
       if (headings.length === 0) {
         container.classList.add('hidden');
-        layout.classList.remove('has-toc');
         return;
       }
       var layout = document.getElementById('layout');
       if (!layout) return;
-      layout.classList.add('has-toc');
+      layout.classList.add('has-sidebar');
       var slugCounts = {};
       headings.forEach(function(h) {
         var text = h.textContent || '';
@@ -969,18 +995,98 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             </script>
         """
 
-        let tocMarkup = isMarkdown ? """
-            <div id="toc-container">
-              <button id="toc-toggle" title="Toggle contents">&#9776;</button>
-              <nav id="toc-nav">
-                <div id="toc-header">Contents</div>
-                <div id="toc-tree"></div>
-              </nav>
-              <div id="toc-resize"></div>
+        let sidebarMarkup = isMarkdown ? """
+            <div id="sidebar-container">
+              <div id="sidebar-icons">
+                <button class="sidebar-icon active" data-panel="toc" title="Contents">&#9776;</button>
+                <button class="sidebar-icon" data-panel="comments" title="Comments">&#128488;</button>
+              </div>
+              <div id="sidebar-panels">
+                <div id="toc-panel" class="sidebar-panel active">
+                  <div id="toc-header">Contents</div>
+                  <div id="toc-tree"></div>
+                </div>
+                <div id="comments-panel" class="sidebar-panel">
+                  <div id="comments-header">Comments</div>
+                  <div id="comments-list"></div>
+                </div>
+              </div>
+              <div id="sidebar-resize"></div>
             </div>
         """ : ""
 
         let tocBlock = isMarkdown ? "<script>\(tocScript)</script>" : ""
+
+        let commentsBlock = isMarkdown ? """
+            <script>
+            (function() {
+              var list = document.getElementById('comments-list');
+              if (!list) return;
+              var marks = document.querySelectorAll('.qmd-comment');
+              var sidebar = document.getElementById('sidebar-container');
+              var layout = document.getElementById('layout');
+              if (marks.length === 0) return;
+              if (sidebar && layout) { sidebar.classList.remove('hidden'); layout.classList.add('has-sidebar'); }
+              // Update badge
+              var commentsIcon = document.querySelector('.sidebar-icon[data-panel="comments"]');
+              if (commentsIcon) {
+                var badge = document.createElement('span');
+                badge.className = 'comment-badge';
+                badge.textContent = marks.length;
+                commentsIcon.appendChild(badge);
+              }
+              marks.forEach(function(mark, index) {
+                var item = document.createElement('div');
+                item.className = 'comment-item';
+                var textEl = document.createElement('div');
+                textEl.className = 'comment-annotated';
+                var annotated = mark.textContent || '';
+                textEl.textContent = annotated.length > 60 ? annotated.substring(0, 57) + '...' : annotated;
+                item.appendChild(textEl);
+                var commentEl = document.createElement('div');
+                commentEl.className = 'comment-text';
+                commentEl.textContent = mark.getAttribute('data-comment') || mark.getAttribute('title') || '';
+                item.appendChild(commentEl);
+                item.addEventListener('click', function() {
+                  mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                });
+                list.appendChild(item);
+              });
+              // Icon tab switching
+              var icons = document.querySelectorAll('.sidebar-icon');
+              icons.forEach(function(icon) {
+                icon.addEventListener('click', function() {
+                  var panel = icon.dataset.panel;
+                  if (icon.classList.contains('active') && !sidebar.classList.contains('collapsed')) {
+                    sidebar.classList.add('collapsed'); return;
+                  }
+                  sidebar.classList.remove('collapsed');
+                  icons.forEach(function(i) { i.classList.remove('active'); });
+                  icon.classList.add('active');
+                  document.querySelectorAll('.sidebar-panel').forEach(function(p) {
+                    p.classList.toggle('active', p.id === panel + '-panel');
+                  });
+                });
+              });
+              // Resize
+              var resize = document.getElementById('sidebar-resize');
+              if (resize && sidebar) {
+                resize.addEventListener('mousedown', function(e) {
+                  e.preventDefault();
+                  if (sidebar.classList.contains('collapsed')) return;
+                  var startX = e.clientX, startW = sidebar.offsetWidth;
+                  function onMove(ev) {
+                    var nw = Math.max(100, Math.min(startW + (ev.clientX - startX), window.innerWidth * 0.5));
+                    sidebar.style.width = nw + 'px';
+                  }
+                  function onUp() { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); }
+                  document.addEventListener('mousemove', onMove);
+                  document.addEventListener('mouseup', onUp);
+                });
+              }
+            })();
+            </script>
+        """ : ""
 
         let emojiBlock = """
             <script>
@@ -1135,24 +1241,40 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               @media (prefers-color-scheme: dark) { .reading-stats { color: #999; border-bottom-color: #444c56; } }
               html[data-theme="dark"] .reading-stats { color: #999; border-bottom-color: #444c56; }
               #layout { height: 100vh; }
-              #layout.has-toc { display: flex; overflow: hidden; }
-              #layout.has-toc .markdown-body { flex: 1; overflow-y: auto; min-height: 0; }
-              html:has(#layout.has-toc), body:has(#layout.has-toc) { height: 100vh; overflow: hidden; }
-              #toc-container {
+              #layout:has(#sidebar-container:not(.hidden)), #layout.has-sidebar { display: flex; overflow: hidden; }
+              #layout:has(#sidebar-container:not(.hidden)) .markdown-body, #layout.has-sidebar .markdown-body { flex: 1; overflow-y: auto; min-height: 0; }
+              html:has(#sidebar-container:not(.hidden)), body:has(#sidebar-container:not(.hidden)),
+              html:has(#layout.has-sidebar), body:has(#layout.has-sidebar) { height: 100vh; overflow: hidden; }
+              #sidebar-container {
                 position: relative; width: 220px; min-width: 100px; max-width: 50vw;
                 height: 100vh; border-right: 1px solid #d0d7de; background: #f6f8fa;
                 font-size: 13px; display: flex; flex-direction: column;
               }
-              #toc-container.hidden { display: none; }
-              #toc-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
-              #toc-nav { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
-              #toc-container.collapsed #toc-nav { display: none; }
-              #toc-container.collapsed #toc-resize { display: none; }
-              #toc-resize { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 10; }
-              #toc-resize:hover, #toc-resize.dragging { background: rgba(9,105,218,0.3); }
-              #toc-toggle { background: none; border: none; cursor: pointer; font-size: 18px; padding: 6px 8px; text-align: left; color: #656d76; flex-shrink: 0; }
-              #toc-toggle:hover { color: #1f2328; }
-              #toc-header { font-weight: 600; padding: 4px 10px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #656d76; }
+              #sidebar-container.hidden { display: none; }
+              #sidebar-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
+              #sidebar-container.collapsed #sidebar-panels { display: none; }
+              #sidebar-container.collapsed #sidebar-resize { display: none; }
+              #sidebar-icons { display: flex; flex-shrink: 0; border-bottom: 1px solid #d0d7de; }
+              .sidebar-icon {
+                flex: 1; background: none; border: none; cursor: pointer;
+                font-size: 16px; padding: 7px 0; text-align: center;
+                color: #656d76; border-bottom: 2px solid transparent;
+                position: relative;
+              }
+              .sidebar-icon:hover { color: #1f2328; background: rgba(0,0,0,0.04); }
+              .sidebar-icon.active { color: #0969da; border-bottom-color: #0969da; }
+              .comment-badge {
+                position: absolute; top: 2px; right: 4px;
+                background: #d4a017; color: #fff; font-size: 9px;
+                min-width: 14px; height: 14px; line-height: 14px;
+                border-radius: 7px; text-align: center; padding: 0 3px;
+              }
+              #sidebar-panels { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+              .sidebar-panel { display: none; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+              .sidebar-panel.active { display: flex; }
+              #sidebar-resize { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 10; }
+              #sidebar-resize:hover { background: rgba(9,105,218,0.3); }
+              #toc-header, #comments-header { font-weight: 600; padding: 4px 10px 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #656d76; flex-shrink: 0; }
               #toc-tree { flex: 1; overflow-y: auto; }
               .toc-item { display: flex; align-items: center; padding: 3px 8px; cursor: pointer; border-left: 3px solid transparent; }
               .toc-item:hover { background: #e8e8e8; }
@@ -1162,34 +1284,39 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               .toc-item.collapsed .toc-toggle { transform: rotate(0deg); }
               .toc-item:not(.collapsed) .toc-toggle:not(.no-children) { transform: rotate(90deg); }
               .toc-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; padding-left: 4px; }
-              body.toc-resizing { cursor: col-resize; user-select: none; }
+              #comments-list { flex: 1; overflow-y: auto; }
+              .comment-item { padding: 8px 10px; cursor: pointer; border-left: 3px solid transparent; border-bottom: 1px solid rgba(0,0,0,0.06); }
+              .comment-item:hover { background: #e8e8e8; }
+              .comment-annotated { font-size: 12px; color: #1f2328; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+              .comment-text { font-size: 11px; color: #656d76; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
               @media (prefers-color-scheme: dark) {
-                #toc-container { background: #252526; border-right-color: #444c56; }
-                #toc-toggle { color: #999; } #toc-toggle:hover { color: #d4d4d4; }
-                #toc-header { color: #999; }
+                #sidebar-container { background: #252526; border-right-color: #444c56; }
+                #sidebar-icons { border-bottom-color: #444c56; }
+                .sidebar-icon { color: #999; }
+                .sidebar-icon:hover { color: #d4d4d4; }
+                .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+                #toc-header, #comments-header { color: #999; }
                 .toc-item:hover { background: #2d2d2d; }
                 .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
                 .toc-toggle { color: #999; }
-                #toc-resize:hover, #toc-resize.dragging { background: rgba(88,166,255,0.3); }
+                #sidebar-resize:hover { background: rgba(88,166,255,0.3); }
+                .comment-item:hover { background: #2d2d2d; }
+                .comment-annotated { color: #d4d4d4; }
+                .comment-text { color: #999; }
+                .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
               }
-              html[data-theme="dark"] #toc-container { background: #252526; border-right-color: #444c56; }
-              html[data-theme="dark"] #toc-toggle { color: #999; }
-              html[data-theme="dark"] #toc-toggle:hover { color: #d4d4d4; }
-              html[data-theme="dark"] #toc-header { color: #999; }
+              html[data-theme="dark"] #sidebar-container { background: #252526; border-right-color: #444c56; }
+              html[data-theme="dark"] #sidebar-icons { border-bottom-color: #444c56; }
+              html[data-theme="dark"] .sidebar-icon { color: #999; }
+              html[data-theme="dark"] .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+              html[data-theme="dark"] #toc-header, html[data-theme="dark"] #comments-header { color: #999; }
               html[data-theme="dark"] .toc-item:hover { background: #2d2d2d; }
               html[data-theme="dark"] .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
               html[data-theme="dark"] .toc-toggle { color: #999; }
-              html[data-theme="dark"] #toc-resize:hover,
-              html[data-theme="dark"] #toc-resize.dragging { background: rgba(88,166,255,0.3); }
-              html[data-theme="light"] #toc-container { background: #f6f8fa; border-right-color: #d0d7de; }
-              html[data-theme="light"] #toc-toggle { color: #656d76; }
-              html[data-theme="light"] #toc-toggle:hover { color: #1f2328; }
-              html[data-theme="light"] #toc-header { color: #656d76; }
-              html[data-theme="light"] .toc-item:hover { background: #e8e8e8; }
-              html[data-theme="light"] .toc-item.active { background: #dbeafe; border-left-color: #0969da; }
-              html[data-theme="light"] .toc-toggle { color: #656d76; }
-              html[data-theme="light"] #toc-resize:hover,
-              html[data-theme="light"] #toc-resize.dragging { background: rgba(9,105,218,0.3); }
+              html[data-theme="dark"] #sidebar-resize:hover { background: rgba(88,166,255,0.3); }
+              html[data-theme="dark"] .comment-item:hover { background: #2d2d2d; }
+              html[data-theme="dark"] .comment-annotated { color: #d4d4d4; }
+              html[data-theme="dark"] .comment-text { color: #999; }
               /* Line numbers */
               .code-line { display: block; }
               pre code.has-line-numbers { counter-reset: line; padding-left: 3.5em !important; }
@@ -1301,12 +1428,12 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               html[data-theme="light"] .hljs-deletion{color:#b31d28;background-color:#ffeef0}
               /* Print stylesheet */
               @media print {
-                #toc-container, .copy-btn, #find-bar, #jump-bar,
+                #sidebar-container, #toc-container, .copy-btn, #find-bar, #jump-bar,
                 .reading-stats, .mermaid-overlay { display: none !important; }
                 body { background: white !important; color: black !important; }
                 .markdown-body { padding: 0 !important; }
                 #layout { display: block !important; height: auto !important; }
-                #layout.has-toc .markdown-body { overflow: visible !important; }
+                #layout.has-sidebar .markdown-body, #layout.has-toc .markdown-body { overflow: visible !important; }
                 h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
                 pre, table, blockquote, img { page-break-inside: avoid; }
                 a[href]::after { content: ' (' attr(href) ')'; font-size: 0.85em; color: #666; }
@@ -1373,10 +1500,82 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
               html[data-theme="dark"] .frontmatter-banner { border-bottom-color: #444c56; }
               html[data-theme="dark"] .frontmatter-title { color: #999; }
               html[data-theme="dark"] .frontmatter-tag { background: #1e3a5f; color: #93c5fd; }
+              /* Comment annotations */
+              .qmd-comment {
+                background: rgba(255, 213, 79, 0.3);
+                border-bottom: 2px solid rgba(255, 179, 0, 0.6);
+              }
+              @media (prefers-color-scheme: dark) {
+                .qmd-comment {
+                  background: rgba(255, 179, 0, 0.2);
+                  border-bottom-color: rgba(255, 179, 0, 0.4);
+                }
+              }
+              html[data-theme="dark"] .qmd-comment {
+                background: rgba(255, 179, 0, 0.2);
+                border-bottom-color: rgba(255, 179, 0, 0.4);
+              }
+              /* Comments sidebar */
+              #comments-container {
+                position: relative;
+                width: 200px; min-width: 80px; max-width: 40vw;
+                height: 100vh;
+                border-left: 1px solid #d0d7de;
+                background: #f6f8fa;
+                font-size: 13px;
+                display: flex; flex-direction: column;
+              }
+              #comments-container.hidden { display: none; }
+              #comments-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
+              #comments-nav { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+              #comments-container.collapsed #comments-nav { display: none; }
+              #comments-toggle {
+                background: none; border: none; cursor: pointer;
+                font-size: 16px; padding: 6px 8px; text-align: left;
+                color: #656d76; flex-shrink: 0;
+              }
+              #comments-toggle:hover { color: #1f2328; }
+              #comments-header {
+                font-weight: 600; padding: 4px 10px 8px; font-size: 12px;
+                text-transform: uppercase; letter-spacing: 0.5px; color: #656d76;
+              }
+              #comments-list { flex: 1; overflow-y: auto; }
+              .comment-item {
+                padding: 8px 10px; cursor: pointer;
+                border-left: 3px solid transparent;
+                border-bottom: 1px solid rgba(0,0,0,0.06);
+              }
+              .comment-item:hover { background: #e8e8e8; }
+              .comment-annotated {
+                font-size: 12px; color: #1f2328;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+              }
+              .comment-text {
+                font-size: 11px; color: #656d76; margin-top: 2px;
+                overflow: hidden; text-overflow: ellipsis;
+                display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+              }
+              @media (prefers-color-scheme: dark) {
+                #comments-container { background: #252526; border-left-color: #444c56; }
+                #comments-toggle { color: #999; }
+                #comments-toggle:hover { color: #d4d4d4; }
+                #comments-header { color: #999; }
+                .comment-item:hover { background: #2d2d2d; }
+                .comment-annotated { color: #d4d4d4; }
+                .comment-text { color: #999; }
+                .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
+              }
+              html[data-theme="dark"] #comments-container { background: #252526; border-left-color: #444c56; }
+              html[data-theme="dark"] #comments-toggle { color: #999; }
+              html[data-theme="dark"] #comments-toggle:hover { color: #d4d4d4; }
+              html[data-theme="dark"] #comments-header { color: #999; }
+              html[data-theme="dark"] .comment-item:hover { background: #2d2d2d; }
+              html[data-theme="dark"] .comment-annotated { color: #d4d4d4; }
+              html[data-theme="dark"] .comment-text { color: #999; }
             </style>
           </head>
           <body>
-            <div id="layout">\(tocMarkup)<article class="markdown-body">\(body)</article></div>
+            <div id="layout">\(sidebarMarkup)<article class="markdown-body">\(body)</article></div>
             \(highlightBlock)
             \(lineNumbersBlock)
             \(copyButtonBlock)
@@ -1386,6 +1585,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             \(zoomOverlayBlock)
             \(readingStatsBlock)
             \(tocBlock)
+            \(commentsBlock)
             \(fontSizeBlock)
             \(jumpToLineBlock)
             \(findBlock)

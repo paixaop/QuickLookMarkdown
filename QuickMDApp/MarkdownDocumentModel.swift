@@ -141,13 +141,18 @@ final class MarkdownDocumentModel: ObservableObject {
 
         if markdownExtensions.contains(ext) {
             let (body, frontmatter) = stripFrontmatter(content)
-            var html = HTMLFormatter.format(body)
+            let processed = preprocessComments(body)
+            var html = SourceMappedHTMLFormatter.format(processed)
             if let fm = frontmatter {
+                // Track frontmatter line count for editor sync (+2 for the two --- delimiters)
+                SourceMappedHTMLFormatter.lastFrontmatterLineCount = fm.components(separatedBy: "\n").count + 2
                 let escaped = fm
                     .replacingOccurrences(of: "&", with: "&amp;")
                     .replacingOccurrences(of: "<", with: "&lt;")
                     .replacingOccurrences(of: ">", with: "&gt;")
                 html = "<div id=\"frontmatter-data\" style=\"display:none\">\(escaped)</div>\n" + html
+            } else {
+                SourceMappedHTMLFormatter.lastFrontmatterLineCount = 0
             }
             return (html, true)
         }
@@ -163,8 +168,14 @@ final class MarkdownDocumentModel: ObservableObject {
 
     @Published var currentURL: URL?
     @Published var rawContent: String = ""
+    @Published var isDirty = false
+    var frontmatterLineCount: Int = 0
     @Published var autoReload = false
     let undoManager = UndoManager()
+
+    func markClean() {
+        isDirty = false
+    }
 
     /// Set rawContent with undo support. Use for programmatic changes (AI, toolbar actions).
     func setContent(_ newContent: String, actionName: String = "AI Transform") {
@@ -206,6 +217,8 @@ final class MarkdownDocumentModel: ObservableObject {
         if let current = currentURL {
             forwardStack.append(current)
         }
+        // If the target URL is open in another tab, switch to it
+        if switchToWindowWithURL(prev) { return }
         isNavigating = true
         load(from: prev)
         isNavigating = false
@@ -216,9 +229,27 @@ final class MarkdownDocumentModel: ObservableObject {
         if let current = currentURL {
             backStack.append(current)
         }
+        // If the target URL is open in another tab, switch to it
+        if switchToWindowWithURL(next) { return }
         isNavigating = true
         load(from: next)
         isNavigating = false
+    }
+
+    /// Try to switch to a window/tab that has the given URL open. Returns true if found.
+    @discardableResult
+    private func switchToWindowWithURL(_ url: URL) -> Bool {
+        let standardized = url.standardizedFileURL
+        for window in NSApp.windows {
+            if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+                window.makeKeyAndOrderFront(nil)
+                if let tabGroup = window.tabGroup {
+                    tabGroup.selectedWindow = window
+                }
+                return true
+            }
+        }
+        return false
     }
 
     /// Re-render HTML from current rawContent without reloading from disk.
@@ -229,12 +260,33 @@ final class MarkdownDocumentModel: ObservableObject {
         try? rawContent.write(to: tempURL, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: tempURL) }
         if let result = try? Self.htmlBody(for: tempURL) {
+            frontmatterLineCount = SourceMappedHTMLFormatter.lastFrontmatterLineCount
             html = Self.wrapHTML(result.html, isMarkdown: result.isMarkdown)
         }
     }
 
     func load(from url: URL) {
         Self.log("load(from: \(url.path))")
+
+        // File size guard
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int {
+            if size > 50_000_000 { // 50MB
+                Self.log("File too large: \(size) bytes")
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "File Too Large"
+                    alert.informativeText = "This file is \(size / 1_000_000)MB. QuickMD supports files up to 50MB."
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+                return
+            }
+            if size > 5_000_000 { // 5MB
+                Self.log("Large file warning: \(size) bytes")
+            }
+        }
+
         let didAccess = url.startAccessingSecurityScopedResource()
         defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
         do {
@@ -243,6 +295,7 @@ final class MarkdownDocumentModel: ObservableObject {
             Self.log("Read \(content.count) chars from file")
             Self.log("Produced \(result.html.count) chars of HTML")
             rawContent = content
+            frontmatterLineCount = SourceMappedHTMLFormatter.lastFrontmatterLineCount
             html = Self.wrapHTML(result.html, isMarkdown: result.isMarkdown)
             Self.log("Wrapped HTML total: \(html?.count ?? 0) chars")
             baseURL = url.deletingLastPathComponent()
@@ -280,6 +333,15 @@ final class MarkdownDocumentModel: ObservableObject {
             queue: .main
         )
         source.setEventHandler { [weak self] in
+            // Check if file was deleted
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                Self.log("File was deleted: \(url.path)")
+                DispatchQueue.main.async { [weak self] in
+                    self?.autoReload = false
+                    self?.stopWatching()
+                }
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 // Capture scroll position before reload so it can be restored
                 if let webView = WebViewStore.shared.webView {
@@ -895,7 +957,7 @@ final class MarkdownDocumentModel: ObservableObject {
 
     static let tocScript = """
     (function() {
-      var container = document.getElementById('toc-container');
+      var container = document.getElementById('sidebar-container');
       if (!container) return;
       var content = document.querySelector('.markdown-body');
       if (!content) return;
@@ -909,12 +971,17 @@ final class MarkdownDocumentModel: ObservableObject {
         if (!tree) return;
         tree.innerHTML = '';
         if (headings.length === 0) {
-          container.classList.add('hidden');
-          layout.classList.remove('has-toc');
+          // Don't hide sidebar if comments tab has content
+          var commentsPanel = document.getElementById('comments-panel');
+          var hasComments = commentsPanel && commentsPanel.querySelector('.comment-item');
+          if (!hasComments) {
+            container.classList.add('hidden');
+            layout.classList.remove('has-sidebar');
+          }
           return;
         }
         container.classList.remove('hidden');
-        layout.classList.add('has-toc');
+        layout.classList.add('has-sidebar');
         // Assign IDs
         var slugCounts = {};
         headings.forEach(function(h) {
@@ -1059,38 +1126,7 @@ final class MarkdownDocumentModel: ObservableObject {
         });
       }, { root: content, rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
       headings.forEach(function(h) { observer.observe(h); });
-      // Toggle button
-      var toggleBtn = document.getElementById('toc-toggle');
-      if (toggleBtn) {
-        toggleBtn.addEventListener('click', function() {
-          container.classList.toggle('collapsed');
-        });
-      }
-      // Resize handle
-      var resizeHandle = document.getElementById('toc-resize');
-      if (resizeHandle) {
-        resizeHandle.addEventListener('mousedown', function(e) {
-          e.preventDefault();
-          resizeHandle.classList.add('dragging');
-          document.body.classList.add('toc-resizing');
-          var startX = e.clientX;
-          var startW = container.offsetWidth;
-          function onMove(e) {
-            var newW = startW + (e.clientX - startX);
-            if (newW < 100) newW = 100;
-            var maxW = window.innerWidth * 0.5;
-            if (newW > maxW) newW = maxW;
-            container.style.width = newW + 'px';
-          }
-          function onUp() {
-            resizeHandle.classList.remove('dragging');
-            document.body.classList.remove('toc-resizing');
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-          }
-          document.addEventListener('mousemove', onMove);
-          document.addEventListener('mouseup', onUp);
-        });
+      // Toggle and resize are handled by sidebarArrangeScript
       }
     })();
     """
@@ -1611,7 +1647,7 @@ final class MarkdownDocumentModel: ObservableObject {
       // never fire in that mode.
       function getScrollContainer() {
         var layout = document.getElementById('layout');
-        if (layout && layout.classList.contains('has-toc')) {
+        if (layout && (layout.classList.contains('has-sidebar') || layout.classList.contains('has-toc'))) {
           return document.querySelector('.markdown-body') || document.documentElement;
         }
         return document.documentElement;
@@ -1650,45 +1686,388 @@ final class MarkdownDocumentModel: ObservableObject {
         if (maxScroll > 0) el.scrollTop = fraction * maxScroll;
       };
 
-      // Double-click: find the clicked text and send block context to Swift
+      // Double-click: find the clicked text and use data-source-line for precise mapping
       document.addEventListener('dblclick', function(e) {
         var sel = window.getSelection();
         if (!sel || sel.rangeCount === 0) return;
         var word = sel.toString().trim();
         if (!word) return;
 
-        // Find the enclosing block element to get paragraph-level context
-        var node = sel.anchorNode;
-        var block = node;
-        while (block && block.nodeType !== 1) block = block.parentNode;
-        var blockTags = ['P','LI','H1','H2','H3','H4','H5','H6','TD','TH','BLOCKQUOTE','PRE','DIV'];
-        while (block && blockTags.indexOf(block.tagName) === -1) block = block.parentElement;
-        var blockText = block ? (block.textContent || '').trim() : '';
-
-        // Get surrounding words for additional context
-        var words = blockText.split(/\\s+/).filter(function(w) { return w.length > 0; });
-        var wordIdx = -1;
-        for (var i = 0; i < words.length; i++) {
-          if (words[i].indexOf(word) !== -1) { wordIdx = i; break; }
+        // Walk up to find nearest element with data-source-line
+        var el = sel.anchorNode;
+        while (el && el !== document.body) {
+          if (el.nodeType === 1 && el.hasAttribute('data-source-line')) break;
+          el = el.parentNode;
         }
-        var before = wordIdx > 0 ? words.slice(Math.max(0, wordIdx - 5), wordIdx).join(' ') : '';
-        var after = wordIdx >= 0 ? words.slice(wordIdx + 1, wordIdx + 6).join(' ') : '';
 
-        // Count which block this is among all blocks (gives structural position)
-        var article = document.querySelector('article.markdown-body');
-        var allBlocks = article ? article.querySelectorAll('p,li,h1,h2,h3,h4,h5,h6,td,th,blockquote,pre') : [];
-        var blockIndex = -1;
-        for (var i = 0; i < allBlocks.length; i++) {
-          if (allBlocks[i] === block || allBlocks[i].contains(block)) { blockIndex = i; break; }
+        if (!el || !el.hasAttribute || !el.hasAttribute('data-source-line')) {
+          // Fallback: send without source line
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
+            window.webkit.messageHandlers.editorSync.postMessage({
+              type: 'dblclick', word: word, sourceLine: -1, sourceCol: -1, offsetInBlock: -1
+            });
+          }
+          return;
         }
+
+        var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
+        var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
+
+        // Character offset of clicked word within this block's text
+        var offsetInBlock = -1;
+        try {
+          var range = sel.getRangeAt(0);
+          var preRange = document.createRange();
+          preRange.setStart(el, 0);
+          preRange.setEnd(range.startContainer, range.startOffset);
+          offsetInBlock = preRange.toString().length;
+        } catch(ex) {}
 
         if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
           window.webkit.messageHandlers.editorSync.postMessage({
-            type: 'dblclick', word: word, before: before, after: after,
-            blockText: blockText, blockIndex: blockIndex, totalBlocks: allBlocks.length
+            type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock
           });
         }
       });
+    })();
+    """
+
+    // MARK: - Comment interaction script
+
+    static let commentScript = """
+    (function() {
+      var currentTooltip = null;
+
+      function removeTooltip() {
+        if (currentTooltip) {
+          currentTooltip.remove();
+          currentTooltip = null;
+        }
+      }
+
+      function showTooltip(mark) {
+        removeTooltip();
+        var comment = mark.getAttribute('data-comment');
+        if (!comment) return;
+        var tip = document.createElement('div');
+        tip.className = 'qmd-comment-tooltip';
+        tip.textContent = comment;
+        mark.appendChild(tip);
+        currentTooltip = tip;
+        // Reposition if it overflows the viewport
+        var rect = tip.getBoundingClientRect();
+        if (rect.top < 0) {
+          tip.style.bottom = 'auto';
+          tip.style.top = 'calc(100% + 4px)';
+        }
+        if (rect.right > window.innerWidth) {
+          tip.style.left = 'auto';
+          tip.style.right = '0';
+        }
+      }
+
+      window.__setupComments = function() {
+        var marks = document.querySelectorAll('.qmd-comment');
+        marks.forEach(function(mark, index) {
+          mark.dataset.commentIndex = index;
+          mark.addEventListener('mouseenter', function() { showTooltip(mark); });
+          mark.addEventListener('mouseleave', function() { removeTooltip(); });
+          mark.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            removeTooltip();
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
+              window.webkit.messageHandlers.commentAction.postMessage({
+                type: 'click',
+                index: index,
+                comment: mark.getAttribute('data-comment') || '',
+                text: mark.textContent || ''
+              });
+            }
+            if (window.__highlightCommentInSidebar) __highlightCommentInSidebar(index);
+          });
+        });
+      };
+      __setupComments();
+
+      // Navigate between comments
+      window.__nextComment = function() {
+        var marks = document.querySelectorAll('.qmd-comment');
+        if (marks.length === 0) return;
+        var scrollEl = (window.__getScrollContainer ? __getScrollContainer() : document.documentElement);
+        var scrollTop = scrollEl.scrollTop;
+        for (var i = 0; i < marks.length; i++) {
+          if (marks[i].getBoundingClientRect().top > 20) {
+            marks[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            showTooltip(marks[i]);
+            setTimeout(removeTooltip, 2000);
+            return;
+          }
+        }
+        // Wrap around to first
+        marks[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        showTooltip(marks[0]);
+        setTimeout(removeTooltip, 2000);
+      };
+
+      window.__prevComment = function() {
+        var marks = document.querySelectorAll('.qmd-comment');
+        if (marks.length === 0) return;
+        for (var i = marks.length - 1; i >= 0; i--) {
+          if (marks[i].getBoundingClientRect().top < -5) {
+            marks[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            showTooltip(marks[i]);
+            setTimeout(removeTooltip, 2000);
+            return;
+          }
+        }
+        // Wrap around to last
+        marks[marks.length - 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        showTooltip(marks[marks.length - 1]);
+        setTimeout(removeTooltip, 2000);
+      };
+
+      // Get source line info for current selection (used by comment placement)
+      window.__getSelectionSourceInfo = function() {
+        var sel = window.getSelection();
+        if (!sel || sel.isCollapsed) return null;
+        var el = sel.anchorNode;
+        while (el && el !== document.body) {
+          if (el.nodeType === 1 && el.hasAttribute('data-source-line')) break;
+          el = el.parentNode;
+        }
+        if (!el || !el.hasAttribute || !el.hasAttribute('data-source-line')) return null;
+        var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
+        var offsetInBlock = -1;
+        try {
+          var range = sel.getRangeAt(0);
+          var preRange = document.createRange();
+          preRange.setStart(el, 0);
+          preRange.setEnd(range.startContainer, range.startOffset);
+          offsetInBlock = preRange.toString().length;
+        } catch(ex) {}
+        return { sourceLine: sourceLine, offsetInBlock: offsetInBlock, text: sel.toString().trim() };
+      };
+
+      // Helpers for native context menu integration
+      window.__getSelectionText = function() {
+        var sel = window.getSelection();
+        if (!sel || sel.isCollapsed) return '';
+        var article = document.querySelector('article.markdown-body');
+        if (!article) return '';
+        var node = sel.anchorNode;
+        while (node && node !== article) node = node.parentNode;
+        if (node !== article) return '';
+        return sel.toString().trim();
+      };
+
+      window.__getCommentAtPoint = function(x, y) {
+        var el = document.elementFromPoint(x, y);
+        if (!el) return null;
+        var mark = el.closest('.qmd-comment');
+        if (!mark) return null;
+        var index = parseInt(mark.dataset.commentIndex || '0');
+        return {
+          index: index,
+          comment: mark.getAttribute('data-comment') || '',
+          text: mark.textContent || ''
+        };
+      };
+    })();
+    """
+
+    // MARK: - Comments sidebar script
+
+    static let commentsSidebarScript = """
+    (function() {
+      window.__buildCommentsList = function() {
+        var list = document.getElementById('comments-list');
+        if (!list) return;
+        list.innerHTML = '';
+        var marks = document.querySelectorAll('.qmd-comment');
+        var sidebar = document.getElementById('sidebar-container');
+        var layout = document.getElementById('layout');
+        if (marks.length === 0) {
+          // Update comments icon badge
+          var badge = document.querySelector('.sidebar-icon[data-panel="comments"] .comment-badge');
+          if (badge) badge.remove();
+          return;
+        }
+        // Show sidebar if comments exist
+        if (sidebar && layout) {
+          sidebar.classList.remove('hidden');
+          layout.classList.add('has-sidebar');
+        }
+        // Update badge count
+        var commentsIcon = document.querySelector('.sidebar-icon[data-panel="comments"]');
+        if (commentsIcon) {
+          var badge = commentsIcon.querySelector('.comment-badge');
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'comment-badge';
+            commentsIcon.appendChild(badge);
+          }
+          badge.textContent = marks.length;
+        }
+
+        marks.forEach(function(mark, index) {
+          var item = document.createElement('div');
+          item.className = 'comment-item';
+          item.dataset.index = index;
+
+          var textEl = document.createElement('div');
+          textEl.className = 'comment-annotated';
+          var annotated = mark.textContent || '';
+          textEl.textContent = annotated.length > 60 ? annotated.substring(0, 57) + '...' : annotated;
+          textEl.title = annotated;
+          item.appendChild(textEl);
+
+          var commentEl = document.createElement('div');
+          commentEl.className = 'comment-text';
+          commentEl.textContent = mark.getAttribute('data-comment') || '';
+          item.appendChild(commentEl);
+
+          var actions = document.createElement('div');
+          actions.className = 'comment-actions';
+          var editBtn = document.createElement('button');
+          editBtn.className = 'comment-action-btn';
+          editBtn.textContent = '\\u270E';
+          editBtn.title = 'Edit comment';
+          editBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
+              window.webkit.messageHandlers.commentAction.postMessage({
+                type: 'click',
+                index: index,
+                comment: mark.getAttribute('data-comment') || '',
+                text: mark.textContent || ''
+              });
+            }
+          });
+          actions.appendChild(editBtn);
+
+          var delBtn = document.createElement('button');
+          delBtn.className = 'comment-action-btn comment-delete-btn';
+          delBtn.textContent = '\\u2715';
+          delBtn.title = 'Delete comment';
+          delBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
+              window.webkit.messageHandlers.commentAction.postMessage({
+                type: 'sidebarDelete',
+                index: index
+              });
+            }
+          });
+          actions.appendChild(delBtn);
+          item.appendChild(actions);
+
+          // Click to navigate
+          item.addEventListener('click', function() {
+            mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            mark.classList.add('qmd-comment-flash');
+            setTimeout(function() { mark.classList.remove('qmd-comment-flash'); }, 1500);
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
+              window.webkit.messageHandlers.commentAction.postMessage({
+                type: 'sidebarClick',
+                index: index
+              });
+            }
+            __highlightCommentInSidebar(index);
+          });
+
+          list.appendChild(item);
+        });
+      };
+
+      window.__highlightCommentInSidebar = function(index) {
+        var list = document.getElementById('comments-list');
+        if (!list) return;
+        list.querySelectorAll('.comment-item').forEach(function(item) {
+          item.classList.toggle('active', parseInt(item.dataset.index) === index);
+        });
+        var active = list.querySelector('.comment-item.active');
+        if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      };
+
+      __buildCommentsList();
+    })();
+    """
+
+    // MARK: - Sidebar arrange script
+
+    static let sidebarArrangeScript = """
+    (function() {
+      var container = document.getElementById('sidebar-container');
+      if (!container) return;
+      var layout = document.getElementById('layout');
+
+      // Icon tab switching
+      var icons = container.querySelectorAll('.sidebar-icon');
+      icons.forEach(function(icon) {
+        icon.addEventListener('click', function() {
+          var panel = icon.dataset.panel;
+          // If clicking the active icon, toggle sidebar collapse
+          if (icon.classList.contains('active') && !container.classList.contains('collapsed')) {
+            container.classList.add('collapsed');
+            return;
+          }
+          container.classList.remove('collapsed');
+          icons.forEach(function(i) { i.classList.remove('active'); });
+          icon.classList.add('active');
+          container.querySelectorAll('.sidebar-panel').forEach(function(p) {
+            p.classList.toggle('active', p.id === panel + '-panel');
+          });
+        });
+      });
+
+      // Resize handle
+      var resize = document.getElementById('sidebar-resize');
+      if (resize) {
+        resize.addEventListener('mousedown', function(e) {
+          e.preventDefault();
+          if (container.classList.contains('collapsed')) return;
+          var startX = e.clientX, startW = container.offsetWidth;
+          resize.classList.add('dragging');
+          document.body.classList.add('sidebar-resizing');
+          function onMove(ev) {
+            var nw = Math.max(100, Math.min(startW + (ev.clientX - startX), window.innerWidth * 0.5));
+            container.style.width = nw + 'px';
+          }
+          function onUp() {
+            resize.classList.remove('dragging');
+            document.body.classList.remove('sidebar-resizing');
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          }
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        });
+      }
+
+      // Show sidebar when comments are added (switch to comments tab)
+      window.__showCommentsPanel = function() {
+        if (!container) return;
+        container.classList.remove('collapsed');
+        icons.forEach(function(i) { i.classList.remove('active'); });
+        var commentsIcon = container.querySelector('.sidebar-icon[data-panel="comments"]');
+        if (commentsIcon) commentsIcon.classList.add('active');
+        container.querySelectorAll('.sidebar-panel').forEach(function(p) {
+          p.classList.toggle('active', p.id === 'comments-panel');
+        });
+      };
+
+      // Toggle sidebar visibility
+      window.__toggleSidebar = function() {
+        if (!container || !layout) return;
+        if (container.classList.contains('hidden')) {
+          container.classList.remove('hidden');
+          layout.classList.add('has-sidebar');
+        } else {
+          container.classList.add('hidden');
+          layout.classList.remove('has-sidebar');
+        }
+      };
     })();
     """
 
@@ -1870,6 +2249,8 @@ final class MarkdownDocumentModel: ObservableObject {
 
           // Selective post-processing
           if (window.__setupCheckboxes) __setupCheckboxes();
+          if (window.__setupComments) __setupComments();
+          if (window.__buildCommentsList) __buildCommentsList();
           if (headingsChanged) {
             if (window.__buildTOC) __buildTOC();
             if (window.__setupAnchorLinks) __setupAnchorLinks();
@@ -1909,6 +2290,8 @@ final class MarkdownDocumentModel: ObservableObject {
             });
           }
           if (window.__setupCheckboxes) __setupCheckboxes();
+          if (window.__setupComments) __setupComments();
+          if (window.__buildCommentsList) __buildCommentsList();
           if (window.__buildTOC) __buildTOC();
           if (window.__setupAnchorLinks) __setupAnchorLinks();
           if (window.__setupFootnotes) __setupFootnotes();
@@ -1945,15 +2328,310 @@ final class MarkdownDocumentModel: ObservableObject {
     /// Generate just the body HTML from markdown text (for incremental updates without full page reload).
     static func markdownBodyHTML(from text: String) -> String {
         let (body, frontmatter) = stripFrontmatter(text)
-        var html = HTMLFormatter.format(body)
+        let processed = preprocessComments(body)
+        var html = SourceMappedHTMLFormatter.format(processed)
         if let fm = frontmatter {
+            SourceMappedHTMLFormatter.lastFrontmatterLineCount = fm.components(separatedBy: "\n").count + 2
             let escaped = fm
                 .replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "<", with: "&lt;")
                 .replacingOccurrences(of: ">", with: "&gt;")
             html = "<div id=\"frontmatter-data\" style=\"display:none\">\(escaped)</div>\n" + html
+        } else {
+            SourceMappedHTMLFormatter.lastFrontmatterLineCount = 0
         }
         return html
+    }
+
+    // MARK: - Source-Mapped HTML Formatter
+
+    /// MarkupWalker that produces HTML with data-source-line/col attributes on block elements.
+    /// This enables the rendered preview to map double-clicked positions back to exact source lines.
+    struct SourceMappedHTMLFormatter: MarkupWalker {
+        private(set) var result = ""
+        var inTableHead = false
+        var tableColumnAlignments: [Table.ColumnAlignment?]? = nil
+        var currentTableColumn = 0
+
+        /// Track frontmatter line count from the most recent format call (static context).
+        static var lastFrontmatterLineCount: Int = 0
+
+        static func format(_ inputString: String) -> String {
+            let document = Document(parsing: inputString)
+            var walker = SourceMappedHTMLFormatter()
+            walker.visit(document)
+            return walker.result
+        }
+
+        private func sourceAttrs(_ markup: Markup) -> String {
+            guard let range = markup.range else { return "" }
+            return " data-source-line=\"\(range.lowerBound.line)\" data-source-col=\"\(range.lowerBound.column)\""
+        }
+
+        // MARK: Block elements
+
+        mutating func visitBlockQuote(_ blockQuote: BlockQuote) {
+            result += "<blockquote\(sourceAttrs(blockQuote))>\n"
+            descendInto(blockQuote)
+            result += "</blockquote>\n"
+        }
+
+        mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
+            let languageAttr: String
+            if let language = codeBlock.language {
+                languageAttr = " class=\"language-\(language)\""
+            } else {
+                languageAttr = ""
+            }
+            result += "<pre\(sourceAttrs(codeBlock))><code\(languageAttr)>\(codeBlock.code)</code></pre>\n"
+        }
+
+        mutating func visitHeading(_ heading: Heading) {
+            result += "<h\(heading.level)\(sourceAttrs(heading))>"
+            descendInto(heading)
+            result += "</h\(heading.level)>\n"
+        }
+
+        mutating func visitThematicBreak(_ thematicBreak: ThematicBreak) {
+            result += "<hr />\n"
+        }
+
+        mutating func visitHTMLBlock(_ html: HTMLBlock) {
+            result += html.rawHTML
+        }
+
+        mutating func visitListItem(_ listItem: ListItem) {
+            result += "<li\(sourceAttrs(listItem))>"
+            if let checkbox = listItem.checkbox {
+                result += "<input type=\"checkbox\" disabled=\"\""
+                if checkbox == .checked {
+                    result += " checked=\"\""
+                }
+                result += " /> "
+            }
+            descendInto(listItem)
+            result += "</li>\n"
+        }
+
+        mutating func visitOrderedList(_ orderedList: OrderedList) {
+            let start: String
+            if orderedList.startIndex != 1 {
+                start = " start=\"\(orderedList.startIndex)\""
+            } else {
+                start = ""
+            }
+            result += "<ol\(start)\(sourceAttrs(orderedList))>\n"
+            descendInto(orderedList)
+            result += "</ol>\n"
+        }
+
+        mutating func visitUnorderedList(_ unorderedList: UnorderedList) {
+            result += "<ul\(sourceAttrs(unorderedList))>\n"
+            descendInto(unorderedList)
+            result += "</ul>\n"
+        }
+
+        mutating func visitParagraph(_ paragraph: Paragraph) {
+            result += "<p\(sourceAttrs(paragraph))>"
+            descendInto(paragraph)
+            result += "</p>\n"
+        }
+
+        mutating func visitTable(_ table: Table) {
+            result += "<table\(sourceAttrs(table))>\n"
+            tableColumnAlignments = table.columnAlignments
+            descendInto(table)
+            tableColumnAlignments = nil
+            result += "</table>\n"
+        }
+
+        mutating func visitTableHead(_ tableHead: Table.Head) {
+            result += "<thead>\n<tr>\n"
+            inTableHead = true
+            currentTableColumn = 0
+            descendInto(tableHead)
+            inTableHead = false
+            result += "</tr>\n</thead>\n"
+        }
+
+        mutating func visitTableBody(_ tableBody: Table.Body) {
+            if !tableBody.isEmpty {
+                result += "<tbody>\n"
+                descendInto(tableBody)
+                result += "</tbody>\n"
+            }
+        }
+
+        mutating func visitTableRow(_ tableRow: Table.Row) {
+            result += "<tr>\n"
+            currentTableColumn = 0
+            descendInto(tableRow)
+            result += "</tr>\n"
+        }
+
+        mutating func visitTableCell(_ tableCell: Table.Cell) {
+            guard let alignments = tableColumnAlignments, currentTableColumn < alignments.count else { return }
+            guard tableCell.colspan > 0 && tableCell.rowspan > 0 else { return }
+            let element = inTableHead ? "th" : "td"
+            result += "<\(element)\(sourceAttrs(tableCell))"
+            if let alignment = alignments[currentTableColumn] {
+                result += " align=\"\(alignment)\""
+            }
+            currentTableColumn += 1
+            if tableCell.rowspan > 1 { result += " rowspan=\"\(tableCell.rowspan)\"" }
+            if tableCell.colspan > 1 { result += " colspan=\"\(tableCell.colspan)\"" }
+            result += ">"
+            descendInto(tableCell)
+            result += "</\(element)>\n"
+        }
+
+        // MARK: Inline elements
+
+        private mutating func printInline(tag: String, _ content: Markup) {
+            result += "<\(tag)>"
+            descendInto(content)
+            result += "</\(tag)>"
+        }
+
+        mutating func visitInlineCode(_ inlineCode: InlineCode) {
+            result += "<code>\(inlineCode.code)</code>"
+        }
+
+        mutating func visitEmphasis(_ emphasis: Emphasis) {
+            printInline(tag: "em", emphasis)
+        }
+
+        mutating func visitStrong(_ strong: Strong) {
+            printInline(tag: "strong", strong)
+        }
+
+        mutating func visitImage(_ image: Image) {
+            result += "<img"
+            if let source = image.source, !source.isEmpty { result += " src=\"\(source)\"" }
+            if let title = image.title, !title.isEmpty { result += " title=\"\(title)\"" }
+            result += " />"
+        }
+
+        mutating func visitInlineHTML(_ inlineHTML: InlineHTML) {
+            result += inlineHTML.rawHTML
+        }
+
+        mutating func visitLineBreak(_ lineBreak: LineBreak) {
+            result += "<br />\n"
+        }
+
+        mutating func visitSoftBreak(_ softBreak: SoftBreak) {
+            result += "\n"
+        }
+
+        mutating func visitLink(_ link: Link) {
+            result += "<a"
+            if let destination = link.destination { result += " href=\"\(destination)\"" }
+            result += ">"
+            descendInto(link)
+            result += "</a>"
+        }
+
+        mutating func visitText(_ text: Text) {
+            result += text.string
+        }
+
+        mutating func visitStrikethrough(_ strikethrough: Strikethrough) {
+            printInline(tag: "del", strikethrough)
+        }
+
+        mutating func visitSymbolLink(_ symbolLink: SymbolLink) {
+            if let destination = symbolLink.destination {
+                result += "<code>\(destination)</code>"
+            }
+        }
+    }
+
+    // MARK: - Comment Annotations
+
+    /// Replace comment markers with styled HTML spans before markdown parsing.
+    /// Transforms `<!-- COMMENT: foo -->text<!-- /COMMENT -->` into `<mark class="qmd-comment" data-comment="foo">text</mark>`.
+    static func preprocessComments(_ markdown: String) -> String {
+        // Pattern: <!-- COMMENT: ... -->...<!-- /COMMENT -->
+        // Using NSRegularExpression for reliable matching across multiline content
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<!--\s*COMMENT:\s*(.*?)\s*-->([\s\S]*?)<!--\s*/COMMENT\s*-->"#,
+            options: []
+        ) else { return markdown }
+
+        let nsMarkdown = markdown as NSString
+        var result = markdown
+        // Process matches in reverse order to preserve offsets
+        let matches = regex.matches(in: markdown, range: NSRange(location: 0, length: nsMarkdown.length))
+        for match in matches.reversed() {
+            let commentText = nsMarkdown.substring(with: match.range(at: 1))
+            let annotatedText = nsMarkdown.substring(with: match.range(at: 2))
+            let escapedComment = commentText
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            let replacement = "<mark class=\"qmd-comment\" data-comment=\"\(escapedComment)\">\(annotatedText)</mark>"
+            let range = Range(match.range, in: result)!
+            result.replaceSubrange(range, with: replacement)
+        }
+        return result
+    }
+
+    /// Wrap selected text with comment markers in the source.
+    static func addComment(around selectedRange: NSRange, comment: String, in text: String) -> String {
+        let nsText = text as NSString
+        let selectedText = nsText.substring(with: selectedRange)
+        let prefix = "<!-- COMMENT: \(comment) -->"
+        let suffix = "<!-- /COMMENT -->"
+        let replacement = "\(prefix)\(selectedText)\(suffix)"
+        return nsText.replacingCharacters(in: selectedRange, with: replacement) as String
+    }
+
+    /// Remove comment markers at the given match index, keeping the annotated text.
+    static func removeComment(at index: Int, in text: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<!--\s*COMMENT:\s*.*?\s*-->([\s\S]*?)<!--\s*/COMMENT\s*-->"#,
+            options: []
+        ) else { return text }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        guard index < matches.count else { return text }
+        let match = matches[index]
+        let annotatedText = nsText.substring(with: match.range(at: 1))
+        return nsText.replacingCharacters(in: match.range, with: annotatedText) as String
+    }
+
+    /// Update the comment text at the given match index.
+    static func updateComment(at index: Int, newComment: String, in text: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<!--\s*COMMENT:\s*.*?\s*-->([\s\S]*?)<!--\s*/COMMENT\s*-->"#,
+            options: []
+        ) else { return text }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        guard index < matches.count else { return text }
+        let match = matches[index]
+        let annotatedText = nsText.substring(with: match.range(at: 1))
+        let replacement = "<!-- COMMENT: \(newComment) -->\(annotatedText)<!-- /COMMENT -->"
+        return nsText.replacingCharacters(in: match.range, with: replacement) as String
+    }
+
+    /// Parse all comments in the source text, returning their ranges and content.
+    static func parseComments(in text: String) -> [(range: NSRange, comment: String, annotatedText: String)] {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"<!--\s*COMMENT:\s*(.*?)\s*-->([\s\S]*?)<!--\s*/COMMENT\s*-->"#,
+            options: []
+        ) else { return [] }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        return matches.map { match in
+            (
+                range: match.range,
+                comment: nsText.substring(with: match.range(at: 1)),
+                annotatedText: nsText.substring(with: match.range(at: 2))
+            )
+        }
     }
 
     static func wrapHTMLPublic(_ body: String, isMarkdown: Bool) -> String {
@@ -1961,14 +2639,23 @@ final class MarkdownDocumentModel: ObservableObject {
     }
 
     private static func wrapHTML(_ body: String, isMarkdown: Bool) -> String {
-        let tocMarkup = isMarkdown ? """
-            <div id="toc-container">
-              <button id="toc-toggle" title="Toggle contents">&#9776;</button>
-              <nav id="toc-nav">
-                <div id="toc-header">Contents</div>
-                <div id="toc-tree"></div>
-              </nav>
-              <div id="toc-resize"></div>
+        let sidebarsMarkup = isMarkdown ? """
+            <div id="sidebar-container" role="navigation" aria-label="Document sidebar">
+              <div id="sidebar-icons">
+                <button class="sidebar-icon active" data-panel="toc" title="Contents" aria-label="Table of contents">&#9776;</button>
+                <button class="sidebar-icon" data-panel="comments" title="Comments" aria-label="Comments panel">&#128488;</button>
+              </div>
+              <div id="sidebar-panels">
+                <div id="toc-panel" class="sidebar-panel active" role="navigation" aria-label="Table of contents">
+                  <div id="toc-header">Contents</div>
+                  <div id="toc-tree"></div>
+                </div>
+                <div id="comments-panel" class="sidebar-panel" role="navigation" aria-label="Comments">
+                  <div id="comments-header">Comments</div>
+                  <div id="comments-list"></div>
+                </div>
+              </div>
+              <div id="sidebar-resize"></div>
             </div>
         """ : ""
 
@@ -2159,12 +2846,14 @@ final class MarkdownDocumentModel: ObservableObject {
               }
               html[data-theme="dark"] .reading-stats { color: #999; border-bottom-color: #444c56; }
               html[data-theme="light"] .reading-stats { color: #656d76; border-bottom-color: #d0d7de; }
-              /* TOC sidebar */
+              /* Sidebar layout */
               #layout { height: 100vh; }
-              #layout.has-toc { display: flex; overflow: hidden; }
-              #layout.has-toc .markdown-body { flex: 1; overflow-y: auto; min-height: 0; }
-              html:has(#layout.has-toc), body:has(#layout.has-toc) { height: 100vh; overflow: hidden; }
-              #toc-container {
+              #layout:has(#sidebar-container:not(.hidden)), #layout.has-sidebar { display: flex; overflow: hidden; }
+              #layout:has(#sidebar-container:not(.hidden)) .markdown-body, #layout.has-sidebar .markdown-body { flex: 1; overflow-y: auto; min-height: 0; }
+              html:has(#sidebar-container:not(.hidden)), body:has(#sidebar-container:not(.hidden)),
+              html:has(#layout.has-sidebar), body:has(#layout.has-sidebar) { height: 100vh; overflow: hidden; }
+              /* Unified sidebar container */
+              #sidebar-container {
                 position: relative;
                 width: 220px; min-width: 100px; max-width: 50vw;
                 height: 100vh;
@@ -2173,25 +2862,46 @@ final class MarkdownDocumentModel: ObservableObject {
                 font-size: 13px;
                 display: flex; flex-direction: column;
               }
-              #toc-container.hidden { display: none; }
-              #toc-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
-              #toc-nav { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
-              #toc-container.collapsed #toc-nav { display: none; }
-              #toc-container.collapsed #toc-resize { display: none; }
-              #toc-resize {
+              #sidebar-container.hidden { display: none; }
+              #sidebar-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
+              #sidebar-container.collapsed #sidebar-panels { display: none; }
+              #sidebar-container.collapsed #sidebar-resize { display: none; }
+              /* Icon tab bar */
+              #sidebar-icons {
+                display: flex; flex-shrink: 0;
+                border-bottom: 1px solid #d0d7de;
+              }
+              .sidebar-icon {
+                flex: 1; background: none; border: none; cursor: pointer;
+                font-size: 16px; padding: 7px 0; text-align: center;
+                color: #656d76; border-bottom: 2px solid transparent;
+                transition: color 0.15s, border-color 0.15s;
+              }
+              .sidebar-icon:hover { color: #1f2328; background: rgba(0,0,0,0.04); }
+              .sidebar-icon.active { color: #0969da; border-bottom-color: #0969da; }
+              .sidebar-icon { position: relative; }
+              .comment-badge {
+                position: absolute; top: 2px; right: 4px;
+                background: #d4a017; color: #fff; font-size: 9px;
+                min-width: 14px; height: 14px; line-height: 14px;
+                border-radius: 7px; text-align: center; padding: 0 3px;
+              }
+              /* Panels */
+              #sidebar-panels { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+              .sidebar-panel { display: none; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+              .sidebar-panel.active { display: flex; }
+              /* Resize handle */
+              #sidebar-resize {
                 position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
                 cursor: col-resize; z-index: 10;
               }
-              #toc-resize:hover, #toc-resize.dragging { background: rgba(9,105,218,0.3); }
-              #toc-toggle {
-                background: none; border: none; cursor: pointer;
-                font-size: 18px; padding: 6px 8px; text-align: left;
-                color: #656d76; flex-shrink: 0;
-              }
-              #toc-toggle:hover { color: #1f2328; }
-              #toc-header {
+              #sidebar-resize:hover, #sidebar-resize.dragging { background: rgba(9,105,218,0.3); }
+              body.sidebar-resizing { cursor: col-resize; user-select: none; }
+              /* TOC panel */
+              #toc-header, #comments-header {
                 font-weight: 600; padding: 4px 10px 8px; font-size: 12px;
                 text-transform: uppercase; letter-spacing: 0.5px; color: #656d76;
+                flex-shrink: 0;
               }
               #toc-tree { flex: 1; overflow-y: auto; }
               .toc-item {
@@ -2213,35 +2923,100 @@ final class MarkdownDocumentModel: ObservableObject {
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                 flex: 1; padding-left: 4px;
               }
-              body.toc-resizing { cursor: col-resize; user-select: none; }
+              /* Comments panel */
+              #comments-list { flex: 1; overflow-y: auto; }
+              .comment-item {
+                padding: 8px 10px; cursor: pointer;
+                border-left: 3px solid transparent;
+                border-bottom: 1px solid rgba(0,0,0,0.06);
+                position: relative;
+              }
+              .comment-item:hover { background: #e8e8e8; }
+              .comment-item.active { border-left-color: #d4a017; background: #fefce8; }
+              .comment-annotated {
+                font-size: 12px; color: #1f2328;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+              }
+              .comment-text {
+                font-size: 11px; color: #656d76; margin-top: 2px;
+                overflow: hidden; text-overflow: ellipsis;
+                display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+              }
+              .comment-actions {
+                position: absolute; top: 4px; right: 4px;
+                display: none; gap: 2px;
+              }
+              .comment-item:hover .comment-actions { display: flex; }
+              .comment-action-btn {
+                background: none; border: 1px solid #d0d7de; border-radius: 4px;
+                cursor: pointer; font-size: 12px; padding: 1px 5px; color: #656d76;
+                line-height: 1.2;
+              }
+              .comment-action-btn:hover { background: #e8e8e8; color: #1f2328; }
+              .comment-delete-btn:hover { background: #ffebe9; color: #cf222e; border-color: #cf222e; }
+              .qmd-comment-flash { animation: comment-flash 1.5s ease; }
+              @keyframes comment-flash {
+                0%, 100% { background: rgba(255, 213, 79, 0.3); }
+                25%, 75% { background: rgba(255, 213, 79, 0.7); }
+              }
+              /* Dark mode */
               @media (prefers-color-scheme: dark) {
-                #toc-container { background: #252526; border-right-color: #444c56; }
-                #toc-toggle { color: #999; }
-                #toc-toggle:hover { color: #d4d4d4; }
-                #toc-header { color: #999; }
+                #sidebar-container { background: #252526; border-right-color: #444c56; }
+                #sidebar-icons { border-bottom-color: #444c56; }
+                .sidebar-icon { color: #999; }
+                .sidebar-icon:hover { color: #d4d4d4; background: rgba(255,255,255,0.04); }
+                .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+                #toc-header, #comments-header { color: #999; }
                 .toc-item:hover { background: #2d2d2d; }
                 .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
                 .toc-toggle { color: #999; }
-                #toc-resize:hover, #toc-resize.dragging { background: rgba(88,166,255,0.3); }
+                #sidebar-resize:hover, #sidebar-resize.dragging { background: rgba(88,166,255,0.3); }
+                .comment-item:hover { background: #2d2d2d; }
+                .comment-item.active { background: #3a3000; border-left-color: #a08000; }
+                .comment-annotated { color: #d4d4d4; }
+                .comment-text { color: #999; }
+                .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
+                .comment-action-btn { border-color: #444c56; color: #999; }
+                .comment-action-btn:hover { background: #2d2d2d; color: #d4d4d4; }
+                .comment-delete-btn:hover { background: #3d1214; color: #f85149; border-color: #f85149; }
               }
-              html[data-theme="dark"] #toc-container { background: #252526; border-right-color: #444c56; }
-              html[data-theme="dark"] #toc-toggle { color: #999; }
-              html[data-theme="dark"] #toc-toggle:hover { color: #d4d4d4; }
-              html[data-theme="dark"] #toc-header { color: #999; }
+              html[data-theme="dark"] #sidebar-container { background: #252526; border-right-color: #444c56; }
+              html[data-theme="dark"] #sidebar-icons { border-bottom-color: #444c56; }
+              html[data-theme="dark"] .sidebar-icon { color: #999; }
+              html[data-theme="dark"] .sidebar-icon:hover { color: #d4d4d4; background: rgba(255,255,255,0.04); }
+              html[data-theme="dark"] .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+              html[data-theme="dark"] #toc-header, html[data-theme="dark"] #comments-header { color: #999; }
               html[data-theme="dark"] .toc-item:hover { background: #2d2d2d; }
               html[data-theme="dark"] .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
               html[data-theme="dark"] .toc-toggle { color: #999; }
-              html[data-theme="dark"] #toc-resize:hover,
-              html[data-theme="dark"] #toc-resize.dragging { background: rgba(88,166,255,0.3); }
-              html[data-theme="light"] #toc-container { background: #f6f8fa; border-right-color: #d0d7de; }
-              html[data-theme="light"] #toc-toggle { color: #656d76; }
-              html[data-theme="light"] #toc-toggle:hover { color: #1f2328; }
-              html[data-theme="light"] #toc-header { color: #656d76; }
+              html[data-theme="dark"] #sidebar-resize:hover,
+              html[data-theme="dark"] #sidebar-resize.dragging { background: rgba(88,166,255,0.3); }
+              html[data-theme="dark"] .comment-item:hover { background: #2d2d2d; }
+              html[data-theme="dark"] .comment-item.active { background: #3a3000; border-left-color: #a08000; }
+              html[data-theme="dark"] .comment-annotated { color: #d4d4d4; }
+              html[data-theme="dark"] .comment-text { color: #999; }
+              html[data-theme="dark"] .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
+              html[data-theme="dark"] .comment-action-btn { border-color: #444c56; color: #999; }
+              html[data-theme="dark"] .comment-action-btn:hover { background: #2d2d2d; color: #d4d4d4; }
+              html[data-theme="dark"] .comment-delete-btn:hover { background: #3d1214; color: #f85149; border-color: #f85149; }
+              html[data-theme="light"] #sidebar-container { background: #f6f8fa; border-right-color: #d0d7de; }
+              html[data-theme="light"] #sidebar-icons { border-bottom-color: #d0d7de; }
+              html[data-theme="light"] .sidebar-icon { color: #656d76; }
+              html[data-theme="light"] .sidebar-icon:hover { color: #1f2328; }
+              html[data-theme="light"] .sidebar-icon.active { color: #0969da; border-bottom-color: #0969da; }
+              html[data-theme="light"] #toc-header, html[data-theme="light"] #comments-header { color: #656d76; }
               html[data-theme="light"] .toc-item:hover { background: #e8e8e8; }
               html[data-theme="light"] .toc-item.active { background: #dbeafe; border-left-color: #0969da; }
               html[data-theme="light"] .toc-toggle { color: #656d76; }
-              html[data-theme="light"] #toc-resize:hover,
-              html[data-theme="light"] #toc-resize.dragging { background: rgba(9,105,218,0.3); }
+              html[data-theme="light"] #sidebar-resize:hover,
+              html[data-theme="light"] #sidebar-resize.dragging { background: rgba(9,105,218,0.3); }
+              html[data-theme="light"] .comment-item:hover { background: #e8e8e8; }
+              html[data-theme="light"] .comment-item.active { background: #fefce8; border-left-color: #d4a017; }
+              html[data-theme="light"] .comment-annotated { color: #1f2328; }
+              html[data-theme="light"] .comment-text { color: #656d76; }
+              html[data-theme="light"] .comment-action-btn { border-color: #d0d7de; color: #656d76; }
+              html[data-theme="light"] .comment-action-btn:hover { background: #e8e8e8; color: #1f2328; }
+              html[data-theme="light"] .comment-delete-btn:hover { background: #ffebe9; color: #cf222e; border-color: #cf222e; }
               html[data-theme="dark"] .markdown-body h1,
               html[data-theme="dark"] .markdown-body h2 { border-bottom-color: #444c56; }
               html[data-theme="dark"] .markdown-body blockquote { border-left-color: #444c56; color: #999; }
@@ -2401,12 +3176,12 @@ final class MarkdownDocumentModel: ObservableObject {
               html[data-theme="light"] #speak-btn:hover { background: #e8e8e8; color: #656d76; }
               /* Print stylesheet */
               @media print {
-                #toc-container, .copy-btn, #speak-btn, #find-bar, #jump-bar,
+                #sidebar-container, #toc-container, .copy-btn, #speak-btn, #find-bar, #jump-bar,
                 .reading-stats, .pres-overlay, .mermaid-overlay { display: none !important; }
                 body { background: white !important; color: black !important; }
                 .markdown-body { padding: 0 !important; }
                 #layout { display: block !important; height: auto !important; }
-                #layout.has-toc .markdown-body { overflow: visible !important; }
+                #layout.has-sidebar .markdown-body, #layout.has-toc .markdown-body { overflow: visible !important; }
                 h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
                 pre, table, blockquote, img { page-break-inside: avoid; }
                 a[href]::after { content: ' (' attr(href) ')'; font-size: 0.85em; color: #666; }
@@ -2487,6 +3262,58 @@ final class MarkdownDocumentModel: ObservableObject {
                 font-size: 1.5em; overflow: auto;
                 padding: 40px;
               }
+              /* Comment annotations */
+              .qmd-comment {
+                background: rgba(255, 213, 79, 0.3);
+                border-bottom: 2px solid rgba(255, 179, 0, 0.6);
+                cursor: pointer;
+                position: relative;
+              }
+              .qmd-comment:hover {
+                background: rgba(255, 213, 79, 0.5);
+              }
+              .qmd-comment-tooltip {
+                position: absolute;
+                bottom: calc(100% + 4px);
+                left: 0;
+                background: #fefce8;
+                border: 1px solid #d4a017;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                max-width: 320px;
+                white-space: pre-wrap;
+                z-index: 10000;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+                color: #333;
+                pointer-events: none;
+              }
+              @media (prefers-color-scheme: dark) {
+                .qmd-comment {
+                  background: rgba(255, 179, 0, 0.2);
+                  border-bottom-color: rgba(255, 179, 0, 0.4);
+                }
+                .qmd-comment:hover {
+                  background: rgba(255, 179, 0, 0.35);
+                }
+                .qmd-comment-tooltip {
+                  background: #3a3000;
+                  border-color: #a08000;
+                  color: #e0d8c0;
+                }
+              }
+              html[data-theme="dark"] .qmd-comment {
+                background: rgba(255, 179, 0, 0.2);
+                border-bottom-color: rgba(255, 179, 0, 0.4);
+              }
+              html[data-theme="dark"] .qmd-comment:hover {
+                background: rgba(255, 179, 0, 0.35);
+              }
+              html[data-theme="dark"] .qmd-comment-tooltip {
+                background: #3a3000;
+                border-color: #a08000;
+                color: #e0d8c0;
+              }
               .pres-counter {
                 position: fixed; bottom: 20px; right: 20px;
                 font-size: 14px; color: #999;
@@ -2507,7 +3334,7 @@ final class MarkdownDocumentModel: ObservableObject {
             </style>
           </head>
           <body>
-            <div id="layout">\(tocMarkup)<article class="markdown-body">\(body)</article></div>
+            <div id="layout">\(sidebarsMarkup)<article class="markdown-body">\(body)</article></div>
           </body>
         </html>
         """

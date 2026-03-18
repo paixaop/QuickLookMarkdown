@@ -6,6 +6,7 @@ import LanguageSupport
 
 struct MarkdownFormattingToolbar: View {
     @Binding var text: String
+    var currentFileURL: (() -> URL?)?
     @Environment(\.colorScheme) private var colorScheme
 
     private struct ToolbarItem: Identifiable {
@@ -90,6 +91,7 @@ struct MarkdownFormattingToolbar: View {
                     }
                     .buttonStyle(.borderless)
                     .help(item.label)
+                    .accessibilityLabel(accessibilityLabelFor(item.label))
                 }
             }
 
@@ -110,12 +112,84 @@ struct MarkdownFormattingToolbar: View {
             .menuStyle(.borderlessButton)
             .frame(width: 40)
             .help("GitHub Alerts")
+            .accessibilityLabel("GitHub Alerts")
+
+            Divider().frame(height: 24).padding(.horizontal, 4)
+
+            // Comment button
+            Button(action: { addCommentFromToolbar() }) {
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 16))
+                    .frame(width: 32, height: 32)
+            }
+            .buttonStyle(.borderless)
+            .help("Add Comment")
+            .accessibilityLabel("Add comment")
 
             Spacer()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(colorScheme == .dark ? Color(nsColor: .controlBackgroundColor) : Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func accessibilityLabelFor(_ label: String) -> String {
+        switch label {
+        case "H1": return "Heading level 1"
+        case "H2": return "Heading level 2"
+        case "H3": return "Heading level 3"
+        case "Code": return "Inline code"
+        case "Code Block": return "Code block"
+        case "Link": return "Insert link"
+        case "Image": return "Insert image"
+        case "Quote": return "Blockquote"
+        case "Table": return "Insert table"
+        case "UL": return "Bullet list"
+        case "OL": return "Numbered list"
+        case "Task": return "Task list"
+        case "HR": return "Horizontal rule"
+        default: return label
+        }
+    }
+
+    private func addCommentFromToolbar() {
+        guard let textView = findEditorTextView() else { return }
+        let selectedRange = textView.selectedRange()
+        guard selectedRange.length > 0,
+              let selectedText = (textView.string as NSString?)?.substring(with: selectedRange) else { return }
+        showCommentPanel(selectedText: selectedText, selectedRange: selectedRange, textView: textView)
+    }
+
+    private func showCommentPanel(selectedText: String, selectedRange: NSRange, textView: NSTextView) {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false
+        )
+        panel.title = "Add Comment"
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.level = .floating
+
+        let mouseLocation = NSEvent.mouseLocation
+        panel.setFrameOrigin(NSPoint(x: mouseLocation.x - 180, y: mouseLocation.y - 240))
+
+        let view = CommentEditorView(
+            annotatedText: selectedText,
+            initialComment: "",
+            isNew: true,
+            onSave: { comment in
+                panel.close()
+                let prefix = "<!-- COMMENT: \(comment) -->"
+                let suffix = "<!-- /COMMENT -->"
+                let wrapped = "\(prefix)\(selectedText)\(suffix)"
+                textView.insertText(wrapped, replacementRange: selectedRange)
+            },
+            onDelete: nil,
+            onCancel: { panel.close() }
+        )
+        panel.contentView = NSHostingView(rootView: view)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     private func insert(_ item: ToolbarItem) {
@@ -129,12 +203,15 @@ struct MarkdownFormattingToolbar: View {
     }
 
     private func insertSnippet(_ snippet: String) {
-        // Find the NSTextView in the window to insert at cursor
         if let textView = findEditorTextView() {
             let selectedRange = textView.selectedRange()
             if selectedRange.length > 0,
                let selectedText = (textView.string as NSString?)?.substring(with: selectedRange) {
-                // Wrap selection if the snippet has a wrap pattern
+                // Link button with filename-like selection: resolve to file link
+                if snippet == "[title](url)", let link = resolveFileLink(selectedText) {
+                    textView.insertText(link, replacementRange: selectedRange)
+                    return
+                }
                 if let (prefix, suffix) = findWrapPattern(for: snippet) {
                     let wrapped = prefix + selectedText + suffix
                     textView.insertText(wrapped, replacementRange: selectedRange)
@@ -145,6 +222,36 @@ struct MarkdownFormattingToolbar: View {
         } else {
             text += snippet
         }
+    }
+
+    /// If text looks like a filename, resolve it relative to the current file and return a markdown link.
+    private func resolveFileLink(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Must have a file extension
+        guard let dot = trimmed.lastIndex(of: "."),
+              dot > trimmed.startIndex,
+              trimmed.distance(from: dot, to: trimmed.endIndex) <= 10 else { return nil }
+        // No spaces allowed unless the whole thing is a path
+        let looksLikePath = trimmed.contains("/") || !trimmed.contains(" ")
+        guard looksLikePath else { return nil }
+
+        // Try to resolve relative to current file's directory
+        if let baseURL = currentFileURL?()?.deletingLastPathComponent() {
+            let candidate = baseURL.appendingPathComponent(trimmed)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                let relativePath = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+                return "[\(trimmed)](\(relativePath))"
+            }
+            // Also try just the filename in the same directory
+            let nameOnly = (trimmed as NSString).lastPathComponent
+            let candidate2 = baseURL.appendingPathComponent(nameOnly)
+            if FileManager.default.fileExists(atPath: candidate2.path) {
+                let relativePath = nameOnly.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? nameOnly
+                return "[\(nameOnly)](\(relativePath))"
+            }
+        }
+        // File not found on disk — still use it as a relative link
+        return "[\(trimmed)](\(trimmed))"
     }
 
     private func findWrapPattern(for snippet: String) -> (String, String)? {
@@ -229,6 +336,7 @@ final class EditorFontManager: NSObject {
 /// Installs an NSEvent local monitor that auto-pairs brackets, backticks, and markdown formatting.
 final class AutoPairHandler: ObservableObject {
     private var monitor: Any?
+    private var isInserting = false
 
     private static let pairs: [(String, String)] = [
         ("(", ")"), ("[", "]"), ("{", "}"),
@@ -238,8 +346,9 @@ final class AutoPairHandler: ObservableObject {
     func install() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self, !self.isInserting else { return event }
             guard UserDefaults.standard.bool(forKey: "autoPair") else { return event }
-            return self?.handleKeyEvent(event) ?? event
+            return self.handleKeyEvent(event)
         }
     }
 
@@ -263,23 +372,23 @@ final class AutoPairHandler: ObservableObject {
         for (open, close) in Self.pairs where close == char && open != close {
             let nextIdx = selectedRange.location + selectedRange.length
             if nextIdx < nsString.length && nsString.substring(with: NSRange(location: nextIdx, length: 1)) == close && selectedRange.length == 0 {
-                // Move cursor past the closing char
+                isInserting = true
                 textView.setSelectedRange(NSRange(location: nextIdx + 1, length: 0))
+                isInserting = false
                 return nil
             }
         }
 
         // Handle backtick + Enter for code fences
         if char == "\r" || char == "\n" {
-            // Check if we're between ``` and ``` (or just typed ```)
             let loc = selectedRange.location
             if loc >= 3 {
                 let before = nsString.substring(with: NSRange(location: loc - 3, length: 3))
                 if before == "```" && (loc == nsString.length || nsString.substring(with: NSRange(location: loc, length: min(1, nsString.length - loc))) == "\n" || loc == nsString.length) {
-                    // Insert newline + newline + closing fence
+                    isInserting = true
                     textView.insertText("\n\n```", replacementRange: selectedRange)
-                    // Move cursor to middle line
                     textView.setSelectedRange(NSRange(location: loc + 1, length: 0))
+                    isInserting = false
                     return nil
                 }
             }
@@ -287,19 +396,17 @@ final class AutoPairHandler: ObservableObject {
 
         // Auto-pair: wrap selection or insert pair
         for (open, close) in Self.pairs where open == char {
+            isInserting = true
             if selectedRange.length > 0 {
-                // Wrap selection
                 let selected = nsString.substring(with: selectedRange)
                 textView.insertText(open + selected + close, replacementRange: selectedRange)
-                // Select the wrapped text (without the pair chars)
                 textView.setSelectedRange(NSRange(location: selectedRange.location + open.count, length: selected.count))
-                return nil
             } else {
-                // Insert pair and place cursor between
                 textView.insertText(open + close, replacementRange: selectedRange)
                 textView.setSelectedRange(NSRange(location: selectedRange.location + open.count, length: 0))
-                return nil
             }
+            isInserting = false
+            return nil
         }
 
         return event
@@ -442,6 +549,7 @@ struct EditorStatusBar: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
         .background(Color(nsColor: .controlBackgroundColor))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -460,7 +568,7 @@ struct MarkdownEditorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            MarkdownFormattingToolbar(text: $text)
+            MarkdownFormattingToolbar(text: $text, currentFileURL: currentFileURL)
             CodeEditor(
                 text: $text,
                 position: $position,
