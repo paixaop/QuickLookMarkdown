@@ -1173,7 +1173,13 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Button("Open File\u{2026}") {
-                        NSApp.sendAction(#selector(NSDocumentController.openDocument(_:)), to: nil, from: nil)
+                        let panel = NSOpenPanel()
+                        panel.allowsMultipleSelection = false
+                        panel.canChooseDirectories = false
+                        panel.allowedContentTypes = [.plainText, .sourceCode, .data]
+                        if panel.runModal() == .OK, let url = panel.url {
+                            model.load(from: url)
+                        }
                     }
                     .controlSize(.large)
 
