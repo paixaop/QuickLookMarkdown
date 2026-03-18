@@ -907,6 +907,7 @@ struct CommentEditorView: View {
     var onSave: (String) -> Void
     var onDelete: (() -> Void)?
     var onCancel: () -> Void
+    @FocusState private var isTextFocused: Bool
 
     init(annotatedText: String, initialComment: String, isNew: Bool, onSave: @escaping (String) -> Void, onDelete: (() -> Void)?, onCancel: @escaping () -> Void) {
         self.annotatedText = annotatedText
@@ -931,7 +932,7 @@ struct CommentEditorView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            TextEditor(text: $commentText)
+            AutoFocusTextView(text: $commentText)
                 .font(.system(size: 13))
                 .frame(minHeight: 60, maxHeight: 120)
                 .border(Color(nsColor: .separatorColor))
@@ -950,6 +951,49 @@ struct CommentEditorView: View {
         }
         .padding()
         .frame(width: 340)
+    }
+}
+
+/// NSTextView wrapper that auto-focuses and places cursor at the end of text.
+struct AutoFocusTextView: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        let textView = scrollView.documentView as! NSTextView
+        textView.font = .systemFont(ofSize: 13)
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.delegate = context.coordinator
+        textView.string = text
+        // Place cursor at end
+        textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        // Auto-focus after a short delay (panel needs time to become key)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            textView.window?.makeFirstResponder(textView)
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        let textView = scrollView.documentView as! NSTextView
+        if textView.string != text {
+            let cursorPos = textView.selectedRange().location
+            textView.string = text
+            textView.setSelectedRange(NSRange(location: min(cursorPos, (text as NSString).length), length: 0))
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: AutoFocusTextView
+        init(_ parent: AutoFocusTextView) { self.parent = parent }
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string
+        }
     }
 }
 
