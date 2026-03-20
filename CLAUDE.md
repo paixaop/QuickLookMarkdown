@@ -2,7 +2,7 @@
 
 ## GitHub
 
-- **Always use the `paixaop` GitHub account** for this repo (not `darksectorai`). Run `gh auth switch --user paixaop` before any `gh` commands if needed.
+- **Always use the `paixaop` GitHub account** for this repo (not `darksectorai`). **You must** run `gh auth switch --user paixaop` before any `gh` commands in this workspace — do not assume the default logged-in user is correct.
 - Remote: `https://github.com/paixaop/QuickLookMarkdown.git`
 
 ## Build & Install
