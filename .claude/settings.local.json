@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(swift:*)",
+      "Bash(xcodebuild:*)"
+    ]
+  },
+  "spinnerTipsEnabled": false
+}

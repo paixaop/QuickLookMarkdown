@@ -421,41 +421,33 @@ final class MarkdownDocumentModelTests: XCTestCase {
         let mdModel = MarkdownDocumentModel()
         mdModel.load(from: mdUrl)
         let mdHtml = try XCTUnwrap(mdModel.html)
-        XCTAssertTrue(mdHtml.contains("id=\"sidebar-container\""), "Markdown should have sidebar container element")
-
-        let pyUrl = writeTempFile("print(1)", ext: "py")
-        let pyModel = MarkdownDocumentModel()
-        pyModel.load(from: pyUrl)
-        let pyHtml = try XCTUnwrap(pyModel.html)
-        XCTAssertFalse(pyHtml.contains("id=\"sidebar-container\""), "Code files should NOT have sidebar container element")
+        // Sidebar is now native SwiftUI — HTML should NOT contain sidebar markup
+        XCTAssertFalse(mdHtml.contains("id=\"sidebar-container\""), "Sidebar should not be in HTML (native SwiftUI)")
+        XCTAssertTrue(mdHtml.contains("id=\"layout\""), "Markdown should have layout wrapper")
     }
 
-    func testTOCScriptGeneratesSlugIDs() {
-        XCTAssertTrue(MarkdownDocumentModel.tocScript.contains("slug"),
-                       "TOC script should generate slug IDs for headings")
+    func testHeadingDataScriptGeneratesSlugIDs() {
+        XCTAssertTrue(MarkdownDocumentModel.headingDataScript.contains("slug"),
+                       "Heading data script should generate slug IDs for headings")
     }
 
-    func testTOCScriptContent() {
-        let script = MarkdownDocumentModel.tocScript
-        XCTAssertTrue(script.contains("sidebar-container"), "Should reference sidebar container")
-        XCTAssertTrue(script.contains("toc-tree"), "Should reference TOC tree")
+    func testHeadingDataScriptContent() {
+        let script = MarkdownDocumentModel.headingDataScript
+        XCTAssertTrue(script.contains("tocData"), "Should send data via tocData bridge")
         XCTAssertTrue(script.contains("IntersectionObserver"), "Should use IntersectionObserver for active tracking")
-        XCTAssertTrue(script.contains("has-sidebar"), "Should support sidebar layout class")
-        XCTAssertTrue(script.contains("scrollIntoView"), "Should scroll to heading on click")
-        XCTAssertTrue(script.contains("scrollIntoView"), "Should scroll to heading on click")
+        XCTAssertTrue(script.contains("__rebuildHeadingData"), "Should expose rebuild function")
+        XCTAssertTrue(script.contains("data-source-line"), "Should extract source line from headings")
     }
 
-    func testTOCMarkupStructure() throws {
+    func testHTMLHasLayoutWrapper() throws {
         let url = writeTempFile("# Heading", ext: "md")
         let model = MarkdownDocumentModel()
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("id=\"sidebar-icons\""), "Should have icon tab bar")
-        XCTAssertTrue(html.contains("id=\"sidebar-panels\""), "Should have panels container")
-        XCTAssertTrue(html.contains("id=\"toc-panel\""), "Should have TOC panel")
-        XCTAssertTrue(html.contains("id=\"sidebar-resize\""), "Should have resize handle")
         XCTAssertTrue(html.contains("id=\"layout\""), "Should have layout wrapper")
+        // Sidebar is now native SwiftUI, not in HTML
+        XCTAssertFalse(html.contains("id=\"sidebar-container\""), "Sidebar should not be in HTML (native SwiftUI)")
     }
 
     // MARK: - Model State
@@ -1276,7 +1268,7 @@ final class MarkdownDocumentModelTests: XCTestCase {
             ("jumpToLineScript", MarkdownDocumentModel.jumpToLineScript),
             ("findScript", MarkdownDocumentModel.findScript),
             ("speakScript", MarkdownDocumentModel.speakScript),
-            ("tocScript", MarkdownDocumentModel.tocScript),
+            ("headingDataScript", MarkdownDocumentModel.headingDataScript),
             ("zoomOverlayScript", MarkdownDocumentModel.zoomOverlayScript),
             ("katexRenderScript", MarkdownDocumentModel.katexRenderScript),
             ("graphvizRenderScript", MarkdownDocumentModel.graphvizRenderScript),
@@ -1336,7 +1328,7 @@ final class MarkdownDocumentModelTests: XCTestCase {
             MarkdownDocumentModel.lineNumbersScript,
             MarkdownDocumentModel.jumpToLineScript,
             MarkdownDocumentModel.findScript,
-            MarkdownDocumentModel.tocScript,
+            MarkdownDocumentModel.headingDataScript,
             MarkdownDocumentModel.zoomOverlayScript,
             MarkdownDocumentModel.speakScript,
             MarkdownDocumentModel.mermaidJS,
@@ -1521,25 +1513,24 @@ final class MarkdownDocumentModelTests: XCTestCase {
         XCTAssertFalse(html.contains("<!-- COMMENT"), "Comment markers should be preprocessed away")
     }
 
-    func testCommentSidebarHTMLPresent() throws {
+    func testSidebarHTMLRemovedFromOutput() throws {
         let md = "# Title\nSome text"
         let url = writeTempFile(md, ext: "md")
         let model = MarkdownDocumentModel()
         model.load(from: url)
 
         let html = try XCTUnwrap(model.html)
-        XCTAssertTrue(html.contains("id=\"sidebar-container\""), "Should have sidebar container")
-        XCTAssertTrue(html.contains("id=\"comments-panel\""), "Should have comments panel")
-        XCTAssertTrue(html.contains("id=\"toc-panel\""), "Should have TOC panel")
-        XCTAssertTrue(html.contains("sidebar-icon"), "Should have sidebar icons")
+        // Sidebar is now native SwiftUI, not in HTML
+        XCTAssertFalse(html.contains("id=\"sidebar-container\""), "Should NOT have sidebar container")
+        XCTAssertFalse(html.contains("id=\"comments-panel\""), "Should NOT have comments panel in HTML")
+        XCTAssertTrue(html.contains("id=\"layout\""), "Should still have layout wrapper")
     }
 
     func testCommentSidebarScriptInjected() {
-        // commentsSidebarScript is injected via WKUserScript, not in page HTML
-        // Verify the static property contains the expected functions
-        let script = MarkdownDocumentModel.commentsSidebarScript
-        XCTAssertTrue(script.contains("__buildCommentsList"), "Should have comments sidebar script")
-        XCTAssertTrue(script.contains("__highlightCommentInSidebar"), "Should have highlight function")
+        // Sidebar is now native SwiftUI — verify headingDataScript sends data via bridge
+        let script = MarkdownDocumentModel.headingDataScript
+        XCTAssertTrue(script.contains("__rebuildHeadingData"), "Should have heading data rebuild function")
+        XCTAssertTrue(script.contains("tocData"), "Should post to tocData bridge handler")
     }
 
     func testCommentFlashAnimationCSS() throws {
@@ -1560,25 +1551,24 @@ final class MarkdownDocumentModelTests: XCTestCase {
         XCTAssertFalse(script.contains("contextmenu"), "Should NOT have contextmenu listener")
     }
 
-    func testSidebarArrangeScript() {
-        let script = MarkdownDocumentModel.sidebarArrangeScript
-        XCTAssertTrue(script.contains("sidebar-icon"), "Should handle icon tabs")
-        XCTAssertTrue(script.contains("sidebar-panel"), "Should handle panel switching")
-        XCTAssertTrue(script.contains("__showCommentsPanel"), "Should expose show comments function")
-        XCTAssertTrue(script.contains("__toggleSidebar"), "Should expose toggle sidebar function")
-        XCTAssertTrue(script.contains("sidebar-resize"), "Should handle resize")
+    func testNoSidebarHTMLInOutput() throws {
+        let url = writeTempFile("# Heading\nSome text", ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+
+        let html = try XCTUnwrap(model.html)
+        XCTAssertFalse(html.contains("sidebar-container"), "Sidebar is native SwiftUI, not in HTML")
+        XCTAssertFalse(html.contains("sidebar-icons"), "Sidebar icons should not be in HTML")
+        XCTAssertFalse(html.contains("sidebar-panel"), "Sidebar panels should not be in HTML")
     }
 
-    func testCommentsSidebarScript() {
-        let script = MarkdownDocumentModel.commentsSidebarScript
-        XCTAssertTrue(script.contains("__buildCommentsList"), "Should have build function")
-        XCTAssertTrue(script.contains("__highlightCommentInSidebar"), "Should have highlight function")
-        XCTAssertTrue(script.contains("comment-item"), "Should create comment items")
-        XCTAssertTrue(script.contains("comment-annotated"), "Should show annotated text")
-        XCTAssertTrue(script.contains("comment-text"), "Should show comment text")
-        XCTAssertTrue(script.contains("sidebarClick"), "Should post sidebarClick message")
-        XCTAssertTrue(script.contains("sidebarDelete"), "Should post sidebarDelete message")
-        XCTAssertTrue(script.contains("comment-badge"), "Should update badge count")
+    func testParsedCommentsRefresh() {
+        let model = MarkdownDocumentModel()
+        model.rawContent = "<!-- COMMENT: note -->hello<!-- /COMMENT --> world"
+        model.refreshParsedComments()
+        XCTAssertEqual(model.parsedComments.count, 1)
+        XCTAssertEqual(model.parsedComments[0].comment, "note")
+        XCTAssertEqual(model.parsedComments[0].annotatedText, "hello")
     }
 
     func testMultipleCommentsPreprocessOrder() {

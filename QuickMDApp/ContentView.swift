@@ -24,6 +24,14 @@ private struct FocusedShowSearchBarKey: FocusedValueKey {
     typealias Value = Binding<Bool>
 }
 
+private struct FocusedShowSidebarKey: FocusedValueKey {
+    typealias Value = Binding<Bool>
+}
+
+private struct FocusedActivePanelKey: FocusedValueKey {
+    typealias Value = Binding<SidebarPanel>
+}
+
 extension FocusedValues {
     var documentModel: MarkdownDocumentModel? {
         get { self[FocusedModelKey.self] }
@@ -36,6 +44,14 @@ extension FocusedValues {
     var showSearchBar: Binding<Bool>? {
         get { self[FocusedShowSearchBarKey.self] }
         set { self[FocusedShowSearchBarKey.self] = newValue }
+    }
+    var showSidebar: Binding<Bool>? {
+        get { self[FocusedShowSidebarKey.self] }
+        set { self[FocusedShowSidebarKey.self] = newValue }
+    }
+    var activePanel: Binding<SidebarPanel>? {
+        get { self[FocusedActivePanelKey.self] }
+        set { self[FocusedActivePanelKey.self] = newValue }
     }
 }
 
@@ -168,8 +184,10 @@ class WebViewStore: ObservableObject {
     weak var webView: ZoomableWebView?
     /// Set to true to suppress editor→renderer scroll sync (when renderer is driving)
     var suppressEditorToRenderer = false
-    /// Last known editor scroll fraction (0…1), updated on every editor scroll
+    /// Last known editor scroll fraction (0…1), updated on every editor scroll (deprecated, kept for reload)
     var lastEditorFraction: CGFloat = 0
+    /// Last known editor top line, updated on every editor scroll
+    var lastEditorLine: Int = 1
     /// True when an HTML reload is triggered by editor typing (not navigation)
     var isEditReload = false
     /// True when an HTML reload is triggered by the file watcher
@@ -178,6 +196,10 @@ class WebViewStore: ObservableObject {
     var preReloadScrollFraction: Double = 0
     /// Callback to show the editor panel (set by ContentView)
     var showEditorCallback: (() -> Void)?
+    /// URL of the link currently hovered in the renderer (empty string = none)
+    @Published var hoveredLinkURL: String = ""
+    /// True when a comment editor panel is already open (prevents duplicates)
+    var commentPanelOpen = false
 
     // MARK: - Shared tab navigation history (for back/forward across tabs)
 
@@ -186,32 +208,58 @@ class WebViewStore: ObservableObject {
     var canGoBackTab: Bool { !tabBackStack.isEmpty }
     var canGoForwardTab: Bool { !tabForwardStack.isEmpty }
 
+    /// Track that a tab is being navigated away from (push current onto back stack, clear forward)
     func pushTabHistory(_ url: URL) {
         tabBackStack.append(url)
         tabForwardStack.removeAll()
     }
 
+    /// Called when a tab becomes active (e.g. user clicks a tab, or tab switch completes).
+    /// Ensures the active tab is tracked at the top of the back stack so that
+    /// "back" always returns to the last *actually visited* tab.
+    func onTabBecameActive(_ url: URL) {
+        let standardized = url.standardizedFileURL.path
+        // If the active tab is already the top of the back stack, nothing to do
+        if let top = tabBackStack.last, top.standardizedFileURL.path == standardized { return }
+        // Push to back stack (don't clear forward — this is a tab switch, not a new navigation)
+        tabBackStack.append(url)
+    }
+
+    private var isNavigatingHistory = false
+
     func goBackTab() {
         guard let prev = tabBackStack.popLast() else { return }
-        // Push current window's URL to forward stack
-        if let current = NSApp.keyWindow?.representedURL {
-            tabForwardStack.append(current)
+        if let current = currentTabURL() {
+            // Don't push current if it's the same as where we're going
+            if current.standardizedFileURL.path != prev.standardizedFileURL.path {
+                tabForwardStack.append(current)
+            }
         }
+        isNavigatingHistory = true
         switchToTab(prev)
+        isNavigatingHistory = false
     }
 
     func goForwardTab() {
         guard let next = tabForwardStack.popLast() else { return }
-        if let current = NSApp.keyWindow?.representedURL {
-            tabBackStack.append(current)
+        if let current = currentTabURL() {
+            if current.standardizedFileURL.path != next.standardizedFileURL.path {
+                tabBackStack.append(current)
+            }
         }
+        isNavigatingHistory = true
         switchToTab(next)
+        isNavigatingHistory = false
+    }
+
+    private func currentTabURL() -> URL? {
+        AppDelegate.activeModel?.currentURL ?? NSApp.keyWindow?.representedURL
     }
 
     private func switchToTab(_ url: URL) {
-        let standardized = url.standardizedFileURL
+        let targetPath = url.standardizedFileURL.path
         for window in NSApp.windows {
-            if let represented = window.representedURL, represented.standardizedFileURL == standardized {
+            if let represented = window.representedURL, represented.standardizedFileURL.path == targetPath {
                 window.makeKeyAndOrderFront(nil)
                 if let tabGroup = window.tabGroup {
                     tabGroup.selectedWindow = window
@@ -250,6 +298,19 @@ struct WebView: NSViewRepresentable {
                       let url = URL(string: urlString) else { return }
                 handleLinkClick(url)
 
+            case "linkHover":
+                let url = body["url"] as? String ?? ""
+                DispatchQueue.main.async {
+                    WebViewStore.shared.hoveredLinkURL = url
+                }
+
+            case "fileClick":
+                guard let path = body["path"] as? String else { return }
+                let fileURL = URL(fileURLWithPath: path)
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleLinkClick(fileURL)
+                }
+
             case "commentAction":
                 guard let type = body["type"] as? String else { return }
                 if type == "click" {
@@ -280,13 +341,32 @@ struct WebView: NSViewRepresentable {
                     self.forceRefreshContent(model: model)
                 }
 
+            case "tocData":
+                if let headingsArray = body["headings"] as? [[String: Any]] {
+                    let headings = headingsArray.compactMap { dict -> TOCHeading? in
+                        guard let id = dict["id"] as? String,
+                              let text = dict["text"] as? String,
+                              let level = dict["level"] as? Int else { return nil }
+                        let sourceLine = dict["sourceLine"] as? Int ?? 0
+                        return TOCHeading(id: id, text: text, level: level, sourceLine: sourceLine)
+                    }
+                    DispatchQueue.main.async {
+                        AppDelegate.activeModel?.tocHeadings = headings
+                    }
+                } else if let activeID = body["activeHeadingID"] as? String {
+                    DispatchQueue.main.async {
+                        AppDelegate.activeModel?.activeTOCHeadingID = activeID
+                    }
+                }
+
             case "editorSync":
                 guard let type = body["type"] as? String else { return }
                 if type == "scroll" {
                     // Suppress renderer→editor sync during edit-driven reloads
                     guard !WebViewStore.shared.isEditReload,
-                          let fraction = body["fraction"] as? Double else { return }
-                    scrollEditorToFraction(CGFloat(fraction))
+                          let line = body["line"] as? Int else { return }
+                    let fractionPast = body["fractionPast"] as? Double ?? 0
+                    scrollEditorToLine(line, fractionPast: CGFloat(fractionPast))
                 } else if type == "dblclick" {
                     guard let word = body["word"] as? String else { return }
                     let sourceLine = body["sourceLine"] as? Int ?? -1
@@ -333,6 +413,12 @@ struct WebView: NSViewRepresentable {
                     if let tabGroup = window.tabGroup {
                         tabGroup.selectedWindow = window
                     }
+                    // Scroll to anchor fragment if present
+                    if let fragment = url.fragment {
+                        let safeFragment = fragment.replacingOccurrences(of: "'", with: "\\'")
+                        let js = "document.getElementById('\(safeFragment)')?.scrollIntoView({behavior:'auto'})"
+                        Self.findWebView(in: window)?.evaluateJavaScript(js) { _, _ in }
+                    }
                     return
                 }
             }
@@ -357,19 +443,38 @@ struct WebView: NSViewRepresentable {
             }
         }
 
-        // MARK: - Renderer → Editor scroll sync
+        // MARK: - Renderer → Editor scroll sync (line-anchored)
 
-        private func scrollEditorToFraction(_ fraction: CGFloat) {
-            guard let textView = findEditorTextView(),
-                  let scrollView = textView.enclosingScrollView else { return }
-            let contentHeight = scrollView.documentView?.frame.height ?? 0
-            let viewportHeight = scrollView.contentView.bounds.height
-            let maxScroll = contentHeight - viewportHeight
-            guard maxScroll > 0 else { return }
-            // Suppress editor→renderer sync while we're driving from renderer
+        private func scrollEditorToLine(_ line: Int, fractionPast: CGFloat = 0) {
+            guard let model = AppDelegate.activeModel,
+                  let textView = findEditorTextView(),
+                  let scrollView = textView.enclosingScrollView,
+                  let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+
+            let source = model.rawContent
+            let adjustedLine = line + model.frontmatterLineCount - 1 // 0-based
+            let lines = source.components(separatedBy: "\n")
+            guard adjustedLine >= 0, adjustedLine < lines.count else { return }
+
+            // Calculate character offset for this line
+            var charOffset = 0
+            for i in 0..<adjustedLine {
+                charOffset += lines[i].count + 1 // +1 for newline
+            }
+
+            let nsLength = (source as NSString).length
+            guard nsLength > 0 else { return }
+
+            // Get the glyph rect for this character position
+            let safeOffset = min(charOffset, nsLength - 1)
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: safeOffset, length: 1), actualCharacterRange: nil)
+            let lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+
+            // Scroll to this line, offset by fractionPast * line height
             WebViewStore.shared.suppressEditorToRenderer = true
-            let targetY = fraction * maxScroll
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            let targetY = lineRect.origin.y + (fractionPast * lineRect.height) - textView.textContainerInset.height
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
             scrollView.reflectScrolledClipView(scrollView.contentView)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 WebViewStore.shared.suppressEditorToRenderer = false
@@ -464,6 +569,8 @@ struct WebView: NSViewRepresentable {
         // MARK: - Comment Editor
 
         func showCommentEditor(index: Int, comment: String, annotatedText: String, isNew: Bool, sourceLine: Int = -1, offsetInBlock: Int = -1) {
+            guard !WebViewStore.shared.commentPanelOpen else { return }
+            WebViewStore.shared.commentPanelOpen = true
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
                 styleMask: [.titled, .closable, .resizable],
@@ -483,6 +590,7 @@ struct WebView: NSViewRepresentable {
                 initialComment: comment,
                 isNew: isNew,
                 onSave: { newComment in
+                    WebViewStore.shared.commentPanelOpen = false
                     panel.close()
                     guard let model = AppDelegate.activeModel else { return }
                     if isNew {
@@ -494,13 +602,17 @@ struct WebView: NSViewRepresentable {
                     self.forceRefreshContent(model: model)
                 },
                 onDelete: isNew ? nil : {
+                    WebViewStore.shared.commentPanelOpen = false
                     panel.close()
                     guard let model = AppDelegate.activeModel else { return }
                     let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
                     model.setContent(updated, actionName: "Remove Comment")
                     self.forceRefreshContent(model: model)
                 },
-                onCancel: { panel.close() }
+                onCancel: {
+                    WebViewStore.shared.commentPanelOpen = false
+                    panel.close()
+                }
             )
 
             panel.contentView = NSHostingView(rootView: view)
@@ -595,11 +707,11 @@ struct WebView: NSViewRepresentable {
 
             if store.isEditReload {
                 // Restore scroll position to match the editor after an edit-driven reload
-                let fraction = store.lastEditorFraction
+                let line = store.lastEditorLine
                 let js = """
                 (function() {
                     if (window.__editorSyncPause) __editorSyncPause();
-                    if (window.__setScrollFraction) __setScrollFraction(\(fraction));
+                    if (window.__scrollToLine) __scrollToLine(\(line), 0);
                     setTimeout(function() { if (window.__editorSyncResume) __editorSyncResume(); }, 200);
                 })();
                 """
@@ -620,7 +732,35 @@ struct WebView: NSViewRepresentable {
                     DispatchQueue.main.async { store.isFileWatcherReload = false }
                 }
             }
+
+            // Scroll to anchor fragment if navigating to a URL with #fragment
+            if let fragment = AppDelegate.activeModel?.pendingFragment {
+                AppDelegate.activeModel?.pendingFragment = nil
+                let safeFragment = fragment.replacingOccurrences(of: "'", with: "\\'")
+                let js = "document.getElementById('\(safeFragment)')?.scrollIntoView({behavior:'auto'})"
+                webView.evaluateJavaScript(js) { _, _ in }
+            }
+
+            // Refresh native sidebar file tree
+            DispatchQueue.main.async {
+                AppDelegate.activeModel?.refreshFileTree()
+            }
         }
+
+        /// Recursively find the first WKWebView in a window's view hierarchy.
+        static func findWebView(in window: NSWindow) -> WKWebView? {
+            func search(_ view: NSView) -> WKWebView? {
+                if let wk = view as? WKWebView { return wk }
+                for sub in view.subviews {
+                    if let found = search(sub) { return found }
+                }
+                return nil
+            }
+            guard let contentView = window.contentView else { return nil }
+            return search(contentView)
+        }
+
+        // injectFileTree removed — file tree is now native SwiftUI via model.refreshFileTree()
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -721,11 +861,7 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
 
-        // 11. TOC sidebar script
-        config.userContentController.addUserScript(WKUserScript(
-            source: MarkdownDocumentModel.tocScript,
-            injectionTime: .atDocumentEnd, forMainFrameOnly: true
-        ))
+        // 11. TOC sidebar script — removed, replaced by headingDataScript (registered below)
 
         // 12. Font size controls
         config.userContentController.addUserScript(WKUserScript(
@@ -794,6 +930,13 @@ struct WebView: NSViewRepresentable {
         ))
         config.userContentController.add(context.coordinator, name: "linkClick")
 
+        // 22b. Link hover (show URL in status bar)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.linkHoverScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+        config.userContentController.add(context.coordinator, name: "linkHover")
+
         // 23. Checkbox toggle (enables clicking checkboxes to modify source)
         config.userContentController.addUserScript(WKUserScript(
             source: MarkdownDocumentModel.checkboxToggleScript,
@@ -815,15 +958,15 @@ struct WebView: NSViewRepresentable {
         ))
         config.userContentController.add(context.coordinator, name: "commentAction")
 
-        // 24b. Comments sidebar panel
-        config.userContentController.addUserScript(WKUserScript(
-            source: MarkdownDocumentModel.commentsSidebarScript,
-            injectionTime: .atDocumentEnd, forMainFrameOnly: true
-        ))
+        // 24b-d. Sidebar scripts removed — sidebars are now native SwiftUI
+        config.userContentController.add(context.coordinator, name: "fileClick")
 
-        // 24c. Sidebar arrangement (flexible positioning)
+        // TOC data bridge (heading list + active heading)
+        config.userContentController.add(context.coordinator, name: "tocData")
+
+        // Heading data script (assigns IDs, sends TOC to Swift, tracks active heading)
         config.userContentController.addUserScript(WKUserScript(
-            source: MarkdownDocumentModel.sidebarArrangeScript,
+            source: MarkdownDocumentModel.headingDataScript,
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
 
@@ -1126,145 +1269,35 @@ struct ContentView: View {
     @StateObject private var model = MarkdownDocumentModel()
     @ObservedObject private var webViewStore = WebViewStore.shared
     @AppStorage("theme") var theme = "system"
+    @AppStorage("showSidebar") var showSidebar = true
+    @AppStorage("sidebarPosition") var sidebarPosition = "leading"
+    @AppStorage("sidebarWidth") var sidebarWidth: Double = 220
     @State private var showEditor = false
+    @State private var activePanel: SidebarPanel = .toc
     @State private var editorPosition = CodeEditor.Position()
     @State private var editorDebounceTask: Task<Void, Never>?
     @State private var scrollSyncTask: Task<Void, Never>?
     @State private var showSearchBar = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            if showSearchBar {
-                SearchBar(isVisible: $showSearchBar)
-            }
-            Group {
-            if let html = model.html {
-                if showEditor {
-                    HSplitView {
-                        WebView(html: html, baseURL: model.baseURL, theme: theme)
-                            .frame(minWidth: 200)
-                        MarkdownEditorView(text: $model.rawContent, position: $editorPosition, onScrollFractionChange: { fraction in
-                            // Always track the editor's scroll position
-                            WebViewStore.shared.lastEditorFraction = fraction
-                            // Skip if renderer is driving the scroll
-                            guard !WebViewStore.shared.suppressEditorToRenderer else { return }
-                            scrollSyncTask?.cancel()
-                            scrollSyncTask = Task { @MainActor in
-                                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms debounce
-                                guard !Task.isCancelled else { return }
-                                guard let webView = WebViewStore.shared.webView else { return }
-                                // Pause renderer→editor sync to prevent feedback loop
-                                webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
-                                webView.evaluateJavaScript(
-                                    "if(window.__setScrollFraction) __setScrollFraction(\(fraction));"
-                                ) { _, _ in
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                        webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
-                                    }
-                                }
-                            }
-                        }, currentFileURL: { model.currentURL })
-                            .frame(minWidth: 200)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .onChange(of: model.rawContent) { newValue in
-                        // Mark window as having unsaved changes
-                        if let window = WebViewStore.shared.webView?.window {
-                            window.isDocumentEdited = true
-                        }
-                        model.isDirty = true
-                        // Debounce re-render since CodeEditorView fires on every keystroke
-                        editorDebounceTask?.cancel()
-                        editorDebounceTask = Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
-                            guard !Task.isCancelled else { return }
-                            if let url = model.currentURL {
-                                let ext = url.pathExtension.lowercased()
-                                if ["md", "markdown", "mdown", "mkd"].contains(ext) {
-                                    // Generate only the body HTML, not the full page
-                                    let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: newValue)
-                                    // Use incremental JS update instead of full loadHTMLString
-                                    guard let webView = WebViewStore.shared.webView else { return }
-                                    let escaped = bodyHTML
-                                        .replacingOccurrences(of: "\\", with: "\\\\")
-                                        .replacingOccurrences(of: "`", with: "\\`")
-                                        .replacingOccurrences(of: "${", with: "\\${")
-                                    webView.evaluateJavaScript("if(window.__updateContent) __updateContent(`\(escaped)`)") { _, _ in }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    WebView(html: html, baseURL: model.baseURL, theme: theme)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            } else {
-                // Welcome screen when no file is open
-                VStack(spacing: 20) {
-                    Spacer()
-                    Image(systemName: "doc.richtext")
-                        .font(.system(size: 60))
-                        .foregroundStyle(.tertiary)
-                    Text("QuickMD")
-                        .font(.largeTitle)
-                        .fontWeight(.bold)
-                    if let errorMessage = model.errorMessage {
-                        Text(errorMessage)
-                            .foregroundStyle(.red)
-                    } else {
-                        Text("Open a markdown file to get started")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                    Button("Open File\u{2026}") {
-                        let panel = NSOpenPanel()
-                        panel.allowsMultipleSelection = false
-                        panel.canChooseDirectories = false
-                        panel.allowedContentTypes = [.plainText, .sourceCode, .data]
-                        if panel.runModal() == .OK, let url = panel.url {
-                            model.load(from: url)
-                        }
-                    }
-                    .controlSize(.large)
+        contentLayout
+            .modifier(ContentViewToolbar(model: model, webViewStore: webViewStore, showEditor: $showEditor, showSearchBar: $showSearchBar, showSidebar: $showSidebar, activePanel: $activePanel))
+            .modifier(ContentViewLifecycle(model: model, showEditor: $showEditor))
+            .modifier(ContentViewNotifications(model: model))
+    }
+}
 
-                    let recentURLs = NSDocumentController.shared.recentDocumentURLs
-                    if !recentURLs.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Recent Files")
-                                .font(.headline)
-                                .foregroundStyle(.secondary)
-                                .padding(.top, 8)
-                            ForEach(recentURLs.prefix(5), id: \.self) { url in
-                                Button(action: { model.load(from: url) }) {
-                                    HStack {
-                                        Image(systemName: "doc")
-                                            .foregroundStyle(.secondary)
-                                        Text(url.lastPathComponent)
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Text(url.deletingLastPathComponent().lastPathComponent)
-                                            .font(.caption)
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .frame(maxWidth: 350)
-                    }
+// MARK: - ContentView Toolbar Modifier
+private struct ContentViewToolbar: ViewModifier {
+    @ObservedObject var model: MarkdownDocumentModel
+    @ObservedObject var webViewStore: WebViewStore
+    @Binding var showEditor: Bool
+    @Binding var showSearchBar: Bool
+    @Binding var showSidebar: Bool
+    @Binding var activePanel: SidebarPanel
 
-                    Spacer()
-                    Text("You can also drag files onto this window")
-                        .font(.caption)
-                        .foregroundStyle(.quaternary)
-                        .padding(.bottom, 20)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Welcome screen")
-            }
-        } // Group
-        } // VStack
+    func body(content: Content) -> some View {
+        content
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
                 let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
@@ -1274,7 +1307,7 @@ struct ContentView: View {
                     Image(systemName: "chevron.left")
                 }
                 .disabled(openInNewTab ? !webViewStore.canGoBackTab : !model.canGoBack)
-                .help("Back (⌘[)")
+                .help("Back (\u{2318}[)")
                 .accessibilityLabel("Go back")
 
                 Button(action: {
@@ -1283,13 +1316,25 @@ struct ContentView: View {
                     Image(systemName: "chevron.right")
                 }
                 .disabled(openInNewTab ? !webViewStore.canGoForwardTab : !model.canGoForward)
-                .help("Forward (⌘])")
+                .help("Forward (\u{2318}])")
                 .accessibilityLabel("Go forward")
             }
         }
         .focusedValue(\.documentModel, model)
         .focusedSceneValue(\.showEditor, $showEditor)
         .focusedSceneValue(\.showSearchBar, $showSearchBar)
+        .focusedSceneValue(\.showSidebar, $showSidebar)
+        .focusedSceneValue(\.activePanel, $activePanel)
+    }
+}
+
+// MARK: - ContentView Lifecycle Modifier
+private struct ContentViewLifecycle: ViewModifier {
+    @ObservedObject var model: MarkdownDocumentModel
+    @Binding var showEditor: Bool
+
+    func body(content: Content) -> some View {
+        content
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
@@ -1312,8 +1357,20 @@ struct ContentView: View {
             WebViewStore.shared.showEditorCallback = {
                 showEditor = true
             }
+            model.refreshParsedComments()
+            model.refreshFileTree()
+            // Track tab activation for back/forward history
+            NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { notification in
+                guard let window = notification.object as? NSWindow,
+                      window.representedURL == model.currentURL,
+                      let url = model.currentURL,
+                      !WebViewStore.shared.isNavigatingHistory else { return }
+                AppDelegate.activeModel = model
+                WebViewStore.shared.onTabBecameActive(url)
+            }
             if let url = AppDelegate.pendingURL {
                 MarkdownDocumentModel.log("onAppear: loading pendingURL \(url.path)")
+                model.pendingFragment = url.fragment
                 model.load(from: url)
                 AppDelegate.pendingURL = nil
                 // Release directory security scope after load completes
@@ -1353,59 +1410,102 @@ struct ContentView: View {
             }
         }
         .onChange(of: model.fileName) { _ in
+            model.refreshParsedComments()
+            model.refreshFileTree()
             DispatchQueue.main.async {
                 if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                    window.title = model.fileName ?? "QuickMD"
+                    if let url = model.currentURL {
+                        let pathComponents = url.pathComponents
+                        let count = pathComponents.count
+                        if count >= 3 {
+                            window.title = pathComponents[(count - 2)...].joined(separator: "/")
+                        } else {
+                            window.title = model.fileName ?? "QuickMD"
+                        }
+                    } else {
+                        window.title = model.fileName ?? "QuickMD"
+                    }
                     window.representedURL = model.currentURL
                 }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .init("saveDocument"))) { _ in
-            // Save document when triggered (e.g., Save All & Quit)
             if let url = model.currentURL {
                 try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
                 model.markClean()
                 if let window = WebViewStore.shared.webView?.window {
                     window.isDocumentEdited = false
                 }
+                Self.pushIncrementalUpdate(model: model)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .addCommentAction)) { _ in
-            // Add comment from editor selection
-            guard let window = NSApp.keyWindow,
-                  let textView = findEditorTextViewInContentView(window.contentView),
-                  textView.selectedRange().length > 0,
-                  let selectedText = (textView.string as NSString?)?.substring(with: textView.selectedRange()) else { return }
-            let selectedRange = textView.selectedRange()
-            let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered, defer: false
-            )
-            panel.title = "Add Comment"
-            panel.isFloatingPanel = true
-            panel.becomesKeyOnlyIfNeeded = false
-            panel.level = .floating
-            let mouseLocation = NSEvent.mouseLocation
-            panel.setFrameOrigin(NSPoint(x: mouseLocation.x - 180, y: mouseLocation.y - 240))
-            let view = CommentEditorView(
-                annotatedText: selectedText,
-                initialComment: "",
-                isNew: true,
-                onSave: { comment in
-                    panel.close()
-                    let prefix = "<!-- COMMENT: \(comment) -->"
-                    let suffix = "<!-- /COMMENT -->"
-                    let wrapped = "\(prefix)\(selectedText)\(suffix)"
-                    textView.insertText(wrapped, replacementRange: selectedRange)
-                },
-                onDelete: nil,
-                onCancel: { panel.close() }
-            )
-            panel.contentView = NSHostingView(rootView: view)
-            panel.makeKeyAndOrderFront(nil)
+            // Only the active model should respond; prevent duplicate panels
+            guard AppDelegate.activeModel === model else { return }
+            guard !WebViewStore.shared.commentPanelOpen else { return }
+            // Try editor selection first
+            if let window = NSApp.keyWindow,
+               let textView = findEditorTextViewInContentView(window.contentView),
+               textView.selectedRange().length > 0,
+               let selectedText = (textView.string as NSString?)?.substring(with: textView.selectedRange()) {
+                let selectedRange = textView.selectedRange()
+                WebViewStore.shared.commentPanelOpen = true
+                let panel = NSPanel(
+                    contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+                    styleMask: [.titled, .closable, .resizable],
+                    backing: .buffered, defer: false
+                )
+                panel.title = "Add Comment"
+                panel.isFloatingPanel = true
+                panel.becomesKeyOnlyIfNeeded = false
+                panel.level = .floating
+                let mouseLocation = NSEvent.mouseLocation
+                panel.setFrameOrigin(NSPoint(x: mouseLocation.x - 180, y: mouseLocation.y - 240))
+                let view = CommentEditorView(
+                    annotatedText: selectedText,
+                    initialComment: "",
+                    isNew: true,
+                    onSave: { comment in
+                        WebViewStore.shared.commentPanelOpen = false
+                        panel.close()
+                        let prefix = "<!-- COMMENT: \(comment) -->"
+                        let suffix = "<!-- /COMMENT -->"
+                        let wrapped = "\(prefix)\(selectedText)\(suffix)"
+                        textView.insertText(wrapped, replacementRange: selectedRange)
+                    },
+                    onDelete: nil,
+                    onCancel: {
+                        WebViewStore.shared.commentPanelOpen = false
+                        panel.close()
+                    }
+                )
+                panel.contentView = NSHostingView(rootView: view)
+                panel.makeKeyAndOrderFront(nil)
+                return
+            }
+
+            // Fall through to renderer (WebView) selection
+            guard let webView = WebViewStore.shared.webView else { return }
+            webView.evaluateJavaScript("window.__getSelectionText ? __getSelectionText() : ''") { result, _ in
+                guard let text = result as? String, !text.isEmpty else { return }
+                webView.evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { infoResult, _ in
+                    var sourceLine = -1
+                    var offsetInBlock = -1
+                    if let info = infoResult as? [String: Any] {
+                        sourceLine = info["sourceLine"] as? Int ?? -1
+                        offsetInBlock = info["offsetInBlock"] as? Int ?? -1
+                    }
+                    DispatchQueue.main.async {
+                        webView.commentCoordinator?.showCommentEditor(
+                            index: -1, comment: "", annotatedText: text,
+                            isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock
+                        )
+                    }
+                }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .removeCommentAction)) { _ in
+            guard AppDelegate.activeModel === model else { return }
             // Remove the comment at the cursor position in the editor
             guard let window = NSApp.keyWindow,
                   let textView = findEditorTextViewInContentView(window.contentView) else { return }
@@ -1422,6 +1522,247 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Content Layout
+
+    private var contentLayout: some View {
+        VStack(spacing: 0) {
+            if showSearchBar {
+                SearchBar(isVisible: $showSearchBar)
+            }
+            ZStack(alignment: .bottomLeading) {
+                HStack(spacing: 0) {
+                    if sidebarPosition == "leading" && showSidebar && model.html != nil {
+                        sidebarContent
+                            .frame(width: sidebarWidth)
+                        SidebarResizeHandle(width: $sidebarWidth, isLeading: true)
+                        Divider()
+                    }
+                    if let html = model.html {
+                        mainContentArea(html: html)
+                    } else {
+                        welcomeScreen
+                    }
+                    if sidebarPosition == "trailing" && showSidebar && model.html != nil {
+                        Divider()
+                        SidebarResizeHandle(width: $sidebarWidth, isLeading: false)
+                        sidebarContent
+                            .frame(width: sidebarWidth)
+                    }
+                }
+                if !webViewStore.hoveredLinkURL.isEmpty {
+                    hoveredLinkIndicator
+                }
+            }
+        }
+    }
+
+    private var hoveredLinkIndicator: some View {
+        Text(webViewStore.hoveredLinkURL)
+            .font(.system(size: 11))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 4))
+            .padding(.leading, 4)
+            .padding(.bottom, 4)
+            .allowsHitTesting(false)
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.15), value: webViewStore.hoveredLinkURL)
+    }
+
+    // MARK: - Welcome Screen
+
+    private var welcomeScreen: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "doc.richtext")
+                .font(.system(size: 60))
+                .foregroundStyle(.tertiary)
+            Text("QuickMD")
+                .font(.largeTitle)
+                .fontWeight(.bold)
+            if let errorMessage = model.errorMessage {
+                Text(errorMessage)
+                    .foregroundStyle(.red)
+            } else {
+                Text("Open a markdown file to get started")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Open File\u{2026}") {
+                let panel = NSOpenPanel()
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                panel.allowedContentTypes = [.plainText, .sourceCode, .data]
+                if panel.runModal() == .OK, let url = panel.url {
+                    model.load(from: url)
+                }
+            }
+            .controlSize(.large)
+
+            let recentURLs = NSDocumentController.shared.recentDocumentURLs
+            if !recentURLs.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Recent Files")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 8)
+                    ForEach(recentURLs.prefix(5), id: \.self) { url in
+                        Button(action: { model.load(from: url) }) {
+                            HStack {
+                                Image(systemName: "doc")
+                                    .foregroundStyle(.secondary)
+                                Text(url.lastPathComponent)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(url.deletingLastPathComponent().lastPathComponent)
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: 350)
+            }
+
+            Spacer()
+            Text("You can also drag files onto this window")
+                .font(.caption)
+                .foregroundStyle(.quaternary)
+                .padding(.bottom, 20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Welcome screen")
+    }
+
+    // MARK: - Main Content Area
+
+    @ViewBuilder
+    private func mainContentArea(html: String) -> some View {
+        if showEditor {
+            HSplitView {
+                WebView(html: html, baseURL: model.baseURL, theme: theme)
+                    .frame(minWidth: 200)
+                MarkdownEditorView(text: $model.rawContent, position: $editorPosition, onTopLineChange: { line, fractionPast in
+                    WebViewStore.shared.lastEditorLine = line
+                    guard !WebViewStore.shared.suppressEditorToRenderer else { return }
+                    scrollSyncTask?.cancel()
+                    scrollSyncTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        guard !Task.isCancelled else { return }
+                        guard let webView = WebViewStore.shared.webView else { return }
+                        webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
+                        webView.evaluateJavaScript(
+                            "if(window.__scrollToLine) __scrollToLine(\(line), \(fractionPast));"
+                        ) { _, _ in
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                                webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
+                            }
+                        }
+                    }
+                }, currentFileURL: { model.currentURL })
+                    .frame(minWidth: 200)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: model.rawContent) { _, _ in
+                if let window = WebViewStore.shared.webView?.window {
+                    window.isDocumentEdited = true
+                }
+                model.isDirty = true
+                model.refreshParsedComments()
+                editorDebounceTask?.cancel()
+                editorDebounceTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    guard !Task.isCancelled else { return }
+                    Self.pushIncrementalUpdate(model: model)
+                }
+            }
+        } else {
+            WebView(html: html, baseURL: model.baseURL, theme: theme)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: - Sidebar Content
+
+    @ViewBuilder
+    private var sidebarContent: some View {
+        SidebarView(
+            model: model,
+            activePanel: $activePanel,
+            onTOCClick: { heading in
+                // Scroll preview to heading element
+                let safeID = heading.id.replacingOccurrences(of: "'", with: "\\'")
+                WebViewStore.shared.webView?.evaluateJavaScript(
+                    "document.getElementById('\(safeID)')?.scrollIntoView({behavior:'smooth'})"
+                ) { _, _ in }
+                // Scroll editor to heading's source line
+                if let textView = findEditorTextViewInContentView(NSApp.keyWindow?.contentView),
+                   let scrollView = textView.enclosingScrollView,
+                   let layoutManager = textView.layoutManager,
+                   let textContainer = textView.textContainer {
+                    let adjustedLine = heading.sourceLine + model.frontmatterLineCount - 1
+                    let lines = model.rawContent.components(separatedBy: "\n")
+                    guard adjustedLine >= 0, adjustedLine < lines.count else { return }
+                    var charOffset = 0
+                    for i in 0..<adjustedLine { charOffset += lines[i].count + 1 }
+                    let nsLength = (model.rawContent as NSString).length
+                    guard nsLength > 0 else { return }
+                    let safeOffset = min(charOffset, nsLength - 1)
+                    let glyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: safeOffset, length: 1), actualCharacterRange: nil)
+                    let lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+                    scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, lineRect.origin.y - textView.textContainerInset.height)))
+                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                }
+            },
+            onCommentClick: { comment in
+                if let textView = findEditorTextViewInContentView(NSApp.keyWindow?.contentView) {
+                    if !showEditor { showEditor = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + (showEditor ? 0 : 0.3)) {
+                        textView.setSelectedRange(comment.range)
+                        textView.scrollRangeToVisible(comment.range)
+                    }
+                }
+                // Also scroll preview to the comment
+                WebViewStore.shared.webView?.evaluateJavaScript(
+                    "document.querySelectorAll('.qmd-comment')[\(comment.id)]?.scrollIntoView({behavior:'smooth'})"
+                ) { _, _ in }
+            },
+            onCommentEdit: { comment in
+                // Reuse existing comment editor via the coordinator
+                WebViewStore.shared.webView?.commentCoordinator?.showCommentEditor(
+                    index: comment.id, comment: comment.comment, annotatedText: comment.annotatedText, isNew: false
+                )
+            },
+            onCommentDelete: { comment in
+                let updated = MarkdownDocumentModel.removeComment(at: comment.id, in: model.rawContent)
+                model.setContent(updated, actionName: "Remove Comment")
+                model.refreshParsedComments()
+                Self.pushIncrementalUpdate(model: model)
+            },
+            onFileClick: { path in
+                let url = URL(fileURLWithPath: path)
+                if url.isFileURL {
+                    // Same logic as fileClick handler
+                    let _ = MarkdownDocumentModel.accessDirectoryForFile(url)
+                    let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
+                    if openInNewTab {
+                        if let current = AppDelegate.activeModel?.currentURL {
+                            WebViewStore.shared.pushTabHistory(current)
+                        }
+                        AppDelegate.pendingURL = url
+                        NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
+                    } else {
+                        model.navigateTo(url)
+                    }
+                }
+            }
+        )
+    }
+
     private func findEditorTextViewInContentView(_ view: NSView?) -> NSTextView? {
         guard let view = view else { return nil }
         if let tv = view as? NSTextView, tv.isEditable { return tv }
@@ -1431,4 +1772,26 @@ struct ContentView: View {
         return nil
     }
 
+    /// Push an incremental DOM update to the renderer WebView from the current model content.
+    /// Falls back to a full re-render if the JS update fails.
+    static func pushIncrementalUpdate(model: MarkdownDocumentModel) {
+        guard let url = model.currentURL else { return }
+        let ext = url.pathExtension.lowercased()
+        guard MarkdownDocumentModel.isMarkdownExtension(ext) else { return }
+
+        let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: model.rawContent)
+        guard let webView = WebViewStore.shared.webView else {
+            model.rerender()
+            return
+        }
+        let escaped = bodyHTML
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "`", with: "\\`")
+            .replacingOccurrences(of: "${", with: "\\${")
+        webView.evaluateJavaScript("if(window.__updateContent) { __updateContent(`\(escaped)`); true } else { false }") { result, error in
+            if error != nil || result as? Bool != true {
+                DispatchQueue.main.async { model.rerender() }
+            }
+        }
+    }
 }

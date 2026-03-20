@@ -455,6 +455,8 @@ struct QuickMDApp: App {
     @FocusedValue(\.documentModel) private var activeModel
     @FocusedValue(\.showEditor) private var showEditor
     @FocusedValue(\.showSearchBar) private var showSearchBar
+    @FocusedValue(\.showSidebar) private var showSidebar
+    @FocusedValue(\.activePanel) private var activePanel
 
     var body: some Scene {
         WindowGroup {
@@ -498,13 +500,14 @@ struct QuickMDApp: App {
                 Divider()
 
                 Button("Save") {
-                    if let model = activeModel, let url = model.currentURL {
-                        try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
-                        model.markClean()
-                        if let window = WebViewStore.shared.webView?.window {
-                            window.isDocumentEdited = false
-                        }
+                    guard let model = activeModel ?? AppDelegate.activeModel,
+                          let url = model.currentURL else { return }
+                    try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
+                    model.markClean()
+                    if let window = WebViewStore.shared.webView?.window {
+                        window.isDocumentEdited = false
                     }
+                    ContentView.pushIncrementalUpdate(model: model)
                 }
                 .keyboardShortcut("s")
 
@@ -759,7 +762,7 @@ struct QuickMDApp: App {
                         activeModel?.goBack()
                     }
                 }
-                .keyboardShortcut("[")
+                .keyboardShortcut(.leftArrow, modifiers: [.command])
                 Button("Forward") {
                     let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
                     if openInNewTab {
@@ -768,7 +771,7 @@ struct QuickMDApp: App {
                         activeModel?.goForward()
                     }
                 }
-                .keyboardShortcut("]")
+                .keyboardShortcut(.rightArrow, modifiers: [.command])
                 Divider()
                 Button("Zoom In") {
                     WebViewStore.shared.webView?.zoomIn()
@@ -784,13 +787,22 @@ struct QuickMDApp: App {
                 .keyboardShortcut("0")
                 Divider()
                 Button("Toggle Sidebar") {
-                    WebViewStore.shared.webView?.evaluateJavaScript("if(window.__toggleSidebar) __toggleSidebar()") { _, _ in }
+                    showSidebar?.wrappedValue.toggle()
                 }
                 .keyboardShortcut("s", modifiers: [.command, .control])
                 Button("Show Comments") {
-                    WebViewStore.shared.webView?.evaluateJavaScript("if(window.__showCommentsPanel) __showCommentsPanel()") { _, _ in }
+                    showSidebar?.wrappedValue = true
+                    activePanel?.wrappedValue = .comments
                 }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
+                Button("Move Sidebar to Other Side") {
+                    if let binding = showSidebar {
+                        // Toggle position
+                        let current = UserDefaults.standard.string(forKey: "sidebarPosition") ?? "leading"
+                        UserDefaults.standard.set(current == "leading" ? "trailing" : "leading", forKey: "sidebarPosition")
+                        if !binding.wrappedValue { binding.wrappedValue = true }
+                    }
+                }
             }
             CommandMenu("Tools") {
                 Button("Find\u{2026}") {
@@ -866,7 +878,7 @@ struct QuickMDApp: App {
                 Button("Add Comment\u{2026}") {
                     NotificationCenter.default.post(name: .addCommentAction, object: nil)
                 }
-                .keyboardShortcut("k", modifiers: [.command, .shift])
+                .keyboardShortcut("k", modifiers: [.command])
                 Button("Remove Comment") {
                     NotificationCenter.default.post(name: .removeCommentAction, object: nil)
                 }

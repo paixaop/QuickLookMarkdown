@@ -559,7 +559,7 @@ struct EditorStatusBar: View {
 struct MarkdownEditorView: View {
     @Binding var text: String
     @Binding var position: CodeEditor.Position
-    var onScrollFractionChange: ((CGFloat) -> Void)?
+    var onTopLineChange: ((Int, CGFloat) -> Void)?
     var currentFileURL: (() -> URL?)?
     @State private var messages: Set<TextLocated<Message>> = []
     @Environment(\.colorScheme) private var colorScheme
@@ -580,7 +580,7 @@ struct MarkdownEditorView: View {
                 showMinimap: true,
                 wrapText: true
             ))
-            .background(ScrollFractionObserver(onFractionChange: onScrollFractionChange))
+            .background(TopLineObserver(onTopLineChange: onTopLineChange))
             .onAppear {
                 EditorFontManager.shared.applyToEditorDeferred()
                 autoPairHandler.install()
@@ -603,14 +603,13 @@ struct MarkdownEditorView: View {
     }
 }
 
-/// Monitors the nearest NSScrollView's bounds changes and reports the scroll fraction (0…1).
-private struct ScrollFractionObserver: NSViewRepresentable {
-    var onFractionChange: ((CGFloat) -> Void)?
+/// Monitors the nearest NSScrollView's bounds changes and reports the top visible source line number.
+private struct TopLineObserver: NSViewRepresentable {
+    var onTopLineChange: ((Int, CGFloat) -> Void)?
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
-        context.coordinator.onFractionChange = onFractionChange
-        // Delay to let the CodeEditor's NSScrollView appear in the hierarchy
+        context.coordinator.onTopLineChange = onTopLineChange
         DispatchQueue.main.async {
             context.coordinator.attach(to: view)
         }
@@ -618,33 +617,25 @@ private struct ScrollFractionObserver: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.onFractionChange = onFractionChange
+        context.coordinator.onTopLineChange = onTopLineChange
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     class Coordinator: NSObject {
-        var onFractionChange: ((CGFloat) -> Void)?
+        var onTopLineChange: ((Int, CGFloat) -> Void)?
         private weak var observedScrollView: NSScrollView?
 
         func attach(to view: NSView) {
-            // Walk up the view hierarchy to find the CodeEditor's NSScrollView
-            // [SYNC] ScrollFractionObserver.attach called, window=\(view.window != nil)")
             guard let scrollView = findCodeEditorScrollView(from: view) else {
-                // [SYNC] ScrollView not found on first try, retrying in 0.5s")
-                // Retry once more after a short delay (view hierarchy may not be ready)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self = self else { return }
                     if let sv = self.findCodeEditorScrollView(from: view) {
-                        // [SYNC] ScrollView found on retry")
                         self.startObserving(sv)
-                    } else {
-                        // [SYNC] ScrollView NOT found on retry either, window=\(view.window != nil)")
                     }
                 }
                 return
             }
-            // [SYNC] ScrollView found immediately")
             startObserving(scrollView)
         }
 
@@ -660,14 +651,11 @@ private struct ScrollFractionObserver: NSViewRepresentable {
             )
         }
 
-        /// Find the NSScrollView that belongs to the CodeEditor (not a WebView).
         private func findCodeEditorScrollView(from view: NSView) -> NSScrollView? {
-            // Walk up to the window, then search for scroll views that contain a text view
             guard let window = view.window else { return nil }
             return findTextScrollView(in: window.contentView)
         }
 
-        /// Recursively find an NSScrollView whose documentView is (or contains) an NSTextView.
         private func findTextScrollView(in view: NSView?) -> NSScrollView? {
             guard let view = view else { return nil }
             if let sv = view as? NSScrollView,
@@ -689,14 +677,43 @@ private struct ScrollFractionObserver: NSViewRepresentable {
         }
 
         @objc private func boundsDidChange(_ notification: Notification) {
-            guard let scrollView = observedScrollView else { return }
-            let contentHeight = scrollView.documentView?.frame.height ?? 0
-            let viewportHeight = scrollView.contentView.bounds.height
-            let maxScroll = contentHeight - viewportHeight
-            guard maxScroll > 0 else { return }
-            let offset = scrollView.contentView.bounds.origin.y
-            let fraction = min(max(offset / maxScroll, 0), 1)
-            onFractionChange?(fraction)
+            guard let scrollView = observedScrollView,
+                  let textView = scrollView.documentView as? NSTextView ?? findTextViewIn(scrollView.documentView),
+                  let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+
+            let visibleRect = scrollView.contentView.bounds
+            let topY = visibleRect.origin.y + textView.textContainerInset.height
+            let topPoint = NSPoint(x: textView.textContainerInset.width + 5, y: topY)
+
+            // Find character index at top of visible rect
+            let charIndex = layoutManager.characterIndex(for: topPoint, in: textContainer, fractionOfDistanceBetweenInsertionPoints: nil)
+
+            // Count newlines to get 1-based line number
+            let nsSource = textView.string as NSString
+            let safeIndex = min(charIndex, nsSource.length)
+            let prefix = nsSource.substring(to: safeIndex)
+            let lineNumber = prefix.components(separatedBy: "\n").count // 1-based
+
+            // Compute fractionPast: how far into the current line we've scrolled
+            var fractionPast: CGFloat = 0
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: min(charIndex, nsSource.length > 0 ? nsSource.length - 1 : 0))
+            let lineFragmentRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            if lineFragmentRect.height > 0 {
+                let lineTop = lineFragmentRect.origin.y + textView.textContainerInset.height
+                fractionPast = max(0, min(1, (topY - lineTop) / lineFragmentRect.height))
+            }
+
+            onTopLineChange?(lineNumber, fractionPast)
+        }
+
+        private func findTextViewIn(_ view: NSView?) -> NSTextView? {
+            guard let view = view else { return nil }
+            if let tv = view as? NSTextView { return tv }
+            for sub in view.subviews {
+                if let found = findTextViewIn(sub) { return found }
+            }
+            return nil
         }
 
         deinit {

@@ -14,12 +14,52 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: config)
     }
 
+    /// Snapshot output directory — set via SNAPSHOT_DIR env var or defaults to QuickMDTests/Snapshots.
+    private static let snapshotDir: String = {
+        if let env = ProcessInfo.processInfo.environment["SNAPSHOT_DIR"], !env.isEmpty { return env }
+        // Fallback: project source tree (works when running from Xcode or CLI)
+        return (ProcessInfo.processInfo.environment["SRCROOT"] ?? "/Users/pedro/code/QuickLookMarkdown")
+            + "/QuickMDTests/Snapshots"
+    }()
+
     override func tearDown() {
+        // Take a snapshot of the WebView at the end of every E2E test
+        if let webView = webView {
+            saveSnapshot(webView: webView, testName: name)
+        }
         webView = nil
         super.tearDown()
     }
 
     // MARK: - Helpers
+
+    /// Capture a PNG screenshot of the WebView and save to the snapshots directory.
+    private func saveSnapshot(webView: WKWebView, testName: String) {
+        let sanitized = testName
+            .replacingOccurrences(of: "[", with: "")
+            .replacingOccurrences(of: "]", with: "")
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
+
+        let dir = Self.snapshotDir
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        let exp = expectation(description: "Snapshot \(sanitized)")
+        let config = WKSnapshotConfiguration()
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        config.snapshotWidth = NSNumber(value: 800.0 / scale)
+        webView.takeSnapshot(with: config) { image, error in
+            defer { exp.fulfill() }
+            guard let image = image,
+                  let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]) else { return }
+            let path = "\(dir)/\(sanitized).png"
+            try? png.write(to: URL(fileURLWithPath: path))
+        }
+        wait(for: [exp], timeout: 5.0)
+    }
 
     private func writeTempFile(_ content: String, ext: String) -> URL {
         let dir = FileManager.default.temporaryDirectory
@@ -29,7 +69,40 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         return url
     }
 
+    /// Core scripts injected via WKUserScript in the same order as makeNSView.
+    /// Excludes large bundled libraries (highlight.js ~127KB, js-yaml ~39KB, mermaid ~2.9MB,
+    /// katex, graphviz) which can fail to load in test environments. These aren't needed
+    /// for DOM structure, interaction, and navigation E2E tests.
+    private static let coreScripts: [String] = [
+        MarkdownDocumentModel.themeScript,
+        MarkdownDocumentModel.highlightRenderScript,
+        MarkdownDocumentModel.lineNumbersScript,
+        MarkdownDocumentModel.copyButtonScript,
+        MarkdownDocumentModel.zoomOverlayScript,
+        MarkdownDocumentModel.readingStatsScript,
+        MarkdownDocumentModel.headingDataScript,
+        MarkdownDocumentModel.fontSizeScript,
+        MarkdownDocumentModel.jumpToLineScript,
+        MarkdownDocumentModel.findScript,
+        MarkdownDocumentModel.speakScript,
+        MarkdownDocumentModel.emojiScript,
+        MarkdownDocumentModel.footnotesScript,
+        MarkdownDocumentModel.frontmatterScript,
+        MarkdownDocumentModel.wordWrapScript,
+        MarkdownDocumentModel.anchorLinksScript,
+        MarkdownDocumentModel.presentationScript,
+        MarkdownDocumentModel.linkClickScript,
+        MarkdownDocumentModel.linkHoverScript,
+        MarkdownDocumentModel.checkboxToggleScript,
+        MarkdownDocumentModel.editorSyncScript,
+        MarkdownDocumentModel.commentScript,
+        MarkdownDocumentModel.contentUpdateScript,
+    ]
+
     /// Load markdown into a real WKWebView with all scripts injected, wait for it to finish.
+    /// Scripts are injected via evaluateJavaScript after page load (WKUserScript has issues
+    /// with IntersectionObserver and other APIs in headless test WKWebViews).
+    /// Each script is wrapped in try-catch to prevent one failure from blocking the rest.
     private func loadMarkdown(_ markdown: String) throws -> (html: String, model: MarkdownDocumentModel) {
         let url = writeTempFile(markdown, ext: "md")
         let model = MarkdownDocumentModel()
@@ -39,21 +112,24 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         let loadExpectation = expectation(description: "WebView loaded")
         webView.loadHTMLString(html, baseURL: nil)
 
-        // Inject scripts after load
-        let scripts = [
-            MarkdownDocumentModel.editorSyncScript,
-            MarkdownDocumentModel.commentScript,
-            MarkdownDocumentModel.commentsSidebarScript,
-            MarkdownDocumentModel.sidebarArrangeScript
-        ]
-
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            for script in scripts {
-                self.webView.evaluateJavaScript(script) { _, _ in }
+            // Inject scripts sequentially via evaluateJavaScript.
+            // Each wrapped in try-catch so one failure doesn't block the rest.
+            var remaining = Self.coreScripts
+            func injectNext() {
+                guard !remaining.isEmpty else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        loadExpectation.fulfill()
+                    }
+                    return
+                }
+                let script = remaining.removeFirst()
+                let wrapped = "try { \(script) } catch(e) {}"
+                self.webView.evaluateJavaScript(wrapped) { _, _ in
+                    injectNext()
+                }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                loadExpectation.fulfill()
-            }
+            injectNext()
         }
         wait(for: [loadExpectation], timeout: 5.0)
         return (html, model)
@@ -412,28 +488,204 @@ final class EditorRendererSyncE2ETests: XCTestCase {
     // MARK: - E2E: sidebar and TOC structure in DOM
     // =========================================================================
 
-    func testSidebarContainerExistsInDOM() throws {
+    func testSidebarNotInDOM() throws {
         let (_, _) = try loadMarkdown("# Heading\n\nParagraph.")
         let exists = evalJS("document.getElementById('sidebar-container') !== null") as? Bool
-        XCTAssertTrue(exists ?? false, "Sidebar container should exist in DOM")
+        XCTAssertFalse(exists ?? true, "Sidebar should NOT be in DOM (native SwiftUI)")
     }
 
-    func testTOCPanelExistsInDOM() throws {
-        let (_, _) = try loadMarkdown("# Heading\n\nParagraph.")
-        let exists = evalJS("document.getElementById('toc-panel') !== null") as? Bool
-        XCTAssertTrue(exists ?? false, "TOC panel should exist")
+    func testHeadingDataScriptAssignsIDs() throws {
+        let (_, _) = try loadMarkdown("# Heading\n\nParagraph.\n\n## Sub\n\nMore.")
+        let rebuildFn = evalJS("typeof window.__rebuildHeadingData") as? String
+        XCTAssertEqual(rebuildFn, "function", "Heading data script should define __rebuildHeadingData")
+        let h1Id = evalJS("document.querySelector('h1')?.id") as? String
+        XCTAssertEqual(h1Id, "heading", "H1 should have slug ID assigned by heading data script")
     }
 
-    func testCommentsPanelExistsInDOM() throws {
-        let (_, _) = try loadMarkdown("# Heading\n\nParagraph.")
-        let exists = evalJS("document.getElementById('comments-panel') !== null") as? Bool
-        XCTAssertTrue(exists ?? false, "Comments panel should exist")
+    // =========================================================================
+    // MARK: - E2E: TOC heading IDs and navigation
+    // =========================================================================
+
+    func testTOCHeadingsHaveGitHubSlugIDs() throws {
+        let md = """
+        # Introduction
+
+        Some text.
+
+        ## Getting Started
+
+        More text.
+
+        ### TLS Termination
+
+        Details here.
+
+        ## Security & Auth
+
+        Auth details.
+        """
+        let (_, _) = try loadMarkdown(md)
+
+        // Verify all headings got slug IDs from the TOC script
+        let introID = evalJS("document.querySelector('h1')?.id") as? String
+        XCTAssertEqual(introID, "introduction", "H1 should have GitHub-style slug ID")
+
+        let gettingStartedID = evalJS("document.querySelector('h2')?.id") as? String
+        XCTAssertEqual(gettingStartedID, "getting-started", "H2 should have slug ID with dashes")
+
+        let tlsID = evalJS("document.querySelector('h3')?.id") as? String
+        XCTAssertEqual(tlsID, "tls-termination", "H3 should have slug ID")
+
+        let secAuthID = evalJS("document.querySelectorAll('h2')[1]?.id") as? String
+        // The & is stripped by the slug regex, leaving "security-auth" or "security--auth"
+        XCTAssertNotNil(secAuthID)
+        XCTAssertTrue(secAuthID!.contains("security"), "H2 with & should have slug ID containing 'security'")
     }
 
-    func testSidebarIconsExistInDOM() throws {
-        let (_, _) = try loadMarkdown("# Heading\n\nParagraph.")
-        let iconCount = evalJS("document.querySelectorAll('.sidebar-icon').length") as? Int
-        XCTAssertEqual(iconCount, 2, "Should have 2 sidebar icons (TOC + Comments)")
+    func testHeadingDataScriptAssignsIDsToAllHeadings() throws {
+        let md = """
+        # Title
+
+        Text.
+
+        ## Section One
+
+        Text.
+
+        ## Section Two
+
+        Text.
+
+        ### Subsection
+
+        Text.
+        """
+        let (_, _) = try loadMarkdown(md)
+
+        // headingDataScript should assign slug IDs to all headings
+        let h1Id = evalJS("document.querySelector('h1')?.id") as? String
+        XCTAssertEqual(h1Id, "title", "H1 should have slug ID")
+        let h2Count = evalJS("document.querySelectorAll('h2[id]').length") as? Int
+        XCTAssertEqual(h2Count, 2, "Both H2s should have IDs")
+        let h3Id = evalJS("document.querySelector('h3')?.id") as? String
+        XCTAssertEqual(h3Id, "subsection", "H3 should have slug ID")
+    }
+
+    func testHeadingSlugIDsAreCorrect() throws {
+        let md = """
+        # Main Title
+
+        Intro.
+
+        ## First Section
+
+        Content.
+        """
+        let (_, _) = try loadMarkdown(md)
+
+        let firstID = evalJS("document.querySelector('h1')?.id") as? String
+        XCTAssertEqual(firstID, "main-title", "H1 should have slug 'main-title'")
+
+        let secondID = evalJS("document.querySelector('h2')?.id") as? String
+        XCTAssertEqual(secondID, "first-section", "H2 should have slug 'first-section'")
+    }
+
+    func testAnchorLinksAddedToHeadings() throws {
+        let md = "# Hello World\n\nText.\n\n## Sub Heading\n\nMore text."
+        let (_, _) = try loadMarkdown(md)
+
+        // Re-run anchor links setup — in test env script execution order isn't guaranteed
+        _ = evalJS("if(window.__setupAnchorLinks) __setupAnchorLinks()")
+
+        let anchorCount = evalJS("document.querySelectorAll('.heading-anchor').length") as? Int ?? 0
+        XCTAssertEqual(anchorCount, 2, "Each heading should get an anchor link")
+
+        let firstAnchorHref = evalJS("document.querySelector('.heading-anchor')?.getAttribute('href')") as? String
+        XCTAssertEqual(firstAnchorHref, "#hello-world")
+    }
+
+    func testScrollToFragmentViaElementId() throws {
+        // Build a document with multiple sections
+        let md = """
+        # Top Heading
+
+        Some intro text.
+
+        ## Target Section
+
+        Target content here.
+
+        ## Another Section
+
+        More content.
+        """
+
+        let (_, _) = try loadMarkdown(md)
+
+        // Verify the target heading exists with the right ID
+        let targetID = evalJS("document.getElementById('target-section')?.id") as? String
+        XCTAssertEqual(targetID, "target-section", "Target heading should have the correct slug ID")
+
+        // Verify scrollIntoView can be called without error (same JS as our didFinish handler)
+        let scrollResult = evalJS("""
+            (function() {
+                var el = document.getElementById('target-section');
+                if (!el) return 'not-found';
+                el.scrollIntoView({behavior:'auto'});
+                return 'ok';
+            })()
+        """) as? String
+        XCTAssertEqual(scrollResult, "ok", "scrollIntoView should execute without error")
+    }
+
+    func testPendingFragmentNotSetOnPlainLoad() throws {
+        // Verify that loading a file without a fragment doesn't set pendingFragment
+        let url = writeTempFile("# Test\n\nContent.", ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+        XCTAssertNil(model.pendingFragment, "Plain load should not set pendingFragment")
+    }
+
+    func testPendingFragmentSetOnNavigateTo() throws {
+        let url = writeTempFile("# Test\n\nContent.", ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+
+        // Simulate navigating to a URL with fragment
+        let fragmentURL = url.appendingPathComponent("").deletingLastPathComponent()
+            .appendingPathComponent(url.lastPathComponent)
+        var components = URLComponents(url: fragmentURL, resolvingAgainstBaseURL: false)!
+        components.fragment = "test-section"
+        let urlWithFragment = components.url!
+
+        model.navigateTo(urlWithFragment)
+        // pendingFragment should be set (it gets consumed by didFinish in the real app)
+        // Note: navigateTo calls load which resets html, triggering didFinish in real scenario
+        // Here we just verify the Swift side sets it correctly
+        XCTAssertEqual(model.pendingFragment, "test-section",
+                       "navigateTo with fragment URL should set pendingFragment")
+    }
+
+    func testPendingFragmentNotSetOnFileWatcherReload() throws {
+        // Simulates what happens when a file watcher triggers a reload:
+        // load(from:) is called with the currentURL (which may have a fragment from a previous navigation).
+        // pendingFragment should NOT be set by load(from:).
+        let url = writeTempFile("# Test\n\nContent.", ext: "md")
+        let model = MarkdownDocumentModel()
+
+        // First navigate to set a fragment
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        components.fragment = "some-heading"
+        model.navigateTo(components.url!)
+
+        // Clear it (simulating didFinish consuming it)
+        model.pendingFragment = nil
+
+        // Simulate file watcher reload — calls load(from:) directly with currentURL
+        model.load(from: model.currentURL ?? url)
+
+        XCTAssertNil(model.pendingFragment,
+                     "File watcher reload (load(from:)) should NOT re-set pendingFragment")
     }
 
     // =========================================================================
@@ -850,5 +1102,199 @@ final class EditorRendererSyncE2ETests: XCTestCase {
                               "'\(item.word)' should be on a list item line, got: '\(lines[adjLine])'")
             }
         }
+    }
+
+    // MARK: - Incremental Content Update E2E Tests
+
+    /// Load markdown with morphdom + contentUpdateScript injected, for testing __updateContent.
+    /// Same as loadMarkdown but kept for backward compatibility — now uses allScripts too.
+    private func loadMarkdownWithUpdateScript(_ markdown: String) throws -> (html: String, model: MarkdownDocumentModel) {
+        return try loadMarkdown(markdown)
+    }
+
+    /// Push an incremental update to the WebView and wait for it to apply.
+    private func pushUpdate(newMarkdown: String) {
+        let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: newMarkdown)
+        let escaped = bodyHTML
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "`", with: "\\`")
+            .replacingOccurrences(of: "${", with: "\\${")
+        let js = "if(window.__updateContent) { __updateContent(`\(escaped)`); true } else { false }"
+        let result = evalJS(js)
+        XCTAssertEqual(result as? Bool, true, "__updateContent should be defined and return true")
+    }
+
+    /// Get the text content of the article.markdown-body element.
+    private func getArticleText() -> String {
+        let result = evalJS("document.querySelector('article.markdown-body')?.textContent || ''")
+        return result as? String ?? ""
+    }
+
+    /// Count elements matching a CSS selector inside the article.
+    private func countElements(_ selector: String) -> Int {
+        let js = "document.querySelectorAll('article.markdown-body \(selector)').length"
+        return evalJS(js) as? Int ?? 0
+    }
+
+    // MARK: - Tests
+
+    func testIncrementalUpdate_addParagraph() throws {
+        let initial = "# Hello\n\nWorld"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        let articleText = getArticleText()
+        XCTAssertTrue(articleText.contains("Hello"), "Initial render should contain 'Hello'")
+        XCTAssertTrue(articleText.contains("World"), "Initial render should contain 'World'")
+        XCTAssertFalse(articleText.contains("New paragraph"), "Should not contain 'New paragraph' initially")
+
+        pushUpdate(newMarkdown: "# Hello\n\nWorld\n\nNew paragraph")
+
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Hello"), "Should still contain 'Hello' after update")
+        XCTAssertTrue(updatedText.contains("World"), "Should still contain 'World' after update")
+        XCTAssertTrue(updatedText.contains("New paragraph"), "Should contain 'New paragraph' after update")
+    }
+
+    func testIncrementalUpdate_modifyHeading() throws {
+        let initial = "# Original Title\n\nSome text"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertEqual(countElements("h1"), 1, "Should have one h1 initially")
+        let initialText = getArticleText()
+        XCTAssertTrue(initialText.contains("Original Title"))
+
+        pushUpdate(newMarkdown: "# Updated Title\n\nSome text")
+
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Updated Title"), "Heading should be updated")
+        XCTAssertFalse(updatedText.contains("Original Title"), "Old heading should be gone")
+        XCTAssertEqual(countElements("h1"), 1, "Should still have exactly one h1")
+    }
+
+    func testIncrementalUpdate_addListItems() throws {
+        let initial = "# List\n\n- Item 1\n- Item 2"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertEqual(countElements("li"), 2, "Should have 2 list items initially")
+
+        pushUpdate(newMarkdown: "# List\n\n- Item 1\n- Item 2\n- Item 3\n- Item 4")
+
+        XCTAssertEqual(countElements("li"), 4, "Should have 4 list items after update")
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Item 3"))
+        XCTAssertTrue(updatedText.contains("Item 4"))
+    }
+
+    func testIncrementalUpdate_removeContent() throws {
+        let initial = "# Title\n\nParagraph one\n\nParagraph two\n\nParagraph three"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertEqual(countElements("p"), 3, "Should have 3 paragraphs initially")
+
+        pushUpdate(newMarkdown: "# Title\n\nParagraph one")
+
+        XCTAssertEqual(countElements("p"), 1, "Should have 1 paragraph after removing content")
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Paragraph one"))
+        XCTAssertFalse(updatedText.contains("Paragraph two"))
+        XCTAssertFalse(updatedText.contains("Paragraph three"))
+    }
+
+    func testIncrementalUpdate_addCodeBlock() throws {
+        let initial = "# Code Example\n\nSome text"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertEqual(countElements("pre"), 0, "Should have no code blocks initially")
+
+        pushUpdate(newMarkdown: "# Code Example\n\nSome text\n\n```swift\nlet x = 42\n```")
+
+        XCTAssertEqual(countElements("pre"), 1, "Should have 1 code block after update")
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("let x = 42"), "Code content should appear")
+    }
+
+    func testIncrementalUpdate_multipleRapidUpdates() throws {
+        let initial = "# Counter\n\nValue: 0"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        for i in 1...5 {
+            pushUpdate(newMarkdown: "# Counter\n\nValue: \(i)")
+        }
+
+        let finalText = getArticleText()
+        XCTAssertTrue(finalText.contains("Value: 5"), "Should show the final update value")
+        XCTAssertFalse(finalText.contains("Value: 0"), "Should not show the initial value")
+    }
+
+    func testIncrementalUpdate_preservesHeadingStructure() throws {
+        let initial = "# H1\n\n## H2\n\n### H3\n\nParagraph"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertEqual(countElements("h1"), 1)
+        XCTAssertEqual(countElements("h2"), 1)
+        XCTAssertEqual(countElements("h3"), 1)
+
+        pushUpdate(newMarkdown: "# H1\n\n## H2\n\n### H3\n\nParagraph\n\n## Another H2\n\nMore text")
+
+        XCTAssertEqual(countElements("h1"), 1, "Should still have 1 h1")
+        XCTAssertEqual(countElements("h2"), 2, "Should now have 2 h2s")
+        XCTAssertEqual(countElements("h3"), 1, "Should still have 1 h3")
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Another H2"))
+        XCTAssertTrue(updatedText.contains("More text"))
+    }
+
+    func testIncrementalUpdate_withFrontmatter() throws {
+        let initial = "---\ntitle: Test\n---\n\n# Hello\n\nWorld"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        let initialText = getArticleText()
+        XCTAssertTrue(initialText.contains("Hello"))
+        XCTAssertTrue(initialText.contains("World"))
+
+        pushUpdate(newMarkdown: "---\ntitle: Test\n---\n\n# Hello\n\nWorld\n\nAdded after frontmatter")
+
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("Added after frontmatter"),
+                       "Content added after frontmatter should appear in renderer")
+    }
+
+    func testIncrementalUpdate_withComments() throws {
+        let initial = "# Doc\n\nSome <!-- COMMENT: note -->annotated<!-- /COMMENT --> text"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        let initialText = getArticleText()
+        XCTAssertTrue(initialText.contains("annotated"))
+
+        pushUpdate(newMarkdown: "# Doc\n\nSome <!-- COMMENT: note -->annotated<!-- /COMMENT --> text\n\nNew paragraph")
+
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("annotated"), "Comment-annotated text should survive update")
+        XCTAssertTrue(updatedText.contains("New paragraph"), "New content should appear")
+        XCTAssertEqual(countElements(".qmd-comment"), 1, "Comment mark should still exist")
+    }
+
+    func testIncrementalUpdate_emptyToContent() throws {
+        let initial = ""
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        pushUpdate(newMarkdown: "# New Document\n\nThis is fresh content")
+
+        let updatedText = getArticleText()
+        XCTAssertTrue(updatedText.contains("New Document"), "Content should appear from empty state")
+        XCTAssertTrue(updatedText.contains("fresh content"))
+    }
+
+    func testIncrementalUpdate_contentToEmpty() throws {
+        let initial = "# Title\n\nParagraph\n\n- List item"
+        _ = try loadMarkdownWithUpdateScript(initial)
+
+        XCTAssertTrue(getArticleText().contains("Title"))
+
+        pushUpdate(newMarkdown: "")
+
+        let updatedText = getArticleText().trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(updatedText.isEmpty || !updatedText.contains("Title"),
+                       "Content should be cleared after empty update")
     }
 }

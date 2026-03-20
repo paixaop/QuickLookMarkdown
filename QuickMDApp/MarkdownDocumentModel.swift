@@ -5,11 +5,67 @@ import os
 
 private let logger = Logger(subsystem: "com.pedro.QuickMDApp", category: "MarkdownModel")
 
+// MARK: - Sidebar Data Models
+
+struct TOCHeading: Identifiable, Equatable {
+    let id: String       // slug ID for scrolling in preview
+    let text: String     // heading text
+    let level: Int       // 1-6
+    let sourceLine: Int  // data-source-line value for editor jump
+}
+
+enum SidebarPanel: String, CaseIterable {
+    case toc, comments, files
+    var icon: String {
+        switch self {
+        case .toc: return "list.bullet"
+        case .comments: return "bubble.left"
+        case .files: return "folder"
+        }
+    }
+    var title: String {
+        switch self {
+        case .toc: return "Contents"
+        case .comments: return "Comments"
+        case .files: return "Files"
+        }
+    }
+}
+
+struct FileNode: Identifiable, Equatable {
+    let id: String       // full path for files, dir name for directories
+    let name: String
+    let isDirectory: Bool
+    let path: String
+    let children: [FileNode]
+
+    static func == (lhs: FileNode, rhs: FileNode) -> Bool {
+        lhs.id == rhs.id && lhs.name == rhs.name && lhs.isDirectory == rhs.isDirectory && lhs.children == rhs.children
+    }
+}
+
+struct ParsedComment: Identifiable, Equatable {
+    let id: Int          // index in source
+    let range: NSRange
+    let comment: String
+    let annotatedText: String
+
+    static func == (lhs: ParsedComment, rhs: ParsedComment) -> Bool {
+        lhs.id == rhs.id && lhs.range == rhs.range && lhs.comment == rhs.comment
+    }
+}
+
 final class MarkdownDocumentModel: ObservableObject {
     @Published var html: String?
     @Published var baseURL: URL?
     @Published var fileName: String?
     @Published var errorMessage: String?
+
+    // MARK: - Sidebar Data
+    @Published var tocHeadings: [TOCHeading] = []
+    @Published var activeTOCHeadingID: String? = nil
+    @Published var parsedComments: [ParsedComment] = []
+    @Published var fileTree: [FileNode] = []
 
     // MARK: - Directory Sandbox Bookmarks
 
@@ -77,7 +133,11 @@ final class MarkdownDocumentModel: ObservableObject {
         }
     }
 
-    private static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd"]
+    static let markdownExtensions: Set<String> = ["md", "markdown", "mdown", "mkd"]
+
+    static func isMarkdownExtension(_ ext: String) -> Bool {
+        markdownExtensions.contains(ext)
+    }
 
     private static let extensionToLanguage: [String: String] = [
         "json": "json", "yaml": "yaml", "yml": "yaml",
@@ -192,10 +252,87 @@ final class MarkdownDocumentModel: ObservableObject {
     }
     private var fileWatcherSource: DispatchSourceFileSystemObject?
 
+    // MARK: - File Tree for Sidebar
+
+    static func scanDirectoryForMarkdown(_ dirURL: URL) -> [[String: Any]] {
+        let fm = FileManager.default
+        let mdExts: Set<String> = ["md", "markdown", "mdown", "mkd"]
+        guard let items = try? fm.contentsOfDirectory(
+            at: dirURL, includingPropertiesForKeys: [.isDirectoryKey, .nameKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        let sorted = items.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+
+        var results: [[String: Any]] = []
+        for item in sorted {
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                let children = scanDirectoryForMarkdown(item)
+                if !children.isEmpty {
+                    results.append([
+                        "type": "dir",
+                        "name": item.lastPathComponent,
+                        "children": children
+                    ])
+                }
+            } else if mdExts.contains(item.pathExtension.lowercased()) {
+                results.append([
+                    "type": "file",
+                    "name": item.lastPathComponent,
+                    "path": item.path
+                ])
+            }
+        }
+        return results
+    }
+
+    // MARK: - Sidebar Data Refresh
+
+    /// Refresh parsed comments from current rawContent
+    func refreshParsedComments() {
+        let comments = Self.parseComments(in: rawContent)
+        parsedComments = comments.enumerated().map { idx, c in
+            ParsedComment(id: idx, range: c.range, comment: c.comment, annotatedText: c.annotatedText)
+        }
+    }
+
+    /// Refresh file tree from current file's directory
+    func refreshFileTree() {
+        guard let dirURL = currentURL?.deletingLastPathComponent() else {
+            fileTree = []
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let tree = Self.scanDirectoryForMarkdown(dirURL)
+            let nodes = Self.convertToFileNodes(tree)
+            DispatchQueue.main.async {
+                self?.fileTree = nodes
+            }
+        }
+    }
+
+    /// Convert scanDirectoryForMarkdown output to FileNode array
+    private static func convertToFileNodes(_ items: [[String: Any]]) -> [FileNode] {
+        items.compactMap { dict -> FileNode? in
+            guard let name = dict["name"] as? String,
+                  let type = dict["type"] as? String else { return nil }
+            if type == "dir" {
+                let children = (dict["children"] as? [[String: Any]]) ?? []
+                return FileNode(id: "dir:\(name)", name: name, isDirectory: true, path: "", children: convertToFileNodes(children))
+            } else {
+                let path = dict["path"] as? String ?? ""
+                return FileNode(id: path, name: name, isDirectory: false, path: path, children: [])
+            }
+        }
+    }
+
     // MARK: - Navigation History
 
     @Published var backStack: [URL] = []
     @Published var forwardStack: [URL] = []
+    /// Fragment (e.g. "tls-termination") to scroll to after next page load.
+    var pendingFragment: String?
     private var isNavigating = false
 
     var canGoBack: Bool { !backStack.isEmpty }
@@ -207,6 +344,7 @@ final class MarkdownDocumentModel: ObservableObject {
             backStack.append(current)
             forwardStack.removeAll()
         }
+        pendingFragment = url.fragment
         isNavigating = true
         load(from: url)
         isNavigating = false
@@ -422,9 +560,10 @@ final class MarkdownDocumentModel: ObservableObject {
         loadResource("highlight-github-dark", ext: "css", label: "highlight GitHub Dark CSS")
     }()
 
-    private static func loadResource(_ name: String, ext: String, label: String) -> String {
+    private static func loadResource(_ name: String, ext: String, subdirectory: String? = nil, label: String) -> String {
+        let subdir = subdirectory.map { "Resources/\($0)" } ?? "Resources"
         log("Loading \(label) from bundle...")
-        if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "Resources"),
+        if let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: subdir),
            let content = try? String(contentsOf: url, encoding: .utf8) {
             log("Loaded \(label): \(content.count) chars")
             return content
@@ -433,703 +572,41 @@ final class MarkdownDocumentModel: ObservableObject {
         return ""
     }
 
-    static let themeScript = """
-    (function() {
-      window.__setTheme = function(theme) {
-        var html = document.documentElement;
-        html.setAttribute('data-theme', theme);
-        if (theme === 'dark') { html.style.colorScheme = 'dark'; }
-        else if (theme === 'light') { html.style.colorScheme = 'light'; }
-        else { html.style.colorScheme = ''; }
-      };
-    })();
-    """
-
-    static let mermaidRenderScript = """
-    if (window.mermaid) {
-      var dt = document.documentElement.getAttribute('data-theme');
-      var mermaidTheme;
-      if (dt === 'dark') { mermaidTheme = 'dark'; }
-      else if (dt === 'light') { mermaidTheme = 'neutral'; }
-      else { mermaidTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'neutral'; }
-      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: mermaidTheme });
-      document.querySelectorAll('pre > code.language-mermaid').forEach(function(code, idx) {
-        var graphDefinition = code.textContent || '';
-        var host = document.createElement('div');
-        host.className = 'mermaid';
-        host.dataset.source = graphDefinition;
-        var pre = code.closest('pre');
-        if (pre) {
-          pre.replaceWith(host);
-          try {
-            mermaid.render('mermaid-' + idx + '-' + Date.now(), graphDefinition)
-              .then(function(result) { host.innerHTML = result.svg; })  // trusted local content from user's own markdown
-              .catch(function() { host.textContent = 'Mermaid render error'; });
-          } catch(e) { host.textContent = 'Mermaid render error'; }
-        }
-      });
+    private static func loadScript(_ name: String) -> String {
+        loadResource(name, ext: "js", subdirectory: "scripts", label: name)
     }
-    """
 
-    static let zoomOverlayScript = """
-    (function() {
-      var scale, panX, panY, overlay, content, zoomLabel, fitScale;
-      var dragging = false, didDrag = false, startX, startY, startPanX, startPanY;
-      function updateTransform() {
-        content.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
-        if (zoomLabel) zoomLabel.textContent = Math.round(scale * 100) + '%';
-      }
-      function setScale(s) { scale = Math.min(Math.max(s, 0.1), 10); updateTransform(); }
-      function closeOverlay() {
-        if (overlay) { overlay.remove(); overlay = null; }
-      }
-      function fitToScreen() {
-        if (!content || !overlay) return;
-        var el = content.querySelector('svg') || content.querySelector('img');
-        if (!el) return;
-        var vw = overlay.clientWidth * 0.85, vh = overlay.clientHeight * 0.85;
-        var sw, sh;
-        if (el.tagName === 'IMG') { sw = el.naturalWidth || el.width; sh = el.naturalHeight || el.height; }
-        else { sw = el.width.baseVal.value || el.getBoundingClientRect().width; sh = el.height.baseVal.value || el.getBoundingClientRect().height; }
-        if (sw > 0 && sh > 0) { fitScale = Math.min(vw / (sw + 48), vh / (sh + 48), 3); }
-        else { fitScale = 1; }
-        scale = fitScale; panX = 0; panY = 0; updateTransform();
-      }
-      function openOverlay(cloneEl) {
-        scale = 1; panX = 0; panY = 0; fitScale = 1;
-        overlay = document.createElement('div');
-        overlay.className = 'mermaid-overlay';
-        var controls = document.createElement('div');
-        controls.className = 'mermaid-overlay-controls';
-        var btnPlus = document.createElement('button');
-        btnPlus.textContent = '+';
-        btnPlus.title = 'Zoom in (+)';
-        btnPlus.addEventListener('click', function(ev) { ev.stopPropagation(); setScale(scale + 0.25); });
-        var btnMinus = document.createElement('button');
-        btnMinus.textContent = '\\u2212';
-        btnMinus.title = 'Zoom out (\\u2212)';
-        btnMinus.addEventListener('click', function(ev) { ev.stopPropagation(); setScale(scale - 0.25); });
-        zoomLabel = document.createElement('span');
-        zoomLabel.className = 'mermaid-overlay-zoom-label';
-        zoomLabel.textContent = '100%';
-        zoomLabel.title = 'Reset zoom';
-        zoomLabel.addEventListener('click', function(ev) {
-          ev.stopPropagation(); scale = 1; panX = 0; panY = 0; updateTransform();
-        });
-        var btnClose = document.createElement('button');
-        btnClose.textContent = '\\u00D7';
-        btnClose.title = 'Close (Esc)';
-        btnClose.addEventListener('click', function(ev) { ev.stopPropagation(); closeOverlay(); });
-        controls.appendChild(btnPlus);
-        controls.appendChild(btnMinus);
-        controls.appendChild(zoomLabel);
-        controls.appendChild(btnClose);
-        content = document.createElement('div');
-        content.className = 'mermaid-overlay-content';
-        content.appendChild(cloneEl);
-        content.addEventListener('click', function(ev) { ev.stopPropagation(); });
-        content.addEventListener('dblclick', function(ev) {
-          ev.stopPropagation();
-          if (Math.abs(scale - 1) < 0.01 && panX === 0 && panY === 0) { fitToScreen(); }
-          else { scale = 1; panX = 0; panY = 0; updateTransform(); }
-        });
-        content.addEventListener('mousedown', function(ev) {
-          ev.preventDefault(); ev.stopPropagation();
-          dragging = true; didDrag = false;
-          startX = ev.clientX; startY = ev.clientY;
-          startPanX = panX; startPanY = panY;
-          content.style.cursor = 'grabbing';
-        });
-        var viewport = document.createElement('div');
-        viewport.className = 'mermaid-overlay-viewport';
-        viewport.appendChild(content);
-        viewport.addEventListener('click', function(ev) { if (!didDrag) closeOverlay(); });
-        overlay.appendChild(controls);
-        overlay.appendChild(viewport);
-        document.body.appendChild(overlay);
-        setTimeout(fitToScreen, 50);
-      }
-      document.addEventListener('click', function(e) {
-        var mermaidDiv = e.target.closest('.mermaid');
-        if (mermaidDiv) {
-          var svg = mermaidDiv.querySelector('svg');
-          if (svg) openOverlay(svg.cloneNode(true));
-          return;
-        }
-        var img = e.target.closest('.markdown-body img');
-        if (img) {
-          var clone = img.cloneNode(true);
-          clone.style.maxWidth = '85vw';
-          clone.style.maxHeight = '80vh';
-          clone.style.display = 'block';
-          openOverlay(clone);
-        }
-      });
-      document.addEventListener('mousemove', function(e) {
-        if (!dragging) return;
-        var dx = e.clientX - startX, dy = e.clientY - startY;
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
-        panX = startPanX + dx; panY = startPanY + dy;
-        updateTransform();
-      });
-      document.addEventListener('mouseup', function() {
-        if (dragging) { dragging = false; if (content) content.style.cursor = 'grab'; }
-      });
-      document.addEventListener('wheel', function(e) {
-        if (!overlay) return;
-        e.preventDefault();
-        var delta = e.deltaY > 0 ? -0.1 : 0.1;
-        var rect = overlay.getBoundingClientRect();
-        var cx = e.clientX - rect.left - rect.width / 2;
-        var cy = e.clientY - rect.top - rect.height / 2;
-        var oldScale = scale;
-        setScale(scale + delta);
-        var ratio = scale / oldScale;
-        panX = cx - ratio * (cx - panX); panY = cy - ratio * (cy - panY);
-        updateTransform();
-      }, { passive: false });
-      document.addEventListener('keydown', function(e) {
-        if (!overlay) return;
-        var step = 40;
-        if (e.key === 'Escape') { closeOverlay(); }
-        else if (e.key === '+' || e.key === '=') { setScale(scale + 0.25); }
-        else if (e.key === '-' || e.key === '_') { setScale(scale - 0.25); }
-        else if (e.key === '0') { scale = 1; panX = 0; panY = 0; updateTransform(); }
-        else if (e.key === 'ArrowLeft') { panX += step; updateTransform(); }
-        else if (e.key === 'ArrowRight') { panX -= step; updateTransform(); }
-        else if (e.key === 'ArrowUp') { panY += step; updateTransform(); }
-        else if (e.key === 'ArrowDown') { panY -= step; updateTransform(); }
-      });
-    })();
-    """
+    static let themeScript = loadScript("theme")
 
-    static let highlightRenderScript = """
-    (function() {
-      document.querySelectorAll('pre > code.language-json').forEach(function(code) {
-        try {
-          var obj = JSON.parse(code.textContent);
-          code.textContent = JSON.stringify(obj, null, 2);
-        } catch(e) {}
-      });
-      if (window.jsyaml) {
-        document.querySelectorAll('pre > code.language-yaml, pre > code.language-yml').forEach(function(code) {
-          try {
-            var obj = jsyaml.load(code.textContent);
-            code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 });
-          } catch(e) {}
-        });
-      }
-      if (window.hljs) {
-        document.querySelectorAll('pre code').forEach(function(block) {
-          if (!block.classList.contains('language-mermaid')) {
-            block.dataset.rawText = block.textContent;
-            hljs.highlightElement(block);
-          }
-        });
-      }
-    })();
-    """
+    static let mermaidRenderScript = loadScript("mermaid-render")
 
-    static let copyButtonScript = """
-    (function() {
-      document.querySelectorAll('pre > code').forEach(function(code) {
-        if (code.classList.contains('language-mermaid')) return;
-        var pre = code.parentElement;
-        if (!pre || pre.querySelector('.copy-btn')) return;
-        pre.style.position = 'relative';
-        var btn = document.createElement('button');
-        btn.className = 'copy-btn';
-        btn.textContent = 'Copy';
-        btn.addEventListener('click', function(e) {
-          e.preventDefault();
-          e.stopPropagation();
-          var text = code.textContent || '';
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(function() {
-              btn.textContent = 'Copied!';
-              setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
-            }).catch(function() { fallbackCopy(text, btn); });
-          } else {
-            fallbackCopy(text, btn);
-          }
-        });
-        pre.appendChild(btn);
-      });
-      function fallbackCopy(text, btn) {
-        var ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        try {
-          document.execCommand('copy');
-          btn.textContent = 'Copied!';
-          setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
-        } catch(e) {}
-        document.body.removeChild(ta);
-      }
-    })();
-    """
+    static let zoomOverlayScript = loadScript("zoom-overlay")
 
-    static let katexRenderScript = """
-    (function() {
-      if (!window.renderMathInElement) return;
-      try {
-        renderMathInElement(document.body, {
-          output: 'mathml',
-          delimiters: [
-            { left: '$$', right: '$$', display: true },
-            { left: '$', right: '$', display: false },
-            { left: '\\\\(', right: '\\\\)', display: false },
-            { left: '\\\\[', right: '\\\\]', display: true }
-          ],
-          throwOnError: false
-        });
-      } catch(e) {}
-    })();
-    """
+    static let highlightRenderScript = loadScript("highlight-render")
 
-    static let readingStatsScript = """
-    (function() {
-      if (document.documentElement.getAttribute('data-filetype') !== 'markdown') return;
-      var body = document.querySelector('.markdown-body');
-      if (!body) return;
-      var text = body.textContent || '';
-      var words = text.trim().split(/\\s+/).filter(function(w) { return w.length > 0; }).length;
-      var minutes = Math.max(1, Math.round(words / 200));
-      var stats = document.createElement('div');
-      stats.className = 'reading-stats';
-      stats.textContent = words.toLocaleString() + ' words · ' + minutes + ' min read';
-      body.insertBefore(stats, body.firstChild);
-    })();
-    """
+    static let copyButtonScript = loadScript("copy-button")
 
-    // Zoom is handled natively via WKWebView.pageZoom (ZoomableWebView)
-    static let fontSizeScript = ""
+    static let katexRenderScript = loadScript("katex-render")
 
-    static let lineNumbersScript = """
-    (function() {
-      var pref = false;
-      try { pref = localStorage.getItem('line-numbers') === 'true'; } catch(e) {}
-      document.querySelectorAll('pre > code').forEach(function(code) {
-        if (code.classList.contains('language-mermaid') || code.classList.contains('language-dot') || code.classList.contains('language-graphviz')) return;
-        var text = code.innerHTML;
-        var lines = text.split('\\n');
-        if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-        code.innerHTML = lines.map(function(l) { return '<span class="code-line">' + l + '</span>'; }).join('');
-        if (pref) code.classList.add('has-line-numbers');
-      });
-      function toggle() {
-        var on = !document.querySelector('pre > code.has-line-numbers');
-        document.querySelectorAll('pre > code').forEach(function(code) {
-          if (code.classList.contains('language-mermaid') || code.classList.contains('language-dot') || code.classList.contains('language-graphviz')) return;
-          if (on) code.classList.add('has-line-numbers');
-          else code.classList.remove('has-line-numbers');
-        });
-        try { localStorage.setItem('line-numbers', on ? 'true' : 'false'); } catch(e) {}
-      }
-      window.__toggleLineNumbers = toggle;
-      document.addEventListener('keydown', function(e) {
-        if (e.metaKey && e.key === 'l') { e.preventDefault(); toggle(); }
-      });
-    })();
-    """
+    static let readingStatsScript = loadScript("reading-stats")
 
-    static let jumpToLineScript = """
-    (function() {
-      var bar = null;
-      function close() { if (bar) { bar.remove(); bar = null; } }
-      function openJump() {
-        if (bar) { close(); return; }
-        bar = document.createElement('div');
-        bar.id = 'jump-bar';
-        var inp = document.createElement('input');
-        inp.type = 'number'; inp.min = '1'; inp.placeholder = 'Line #';
-        bar.appendChild(inp);
-        document.body.appendChild(bar);
-        inp.focus();
-        inp.addEventListener('keydown', function(ev) {
-          if (ev.key === 'Escape') { close(); return; }
-          if (ev.key === 'Enter') {
-            var n = parseInt(inp.value);
-            if (!n || n < 1) return;
-            var lines = document.querySelectorAll('.code-line');
-            if (n > lines.length) n = lines.length;
-            var target = lines[n - 1];
-            if (target) {
-              target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              target.classList.add('line-flash');
-              setTimeout(function() { target.classList.remove('line-flash'); }, 1000);
-            }
-            close();
-          }
-        });
-      }
-      window.__jumpToLine = openJump;
-      document.addEventListener('keydown', function(e) {
-        if (e.metaKey && e.key === 'g') { e.preventDefault(); openJump(); }
-      });
-    })();
-    """
+    static let fontSizeScript: String = loadScript("font-size")
 
-    static let findScript = """
-    (function() {
-      var bar, input, counter, highlights = [], currentIdx = -1;
-      function clearHighlights() {
-        highlights.forEach(function(span) {
-          var parent = span.parentNode;
-          if (parent) { parent.replaceChild(document.createTextNode(span.textContent), span); parent.normalize(); }
-        });
-        highlights = []; currentIdx = -1;
-      }
-      function updateCounter() {
-        if (!counter) return;
-        if (highlights.length === 0) { counter.textContent = ''; return; }
-        counter.textContent = (currentIdx + 1) + '/' + highlights.length;
-      }
-      function scrollToCurrent() {
-        highlights.forEach(function(h) { h.className = 'find-highlight'; });
-        if (currentIdx >= 0 && currentIdx < highlights.length) {
-          highlights[currentIdx].className = 'find-highlight find-highlight-active';
-          highlights[currentIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-        updateCounter();
-      }
-      function doSearch(query) {
-        clearHighlights();
-        if (!query) { updateCounter(); return; }
-        var body = document.querySelector('.markdown-body') || document.body;
-        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
-        var textNodes = [];
-        while (walker.nextNode()) textNodes.push(walker.currentNode);
-        var lowerQ = query.toLowerCase();
-        textNodes.forEach(function(node) {
-          var text = node.textContent;
-          var lower = text.toLowerCase();
-          var idx = lower.indexOf(lowerQ);
-          if (idx === -1) return;
-          var frag = document.createDocumentFragment();
-          var pos = 0;
-          while (idx !== -1) {
-            if (idx > pos) frag.appendChild(document.createTextNode(text.substring(pos, idx)));
-            var span = document.createElement('span');
-            span.className = 'find-highlight';
-            span.textContent = text.substring(idx, idx + query.length);
-            frag.appendChild(span);
-            highlights.push(span);
-            pos = idx + query.length;
-            idx = lower.indexOf(lowerQ, pos);
-          }
-          if (pos < text.length) frag.appendChild(document.createTextNode(text.substring(pos)));
-          node.parentNode.replaceChild(frag, node);
-        });
-        if (highlights.length > 0) { currentIdx = 0; scrollToCurrent(); }
-        else { updateCounter(); }
-      }
-      function openBar() {
-        if (bar) { input.focus(); input.select(); return; }
-        bar = document.createElement('div');
-        bar.id = 'find-bar';
-        input = document.createElement('input');
-        input.type = 'text';
-        input.placeholder = 'Find...';
-        counter = document.createElement('span');
-        counter.className = 'find-counter';
-        var closeBtn = document.createElement('button');
-        closeBtn.textContent = '\\u00D7';
-        closeBtn.addEventListener('click', function() { closeBar(); });
-        bar.appendChild(input);
-        bar.appendChild(counter);
-        bar.appendChild(closeBtn);
-        document.body.appendChild(bar);
-        input.focus();
-        var debounce;
-        input.addEventListener('input', function() {
-          clearTimeout(debounce);
-          debounce = setTimeout(function() { doSearch(input.value); }, 150);
-        });
-        input.addEventListener('keydown', function(ev) {
-          if (ev.key === 'Escape') { closeBar(); return; }
-          if (ev.key === 'Enter') {
-            if (highlights.length === 0) return;
-            if (ev.shiftKey) { currentIdx = (currentIdx - 1 + highlights.length) % highlights.length; }
-            else { currentIdx = (currentIdx + 1) % highlights.length; }
-            scrollToCurrent();
-          }
-        });
-      }
-      function closeBar() {
-        clearHighlights();
-        if (bar) { bar.remove(); bar = null; }
-      }
-      window.__findOpen = openBar;
-      // Expose search API for SwiftUI search bar
-      window.__searchHighlight = function(query) { doSearch(query); return highlights.length; };
-      window.__searchNext = function() { if (highlights.length === 0) return -1; currentIdx = (currentIdx + 1) % highlights.length; scrollToCurrent(); return currentIdx; };
-      window.__searchPrev = function() { if (highlights.length === 0) return -1; currentIdx = (currentIdx - 1 + highlights.length) % highlights.length; scrollToCurrent(); return currentIdx; };
-      window.__searchClear = function() { clearHighlights(); };
-      window.__searchCount = function() { return highlights.length; };
-      window.__searchCurrentIndex = function() { return currentIdx; };
-      document.addEventListener('keydown', function(e) {
-        if (e.metaKey && e.key === 'f') { e.preventDefault(); openBar(); }
-      });
-    })();
-    """
+    static let lineNumbersScript = loadScript("line-numbers")
 
-    static let graphvizRenderScript = """
-    (function() {
-      if (typeof Viz === 'undefined') return;
-      var blocks = document.querySelectorAll('pre > code.language-dot, pre > code.language-graphviz');
-      if (blocks.length === 0) return;
-      Viz.instance().then(function(viz) {
-        blocks.forEach(function(code) {
-          var dot = code.textContent || '';
-          var pre = code.closest('pre');
-          if (!pre) return;
-          try {
-            var svg = viz.renderSVGElement(dot);
-            var host = document.createElement('div');
-            host.className = 'graphviz mermaid';
-            host.appendChild(svg);
-            pre.replaceWith(host);
-          } catch(e) {
-            var errDiv = document.createElement('div');
-            errDiv.className = 'graphviz-error';
-            errDiv.textContent = 'Graphviz error: ' + e.message;
-            pre.replaceWith(errDiv);
-          }
-        });
-      });
-    })();
-    """
+    static let jumpToLineScript = loadScript("jump-to-line")
 
-    private static let speakIconIdle = "<svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polygon points='11 5 6 9 2 9 2 15 6 15 11 19 11 5'/><path d='M19.07 4.93a10 10 0 0 1 0 14.14'/><path d='M15.54 8.46a5 5 0 0 1 0 7.07'/></svg>"
-    private static let speakIconPause = "<svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='6' y='4' width='4' height='16'/><rect x='14' y='4' width='4' height='16'/></svg>"
-    private static let speakIconPlay = "<svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polygon points='5 3 19 12 5 21 5 3'/></svg>"
+    static let findScript = loadScript("find")
 
-    static let speakScript = """
-    (function() {
-      if (typeof speechSynthesis === 'undefined') return;
-      var btn = document.createElement('button');
-      btn.id = 'speak-btn';
-      btn.innerHTML = '\(speakIconIdle)';
-      btn.title = 'Read aloud';
-      var state = 'idle';
-      function setState(s) {
-        state = s;
-        btn.classList.toggle('speaking', s === 'speaking');
-        btn.classList.toggle('paused', s === 'paused');
-        if (s === 'idle') btn.innerHTML = '\(speakIconIdle)';
-        else if (s === 'speaking') btn.innerHTML = '\(speakIconPause)';
-        else if (s === 'paused') btn.innerHTML = '\(speakIconPlay)';
-      }
-      function getText() {
-        var body = document.querySelector('.markdown-body');
-        return (body || document.body).textContent || '';
-      }
-      function stop() { speechSynthesis.cancel(); setState('idle'); }
-      function start() {
-        stop();
-        var utt = new SpeechSynthesisUtterance(getText());
-        utt.onend = function() { setState('idle'); };
-        speechSynthesis.speak(utt);
-        setState('speaking');
-      }
-      function pause() { speechSynthesis.pause(); setState('paused'); }
-      function resume() { speechSynthesis.resume(); setState('speaking'); }
-      var lastClick = 0;
-      btn.addEventListener('click', function() {
-        var now = Date.now();
-        if (now - lastClick < 350) { stop(); lastClick = 0; return; }
-        lastClick = now;
-        setTimeout(function() {
-          if (Date.now() - lastClick < 350) return;
-          if (state === 'idle') start();
-          else if (state === 'speaking') pause();
-          else if (state === 'paused') resume();
-        }, 360);
-      });
-      document.body.appendChild(btn);
-      window.__speak = { start: start, pause: pause, resume: resume, stop: stop };
-    })();
-    """
+    static let graphvizRenderScript = loadScript("graphviz-render")
 
-    static let tocScript = """
-    (function() {
-      var container = document.getElementById('sidebar-container');
-      if (!container) return;
-      var content = document.querySelector('.markdown-body');
-      if (!content) return;
-      var layout = document.getElementById('layout');
-      if (!layout) return;
+    static let speakScript = loadScript("speak")
 
-      // Expose __buildTOC for incremental updates
-      window.__buildTOC = function() {
-        var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
-        var tree = document.getElementById('toc-tree');
-        if (!tree) return;
-        tree.innerHTML = '';
-        if (headings.length === 0) {
-          // Don't hide sidebar if comments tab has content
-          var commentsPanel = document.getElementById('comments-panel');
-          var hasComments = commentsPanel && commentsPanel.querySelector('.comment-item');
-          if (!hasComments) {
-            container.classList.add('hidden');
-            layout.classList.remove('has-sidebar');
-          }
-          return;
-        }
-        container.classList.remove('hidden');
-        layout.classList.add('has-sidebar');
-        // Assign IDs
-        var slugCounts = {};
-        headings.forEach(function(h) {
-          var text = h.textContent || '';
-          var slug = text.toLowerCase().trim()
-            .replace(/[^\\w\\s-]/g, '').replace(/[\\s]+/g, '-').replace(/^-+|-+$/g, '');
-          if (!slug) slug = 'heading';
-          if (slugCounts[slug] != null) { slugCounts[slug]++; slug += '-' + slugCounts[slug]; }
-          else { slugCounts[slug] = 0; }
-          h.id = slug;
-        });
-        var items = [];
-        headings.forEach(function(h) {
-          items.push({ el: h, level: parseInt(h.tagName.charAt(1)), children: [] });
-        });
-        items.forEach(function(item, idx) {
-          var minLevel = items[0].level;
-          var indent = item.level - minLevel;
-          var hasChildren = (idx + 1 < items.length && items[idx + 1].level > item.level);
-          var row = document.createElement('div');
-          row.className = 'toc-item';
-          row.setAttribute('data-heading-id', item.el.id);
-          row.style.paddingLeft = (8 + indent * 14) + 'px';
-          var toggle = document.createElement('span');
-          toggle.className = 'toc-toggle';
-          if (hasChildren) {
-            toggle.textContent = '\\u25B6';
-            toggle.addEventListener('click', function(e) {
-              e.stopPropagation();
-              row.classList.toggle('collapsed');
-              var myLevel = item.level;
-              var sibling = row.nextElementSibling;
-              while (sibling && sibling.classList.contains('toc-item')) {
-                var sibLevel = parseInt(sibling.getAttribute('data-level'));
-                if (sibLevel <= myLevel) break;
-                sibling.style.display = row.classList.contains('collapsed') ? 'none' : 'flex';
-                sibling = sibling.nextElementSibling;
-              }
-            });
-          } else { toggle.classList.add('no-children'); }
-          row.appendChild(toggle);
-          var label = document.createElement('span');
-          label.className = 'toc-label';
-          label.textContent = item.el.textContent;
-          label.addEventListener('click', function() { item.el.scrollIntoView({ behavior: 'smooth' }); });
-          row.appendChild(label);
-          row.setAttribute('data-level', item.level);
-          tree.appendChild(row);
-        });
-        // Re-observe headings
-        if (window.__tocObserver) window.__tocObserver.disconnect();
-        var tocItems = tree.querySelectorAll('.toc-item');
-        window.__tocObserver = new IntersectionObserver(function(entries) {
-          entries.forEach(function(entry) {
-            if (entry.isIntersecting) {
-              tocItems.forEach(function(ti) { ti.classList.remove('active'); });
-              var id = entry.target.id;
-              var match = tree.querySelector('.toc-item[data-heading-id="' + id + '"]');
-              if (match) match.classList.add('active');
-            }
-          });
-        }, { root: content, rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
-        headings.forEach(function(h) { window.__tocObserver.observe(h); });
-      };
+    // MARK: - Heading Data Script (sends TOC data to Swift via bridge)
 
-      var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
-      if (headings.length === 0) {
-        container.classList.add('hidden');
-        layout.classList.remove('has-toc');
-        return;
-      }
-      layout.classList.add('has-toc');
-      // Assign IDs (GitHub-style slugs)
-      var slugCounts = {};
-      headings.forEach(function(h) {
-        var text = h.textContent || '';
-        var slug = text.toLowerCase().trim()
-          .replace(/[^\\w\\s-]/g, '').replace(/[\\s]+/g, '-').replace(/^-+|-+$/g, '');
-        if (!slug) slug = 'heading';
-        if (slugCounts[slug] != null) { slugCounts[slug]++; slug += '-' + slugCounts[slug]; }
-        else { slugCounts[slug] = 0; }
-        h.id = slug;
-      });
-      // Build tree
-      var tree = document.getElementById('toc-tree');
-      var items = [];
-      headings.forEach(function(h) {
-        var level = parseInt(h.tagName.charAt(1));
-        var item = { el: h, level: level, children: [] };
-        items.push(item);
-      });
-      // Render flat list with indentation
-      items.forEach(function(item, idx) {
-        var minLevel = items[0].level;
-        var indent = item.level - minLevel;
-        var hasChildren = (idx + 1 < items.length && items[idx + 1].level > item.level);
-        var row = document.createElement('div');
-        row.className = 'toc-item';
-        row.setAttribute('data-heading-id', item.el.id);
-        row.style.paddingLeft = (8 + indent * 14) + 'px';
-        var toggle = document.createElement('span');
-        toggle.className = 'toc-toggle';
-        if (hasChildren) {
-          toggle.textContent = '\\u25B6';
-          toggle.addEventListener('click', function(e) {
-            e.stopPropagation();
-            row.classList.toggle('collapsed');
-            // Toggle visibility of child items
-            var myLevel = item.level;
-            var sibling = row.nextElementSibling;
-            while (sibling && sibling.classList.contains('toc-item')) {
-              var sibLevel = parseInt(sibling.getAttribute('data-level'));
-              if (sibLevel <= myLevel) break;
-              sibling.style.display = row.classList.contains('collapsed') ? 'none' : 'flex';
-              sibling = sibling.nextElementSibling;
-            }
-          });
-        } else {
-          toggle.classList.add('no-children');
-        }
-        row.appendChild(toggle);
-        var label = document.createElement('span');
-        label.className = 'toc-label';
-        label.textContent = item.el.textContent;
-        label.addEventListener('click', function() {
-          item.el.scrollIntoView({ behavior: 'smooth' });
-        });
-        row.appendChild(label);
-        row.setAttribute('data-level', item.level);
-        tree.appendChild(row);
-      });
-      // Active heading tracking
-      var tocItems = tree.querySelectorAll('.toc-item');
-      var observer = new IntersectionObserver(function(entries) {
-        entries.forEach(function(entry) {
-          if (entry.isIntersecting) {
-            tocItems.forEach(function(ti) { ti.classList.remove('active'); });
-            var id = entry.target.id;
-            var match = tree.querySelector('.toc-item[data-heading-id=\"' + id + '\"]');
-            if (match) match.classList.add('active');
-          }
-        });
-      }, { root: content, rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
-      headings.forEach(function(h) { observer.observe(h); });
-      // Toggle and resize are handled by sidebarArrangeScript
-      }
-    })();
-    """
+    static let headingDataScript = loadScript("heading-data")
+
+    static let tocScript = loadScript("toc")
 
     // MARK: - Custom CSS Themes
 
@@ -1218,1090 +695,60 @@ final class MarkdownDocumentModel: ObservableObject {
 
     // MARK: - Word Wrap Toggle
 
-    static let wordWrapScript = """
-    (function() {
-      var wrapped = false;
-      function toggle() {
-        wrapped = !wrapped;
-        document.querySelectorAll('pre').forEach(function(pre) {
-          pre.style.whiteSpace = wrapped ? 'pre-wrap' : '';
-          pre.style.wordBreak = wrapped ? 'break-all' : '';
-        });
-      }
-      window.__toggleWordWrap = toggle;
-    })();
-    """
+    static let wordWrapScript = loadScript("word-wrap")
 
     // MARK: - Anchor Links
 
-    static let anchorLinksScript = """
-    (function() {
-      window.__setupAnchorLinks = function() {
-        var body = document.querySelector('.markdown-body');
-        if (!body) return;
-        body.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach(function(h) {
-          if (!h.id) return;
-          if (h.querySelector('.heading-anchor')) return;
-          var a = document.createElement('a');
-          a.className = 'heading-anchor';
-          a.href = '#' + h.id;
-          a.textContent = '#';
-          a.addEventListener('click', function(e) { e.stopPropagation(); });
-          h.insertBefore(a, h.firstChild);
-        });
-      };
-      __setupAnchorLinks();
-    })();
-    """
+    static let anchorLinksScript = loadScript("anchor-links")
 
     // MARK: - Emoji Shortcodes
 
-    static let emojiScript = """
-    (function() {
-      var map = {
-        '+1':'\\uD83D\\uDC4D','-1':'\\uD83D\\uDC4E','100':'\\uD83D\\uDCAF','1234':'\\uD83D\\uDD22',
-        'smile':'\\uD83D\\uDE04','laughing':'\\uD83D\\uDE06','blush':'\\uD83D\\uDE0A','smiley':'\\uD83D\\uDE03',
-        'relaxed':'\\u263A\\uFE0F','smirk':'\\uD83D\\uDE0F','heart_eyes':'\\uD83D\\uDE0D','kissing_heart':'\\uD83D\\uDE18',
-        'kissing':'\\uD83D\\uDE17','wink':'\\uD83D\\uDE09','stuck_out_tongue_winking_eye':'\\uD83D\\uDE1C',
-        'stuck_out_tongue':'\\uD83D\\uDE1B','flushed':'\\uD83D\\uDE33','grin':'\\uD83D\\uDE01',
-        'pensive':'\\uD83D\\uDE14','relieved':'\\uD83D\\uDE0C','unamused':'\\uD83D\\uDE12',
-        'disappointed':'\\uD83D\\uDE1E','persevere':'\\uD83D\\uDE23','cry':'\\uD83D\\uDE22',
-        'joy':'\\uD83D\\uDE02','sob':'\\uD83D\\uDE2D','sleepy':'\\uD83D\\uDE2A','sweat':'\\uD83D\\uDE13',
-        'cold_sweat':'\\uD83D\\uDE30','angry':'\\uD83D\\uDE20','rage':'\\uD83D\\uDE21',
-        'triumph':'\\uD83D\\uDE24','mask':'\\uD83D\\uDE37','sunglasses':'\\uD83D\\uDE0E',
-        'dizzy_face':'\\uD83D\\uDE35','imp':'\\uD83D\\uDC7F','neutral_face':'\\uD83D\\uDE10',
-        'no_mouth':'\\uD83D\\uDE36','innocent':'\\uD83D\\uDE07','alien':'\\uD83D\\uDC7D',
-        'yellow_heart':'\\uD83D\\uDC9B','blue_heart':'\\uD83D\\uDC99','purple_heart':'\\uD83D\\uDC9C',
-        'heart':'\\u2764\\uFE0F','green_heart':'\\uD83D\\uDC9A','broken_heart':'\\uD83D\\uDC94',
-        'heartbeat':'\\uD83D\\uDC93','heartpulse':'\\uD83D\\uDC97','sparkling_heart':'\\uD83D\\uDC96',
-        'star':'\\u2B50','star2':'\\uD83C\\uDF1F','sparkles':'\\u2728','sunny':'\\u2600\\uFE0F',
-        'cloud':'\\u2601\\uFE0F','zap':'\\u26A1','fire':'\\uD83D\\uDD25','snowflake':'\\u2744\\uFE0F',
-        'rainbow':'\\uD83C\\uDF08','ocean':'\\uD83C\\uDF0A','earth_americas':'\\uD83C\\uDF0E',
-        'moon':'\\uD83C\\uDF19','sun_with_face':'\\uD83C\\uDF1E',
-        'thumbsup':'\\uD83D\\uDC4D','thumbsdown':'\\uD83D\\uDC4E','ok_hand':'\\uD83D\\uDC4C',
-        'punch':'\\uD83D\\uDC4A','fist':'\\u270A','v':'\\u270C\\uFE0F','wave':'\\uD83D\\uDC4B',
-        'hand':'\\u270B','open_hands':'\\uD83D\\uDC50','point_up':'\\u261D\\uFE0F',
-        'point_down':'\\uD83D\\uDC47','point_left':'\\uD83D\\uDC48','point_right':'\\uD83D\\uDC49',
-        'raised_hands':'\\uD83D\\uDE4C','pray':'\\uD83D\\uDE4F','clap':'\\uD83D\\uDC4F',
-        'muscle':'\\uD83D\\uDCAA','metal':'\\uD83E\\uDD18','fu':'\\uD83D\\uDD95',
-        'walking':'\\uD83D\\uDEB6','runner':'\\uD83C\\uDFC3','dancer':'\\uD83D\\uDC83',
-        'couple':'\\uD83D\\uDC6B','family':'\\uD83D\\uDC6A','boy':'\\uD83D\\uDC66',
-        'girl':'\\uD83D\\uDC67','man':'\\uD83D\\uDC68','woman':'\\uD83D\\uDC69',
-        'cop':'\\uD83D\\uDC6E','angel':'\\uD83D\\uDC7C',
-        'dog':'\\uD83D\\uDC36','cat':'\\uD83D\\uDC31','mouse':'\\uD83D\\uDC2D','hamster':'\\uD83D\\uDC39',
-        'rabbit':'\\uD83D\\uDC30','bear':'\\uD83D\\uDC3B','panda_face':'\\uD83D\\uDC3C',
-        'pig':'\\uD83D\\uDC37','frog':'\\uD83D\\uDC38','monkey_face':'\\uD83D\\uDC35',
-        'chicken':'\\uD83D\\uDC14','penguin':'\\uD83D\\uDC27','bird':'\\uD83D\\uDC26',
-        'fish':'\\uD83D\\uDC1F','whale':'\\uD83D\\uDC33','bug':'\\uD83D\\uDC1B',
-        'snake':'\\uD83D\\uDC0D','turtle':'\\uD83D\\uDC22','bee':'\\uD83D\\uDC1D',
-        'cherry_blossom':'\\uD83C\\uDF38','rose':'\\uD83C\\uDF39','sunflower':'\\uD83C\\uDF3B',
-        'four_leaf_clover':'\\uD83C\\uDF40','seedling':'\\uD83C\\uDF31','evergreen_tree':'\\uD83C\\uDF32',
-        'palm_tree':'\\uD83C\\uDF34','cactus':'\\uD83C\\uDF35',
-        'apple':'\\uD83C\\uDF4E','green_apple':'\\uD83C\\uDF4F','banana':'\\uD83C\\uDF4C',
-        'grapes':'\\uD83C\\uDF47','watermelon':'\\uD83C\\uDF49','strawberry':'\\uD83C\\uDF53',
-        'lemon':'\\uD83C\\uDF4B','peach':'\\uD83C\\uDF51','pizza':'\\uD83C\\uDF55',
-        'hamburger':'\\uD83C\\uDF54','fries':'\\uD83C\\uDF5F','egg':'\\uD83C\\uDF73',
-        'coffee':'\\u2615','tea':'\\uD83C\\uDF75','beer':'\\uD83C\\uDF7A','wine_glass':'\\uD83C\\uDF77',
-        'tada':'\\uD83C\\uDF89','balloon':'\\uD83C\\uDF88','gift':'\\uD83C\\uDF81',
-        'trophy':'\\uD83C\\uDFC6','medal_sports':'\\uD83C\\uDFC5',
-        'rocket':'\\uD83D\\uDE80','airplane':'\\u2708\\uFE0F','car':'\\uD83D\\uDE97',
-        'bike':'\\uD83D\\uDEB2','ship':'\\uD83D\\uDEA2','train':'\\uD83D\\uDE82',
-        'house':'\\uD83C\\uDFE0','school':'\\uD83C\\uDFEB','office':'\\uD83C\\uDFE2',
-        'hospital':'\\uD83C\\uDFE5','church':'\\u26EA','tent':'\\u26FA',
-        'watch':'\\u231A','phone':'\\u260E\\uFE0F','computer':'\\uD83D\\uDCBB','bulb':'\\uD83D\\uDCA1',
-        'battery':'\\uD83D\\uDD0B','key':'\\uD83D\\uDD11','lock':'\\uD83D\\uDD12',
-        'unlock':'\\uD83D\\uDD13','bell':'\\uD83D\\uDD14','bookmark':'\\uD83D\\uDD16',
-        'link':'\\uD83D\\uDD17','wrench':'\\uD83D\\uDD27','hammer':'\\uD83D\\uDD28',
-        'scissors':'\\u2702\\uFE0F','pushpin':'\\uD83D\\uDCCC','paperclip':'\\uD83D\\uDCCE',
-        'pencil2':'\\u270F\\uFE0F','memo':'\\uD83D\\uDCDD','book':'\\uD83D\\uDCD6',
-        'books':'\\uD83D\\uDCDA','newspaper':'\\uD83D\\uDCF0','calendar':'\\uD83D\\uDCC5',
-        'chart_with_upwards_trend':'\\uD83D\\uDCC8','chart_with_downwards_trend':'\\uD83D\\uDCC9',
-        'email':'\\u2709\\uFE0F','inbox_tray':'\\uD83D\\uDCE5','outbox_tray':'\\uD83D\\uDCE4',
-        'package':'\\uD83D\\uDCE6','mailbox':'\\uD83D\\uDCEB',
-        'warning':'\\u26A0\\uFE0F','x':'\\u274C','o':'\\u2B55','white_check_mark':'\\u2705',
-        'heavy_check_mark':'\\u2714\\uFE0F','heavy_multiplication_x':'\\u2716\\uFE0F',
-        'bangbang':'\\u203C\\uFE0F','question':'\\u2753','exclamation':'\\u2757',
-        'grey_question':'\\u2754','grey_exclamation':'\\u2755',
-        'recycle':'\\u267B\\uFE0F','beginner':'\\uD83D\\uDD30','trident':'\\uD83D\\uDD31',
-        'checkered_flag':'\\uD83C\\uDFC1','triangular_flag_on_post':'\\uD83D\\uDEA9',
-        'arrow_up':'\\u2B06\\uFE0F','arrow_down':'\\u2B07\\uFE0F','arrow_left':'\\u2B05\\uFE0F',
-        'arrow_right':'\\u27A1\\uFE0F','arrow_upper_left':'\\u2196\\uFE0F','arrow_upper_right':'\\u2197\\uFE0F',
-        'arrow_lower_left':'\\u2199\\uFE0F','arrow_lower_right':'\\u2198\\uFE0F',
-        'information_source':'\\u2139\\uFE0F','abc':'\\uD83D\\uDD24',
-        'thinking':'\\uD83E\\uDD14','eyes':'\\uD83D\\uDC40','skull':'\\uD83D\\uDC80',
-        'ghost':'\\uD83D\\uDC7B','see_no_evil':'\\uD83D\\uDE48','hear_no_evil':'\\uD83D\\uDE49',
-        'speak_no_evil':'\\uD83D\\uDE4A','sweat_smile':'\\uD83D\\uDE05','rofl':'\\uD83E\\uDD23',
-        'slightly_smiling_face':'\\uD83D\\uDE42','upside_down_face':'\\uD83D\\uDE43',
-        'nerd_face':'\\uD83E\\uDD13','party_popper':'\\uD83C\\uDF89',
-        'raised_eyebrow':'\\uD83E\\uDD28','shrug':'\\uD83E\\uDD37','facepalm':'\\uD83E\\uDD26',
-        'wave_dash':'\\u3030\\uFE0F','copyright':'\\u00A9\\uFE0F','registered':'\\u00AE\\uFE0F',
-        'tm':'\\u2122\\uFE0F','infinity':'\\u267E\\uFE0F',
-        'art':'\\uD83C\\uDFA8','musical_note':'\\uD83C\\uDFB5','microphone':'\\uD83C\\uDFA4',
-        'headphones':'\\uD83C\\uDFA7','guitar':'\\uD83C\\uDFB8','trumpet':'\\uD83C\\uDFBA',
-        'violin':'\\uD83C\\uDFBB','game_die':'\\uD83C\\uDFB2',
-        'soccer':'\\u26BD','basketball':'\\uD83C\\uDFC0','football':'\\uD83C\\uDFC8',
-        'baseball':'\\u26BE','tennis':'\\uD83C\\uDFBE','golf':'\\u26F3',
-        'tada_party':'\\uD83C\\uDF89','confetti_ball':'\\uD83C\\uDF8A',
-        'gem':'\\uD83D\\uDC8E','ring':'\\uD83D\\uDC8D','crown':'\\uD83D\\uDC51',
-        'moneybag':'\\uD83D\\uDCB0','dollar':'\\uD83D\\uDCB5','credit_card':'\\uD83D\\uDCB3',
-        'chart':'\\uD83D\\uDCB9','bomb':'\\uD83D\\uDCA3','boom':'\\uD83D\\uDCA5',
-        'zzz':'\\uD83D\\uDCA4','dash':'\\uD83D\\uDCA8','sweat_drops':'\\uD83D\\uDCA6',
-        'notes':'\\uD83C\\uDFB6','speech_balloon':'\\uD83D\\uDCAC','thought_balloon':'\\uD83D\\uDCAD',
-        'no_entry':'\\u26D4','no_entry_sign':'\\uD83D\\uDEAB','underage':'\\uD83D\\uDD1E',
-        'anger':'\\uD83D\\uDCA2','skull_and_crossbones':'\\u2620\\uFE0F'
-      };
-      var re = /:([a-z0-9_+-]+):/g;
-      window.__applyEmoji = function(container) {
-        var body = container || document.querySelector('.markdown-body') || document.body;
-        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
-          acceptNode: function(node) {
-            var p = node.parentNode;
-            while (p && p !== body) {
-              var tag = p.tagName;
-              if (tag === 'PRE' || tag === 'CODE' || tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
-              p = p.parentNode;
-            }
-            return NodeFilter.FILTER_ACCEPT;
-          }
-        });
-        var nodes = [];
-        while (walker.nextNode()) nodes.push(walker.currentNode);
-        nodes.forEach(function(node) {
-          var text = node.textContent;
-          if (!re.test(text)) return;
-          re.lastIndex = 0;
-          var newText = text.replace(re, function(match, code) {
-            return map[code] || match;
-          });
-          if (newText !== text) node.textContent = newText;
-        });
-      };
-      __applyEmoji();
-    })();
-    """
+    static let emojiScript = loadScript("emoji")
 
     // MARK: - Footnotes
 
-    static let footnotesScript = """
-    (function() {
-      window.__setupFootnotes = function() {
-        var body = document.querySelector('.markdown-body');
-        if (!body) return;
-        // Remove existing footnotes section before rebuilding
-        var existing = body.querySelector('section.footnotes');
-        if (existing) existing.remove();
-      var defs = {};
-      var paras = body.querySelectorAll('p');
-      var defParas = [];
-      paras.forEach(function(p) {
-        var text = p.textContent || '';
-        var m = text.match(/^\\[\\^([^\\]]+)\\]:\\s*(.*)/s);
-        if (m) {
-          defs[m[1]] = m[2].trim();
-          defParas.push(p);
-        }
-      });
-      if (Object.keys(defs).length === 0) return;
-      var refCount = 0;
-      var refMap = {};
-      function processNode(node) {
-        var walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
-          acceptNode: function(n) {
-            var p = n.parentNode;
-            if (p.tagName === 'PRE' || p.tagName === 'CODE' || p.tagName === 'A') return NodeFilter.FILTER_REJECT;
-            return NodeFilter.FILTER_ACCEPT;
-          }
-        });
-        var textNodes = [];
-        while (walker.nextNode()) textNodes.push(walker.currentNode);
-        textNodes.forEach(function(tn) {
-          var text = tn.textContent;
-          if (text.indexOf('[^') === -1) return;
-          var parts = text.split(/(\\[\\^[^\\]]+\\])/);
-          if (parts.length <= 1) return;
-          var frag = document.createDocumentFragment();
-          parts.forEach(function(part) {
-            var rm = part.match(/^\\[\\^([^\\]]+)\\]$/);
-            if (rm && defs[rm[1]] !== undefined) {
-              var id = rm[1];
-              if (!refMap[id]) { refCount++; refMap[id] = refCount; }
-              var num = refMap[id];
-              var sup = document.createElement('sup');
-              sup.className = 'footnote-ref';
-              var a = document.createElement('a');
-              a.href = '#fn-' + id;
-              a.id = 'fnref-' + id;
-              a.textContent = num;
-              sup.appendChild(a);
-              frag.appendChild(sup);
-            } else {
-              frag.appendChild(document.createTextNode(part));
-            }
-          });
-          tn.parentNode.replaceChild(frag, tn);
-        });
-      }
-      processNode(body);
-      defParas.forEach(function(p) { p.remove(); });
-      var section = document.createElement('section');
-      section.className = 'footnotes';
-      var hr = document.createElement('hr');
-      section.appendChild(hr);
-      var ol = document.createElement('ol');
-      var keys = Object.keys(refMap).sort(function(a, b) { return refMap[a] - refMap[b]; });
-      keys.forEach(function(id) {
-        var li = document.createElement('li');
-        li.id = 'fn-' + id;
-        var textSpan = document.createElement('span');
-        textSpan.textContent = defs[id] + ' ';
-        li.appendChild(textSpan);
-        var backref = document.createElement('a');
-        backref.href = '#fnref-' + id;
-        backref.className = 'footnote-backref';
-        backref.textContent = '\\u21A9';
-        li.appendChild(backref);
-        ol.appendChild(li);
-      });
-      section.appendChild(ol);
-      body.appendChild(section);
-      };
-      __setupFootnotes();
-    })();
-    """
+    static let footnotesScript = loadScript("footnotes")
 
     // MARK: - Frontmatter
 
-    static let frontmatterScript = """
-    (function() {
-      window.__setupFrontmatter = function() {
-        // Remove existing banner before rebuilding
-        var existingBanner = document.querySelector('.frontmatter-banner');
-        if (existingBanner) existingBanner.remove();
-      var el = document.getElementById('frontmatter-data');
-      if (!el) return;
-      var raw = el.textContent;
-      if (!raw || !window.jsyaml) return;
-      try {
-        var data = jsyaml.load(raw);
-        if (!data || typeof data !== 'object') return;
-        var banner = document.createElement('div');
-        banner.className = 'frontmatter-banner';
-        if (data.title) {
-          var t = document.createElement('div');
-          t.className = 'frontmatter-title';
-          t.textContent = data.title;
-          banner.appendChild(t);
-        }
-        var meta = [];
-        if (data.author) meta.push(data.author);
-        if (data.date) meta.push(String(data.date));
-        if (meta.length > 0) {
-          var m = document.createElement('div');
-          m.className = 'frontmatter-meta';
-          m.textContent = meta.join(' \\u00B7 ');
-          banner.appendChild(m);
-        }
-        if (data.tags && Array.isArray(data.tags)) {
-          var tagsDiv = document.createElement('div');
-          tagsDiv.className = 'frontmatter-tags';
-          data.tags.forEach(function(tag) {
-            var pill = document.createElement('span');
-            pill.className = 'frontmatter-tag';
-            pill.textContent = tag;
-            tagsDiv.appendChild(pill);
-          });
-          banner.appendChild(tagsDiv);
-        }
-        var body = document.querySelector('.markdown-body');
-        if (body) {
-          var stats = body.querySelector('.reading-stats');
-          if (stats) body.insertBefore(banner, stats);
-          else body.insertBefore(banner, body.firstChild);
-        }
-      } catch(e) {}
-      };
-      __setupFrontmatter();
-    })();
-    """
+    static let frontmatterScript = loadScript("frontmatter")
 
     // MARK: - Presentation Mode
 
-    static let presentationScript = """
-    (function() {
-      var overlay, slides, currentSlide, counter;
-      function buildSlides() {
-        var body = document.querySelector('.markdown-body');
-        if (!body) return [];
-        var children = Array.from(body.children);
-        var result = [[]];
-        children.forEach(function(el) {
-          if (el.tagName === 'HR') { result.push([]); }
-          else { result[result.length - 1].push(el); }
-        });
-        return result.filter(function(s) { return s.length > 0; });
-      }
-      function showSlide(n) {
-        if (n < 0 || n >= slides.length) return;
-        currentSlide = n;
-        var content = overlay.querySelector('.pres-content');
-        while (content.firstChild) content.removeChild(content.firstChild);
-        slides[n].forEach(function(el) {
-          content.appendChild(el.cloneNode(true));
-        });
-        counter.textContent = (n + 1) + ' / ' + slides.length;
-      }
-      function start() {
-        slides = buildSlides();
-        if (slides.length === 0) return;
-        currentSlide = 0;
-        overlay = document.createElement('div');
-        overlay.className = 'pres-overlay';
-        var content = document.createElement('div');
-        content.className = 'pres-content';
-        counter = document.createElement('div');
-        counter.className = 'pres-counter';
-        var closeBtn = document.createElement('button');
-        closeBtn.className = 'pres-close';
-        closeBtn.textContent = '\\u00D7';
-        closeBtn.addEventListener('click', stop);
-        overlay.appendChild(content);
-        overlay.appendChild(counter);
-        overlay.appendChild(closeBtn);
-        document.body.appendChild(overlay);
-        showSlide(0);
-      }
-      function stop() {
-        if (overlay) { overlay.remove(); overlay = null; }
-      }
-      function next() { if (overlay && currentSlide < slides.length - 1) showSlide(currentSlide + 1); }
-      function prev() { if (overlay && currentSlide > 0) showSlide(currentSlide - 1); }
-      document.addEventListener('keydown', function(e) {
-        if (!overlay) return;
-        if (e.key === 'Escape') { stop(); }
-        else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
-        else if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
-      });
-      document.addEventListener('click', function(e) {
-        if (!overlay) return;
-        if (e.target === overlay || e.target.classList.contains('pres-content')) next();
-      });
-      window.__startPresentation = function() {
-        if (overlay) { stop(); } else { start(); }
-      };
-      window.__stopPresentation = stop;
-      window.__presentationActive = function() { return !!overlay; };
-    })();
-    """
+    static let presentationScript = loadScript("presentation")
 
     // Intercept link clicks via JS and forward to Swift, because WKWebView
     // may silently block file:// navigations from loadHTMLString pages
     // before decidePolicyFor is ever called.
-    static let linkClickScript = """
-    (function() {
-      document.addEventListener('click', function(e) {
-        var a = e.target.closest('a[href]');
-        if (!a) return;
-        var href = a.href;
-        if (!href) return;
-        // Let anchor links work normally
-        if (href.indexOf('#') === 0 || (a.getAttribute('href') || '').indexOf('#') === 0) return;
-        // Same-page anchor links
-        if (a.hash && a.pathname === location.pathname) return;
-        e.preventDefault();
-        e.stopPropagation();
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.linkClick) {
-          window.webkit.messageHandlers.linkClick.postMessage({ url: href });
-        }
-      }, true);
-    })();
-    """
+    static let linkClickScript = loadScript("link-click")
 
-    static let checkboxToggleScript = """
-    (function() {
-      window.__setupCheckboxes = function() {
-        var checkboxes = document.querySelectorAll('.markdown-body input[type="checkbox"]');
-        checkboxes.forEach(function(cb, index) {
-          cb.disabled = false;
-          cb.style.cursor = 'pointer';
-          cb.addEventListener('change', function(e) {
-            var checked = e.target.checked;
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.checkboxToggle) {
-              window.webkit.messageHandlers.checkboxToggle.postMessage({index: index, checked: checked});
-            }
-          });
-        });
-      };
-      __setupCheckboxes();
-    })();
-    """
+    static let linkHoverScript = loadScript("link-hover")
 
-    static let editorSyncScript = """
-    (function() {
-      var syncEnabled = true;
-      window.__editorSyncPause = function() { syncEnabled = false; };
-      window.__editorSyncResume = function() { syncEnabled = true; };
+    static let checkboxToggleScript = loadScript("checkbox-toggle")
 
-      // Determine the scroll container: .markdown-body when TOC layout is active,
-      // otherwise document.documentElement. The TOC layout sets overflow-y:auto on
-      // .markdown-body and overflow:hidden on html/body, so window scroll events
-      // never fire in that mode.
-      function getScrollContainer() {
-        var layout = document.getElementById('layout');
-        if (layout && (layout.classList.contains('has-sidebar') || layout.classList.contains('has-toc'))) {
-          return document.querySelector('.markdown-body') || document.documentElement;
-        }
-        return document.documentElement;
-      }
-
-      // Expose for Swift to scroll the renderer
-      window.__getScrollContainer = getScrollContainer;
-
-      // Report scroll fraction to Swift when the user scrolls the renderer
-      var scrollTimer = null;
-      function onScroll() {
-        if (!syncEnabled) return;
-        if (scrollTimer) clearTimeout(scrollTimer);
-        scrollTimer = setTimeout(function() {
-          var el = getScrollContainer();
-          var maxScroll = el.scrollHeight - el.clientHeight;
-          if (maxScroll <= 0) return;
-          var fraction = el.scrollTop / maxScroll;
-          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-            window.webkit.messageHandlers.editorSync.postMessage({type: 'scroll', fraction: fraction});
-          }
-        }, 30);
-      }
-
-      // Listen on both window and .markdown-body to cover both layouts
-      window.addEventListener('scroll', onScroll, {passive: true});
-      setTimeout(function() {
-        var mb = document.querySelector('.markdown-body');
-        if (mb) mb.addEventListener('scroll', onScroll, {passive: true});
-      }, 100);
-
-      // Expose a function for Swift to set scroll position on the correct container
-      window.__setScrollFraction = function(fraction) {
-        var el = getScrollContainer();
-        var maxScroll = el.scrollHeight - el.clientHeight;
-        if (maxScroll > 0) el.scrollTop = fraction * maxScroll;
-      };
-
-      // Double-click: find the clicked text and use data-source-line for precise mapping
-      document.addEventListener('dblclick', function(e) {
-        var sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) return;
-        var word = sel.toString().trim();
-        if (!word) return;
-
-        // Walk up to find nearest element with data-source-line
-        var el = sel.anchorNode;
-        while (el && el !== document.body) {
-          if (el.nodeType === 1 && el.hasAttribute('data-source-line')) break;
-          el = el.parentNode;
-        }
-
-        if (!el || !el.hasAttribute || !el.hasAttribute('data-source-line')) {
-          // Fallback: send without source line
-          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-            window.webkit.messageHandlers.editorSync.postMessage({
-              type: 'dblclick', word: word, sourceLine: -1, sourceCol: -1, offsetInBlock: -1
-            });
-          }
-          return;
-        }
-
-        var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
-        var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
-
-        // Character offset of clicked word within this block's text
-        var offsetInBlock = -1;
-        try {
-          var range = sel.getRangeAt(0);
-          var preRange = document.createRange();
-          preRange.setStart(el, 0);
-          preRange.setEnd(range.startContainer, range.startOffset);
-          offsetInBlock = preRange.toString().length;
-        } catch(ex) {}
-
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-          window.webkit.messageHandlers.editorSync.postMessage({
-            type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock
-          });
-        }
-      });
-    })();
-    """
+    static let editorSyncScript = loadScript("editor-sync")
 
     // MARK: - Comment interaction script
 
-    static let commentScript = """
-    (function() {
-      var currentTooltip = null;
-
-      function removeTooltip() {
-        if (currentTooltip) {
-          currentTooltip.remove();
-          currentTooltip = null;
-        }
-      }
-
-      function showTooltip(mark) {
-        removeTooltip();
-        var comment = mark.getAttribute('data-comment');
-        if (!comment) return;
-        var tip = document.createElement('div');
-        tip.className = 'qmd-comment-tooltip';
-        tip.textContent = comment;
-        mark.appendChild(tip);
-        currentTooltip = tip;
-        // Reposition if it overflows the viewport
-        var rect = tip.getBoundingClientRect();
-        if (rect.top < 0) {
-          tip.style.bottom = 'auto';
-          tip.style.top = 'calc(100% + 4px)';
-        }
-        if (rect.right > window.innerWidth) {
-          tip.style.left = 'auto';
-          tip.style.right = '0';
-        }
-      }
-
-      window.__setupComments = function() {
-        var marks = document.querySelectorAll('.qmd-comment');
-        marks.forEach(function(mark, index) {
-          mark.dataset.commentIndex = index;
-          mark.addEventListener('mouseenter', function() { showTooltip(mark); });
-          mark.addEventListener('mouseleave', function() { removeTooltip(); });
-          mark.addEventListener('click', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            removeTooltip();
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
-              window.webkit.messageHandlers.commentAction.postMessage({
-                type: 'click',
-                index: index,
-                comment: mark.getAttribute('data-comment') || '',
-                text: mark.textContent || ''
-              });
-            }
-            if (window.__highlightCommentInSidebar) __highlightCommentInSidebar(index);
-          });
-        });
-      };
-      __setupComments();
-
-      // Navigate between comments
-      window.__nextComment = function() {
-        var marks = document.querySelectorAll('.qmd-comment');
-        if (marks.length === 0) return;
-        var scrollEl = (window.__getScrollContainer ? __getScrollContainer() : document.documentElement);
-        var scrollTop = scrollEl.scrollTop;
-        for (var i = 0; i < marks.length; i++) {
-          if (marks[i].getBoundingClientRect().top > 20) {
-            marks[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
-            showTooltip(marks[i]);
-            setTimeout(removeTooltip, 2000);
-            return;
-          }
-        }
-        // Wrap around to first
-        marks[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
-        showTooltip(marks[0]);
-        setTimeout(removeTooltip, 2000);
-      };
-
-      window.__prevComment = function() {
-        var marks = document.querySelectorAll('.qmd-comment');
-        if (marks.length === 0) return;
-        for (var i = marks.length - 1; i >= 0; i--) {
-          if (marks[i].getBoundingClientRect().top < -5) {
-            marks[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
-            showTooltip(marks[i]);
-            setTimeout(removeTooltip, 2000);
-            return;
-          }
-        }
-        // Wrap around to last
-        marks[marks.length - 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
-        showTooltip(marks[marks.length - 1]);
-        setTimeout(removeTooltip, 2000);
-      };
-
-      // Get source line info for current selection (used by comment placement)
-      window.__getSelectionSourceInfo = function() {
-        var sel = window.getSelection();
-        if (!sel || sel.isCollapsed) return null;
-        var el = sel.anchorNode;
-        while (el && el !== document.body) {
-          if (el.nodeType === 1 && el.hasAttribute('data-source-line')) break;
-          el = el.parentNode;
-        }
-        if (!el || !el.hasAttribute || !el.hasAttribute('data-source-line')) return null;
-        var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
-        var offsetInBlock = -1;
-        try {
-          var range = sel.getRangeAt(0);
-          var preRange = document.createRange();
-          preRange.setStart(el, 0);
-          preRange.setEnd(range.startContainer, range.startOffset);
-          offsetInBlock = preRange.toString().length;
-        } catch(ex) {}
-        return { sourceLine: sourceLine, offsetInBlock: offsetInBlock, text: sel.toString().trim() };
-      };
-
-      // Helpers for native context menu integration
-      window.__getSelectionText = function() {
-        var sel = window.getSelection();
-        if (!sel || sel.isCollapsed) return '';
-        var article = document.querySelector('article.markdown-body');
-        if (!article) return '';
-        var node = sel.anchorNode;
-        while (node && node !== article) node = node.parentNode;
-        if (node !== article) return '';
-        return sel.toString().trim();
-      };
-
-      window.__getCommentAtPoint = function(x, y) {
-        var el = document.elementFromPoint(x, y);
-        if (!el) return null;
-        var mark = el.closest('.qmd-comment');
-        if (!mark) return null;
-        var index = parseInt(mark.dataset.commentIndex || '0');
-        return {
-          index: index,
-          comment: mark.getAttribute('data-comment') || '',
-          text: mark.textContent || ''
-        };
-      };
-    })();
-    """
+    static let commentScript = loadScript("comment")
 
     // MARK: - Comments sidebar script
 
-    static let commentsSidebarScript = """
-    (function() {
-      window.__buildCommentsList = function() {
-        var list = document.getElementById('comments-list');
-        if (!list) return;
-        list.innerHTML = '';
-        var marks = document.querySelectorAll('.qmd-comment');
-        var sidebar = document.getElementById('sidebar-container');
-        var layout = document.getElementById('layout');
-        if (marks.length === 0) {
-          // Update comments icon badge
-          var badge = document.querySelector('.sidebar-icon[data-panel="comments"] .comment-badge');
-          if (badge) badge.remove();
-          return;
-        }
-        // Show sidebar if comments exist
-        if (sidebar && layout) {
-          sidebar.classList.remove('hidden');
-          layout.classList.add('has-sidebar');
-        }
-        // Update badge count
-        var commentsIcon = document.querySelector('.sidebar-icon[data-panel="comments"]');
-        if (commentsIcon) {
-          var badge = commentsIcon.querySelector('.comment-badge');
-          if (!badge) {
-            badge = document.createElement('span');
-            badge.className = 'comment-badge';
-            commentsIcon.appendChild(badge);
-          }
-          badge.textContent = marks.length;
-        }
+    static let commentsSidebarScript = loadScript("comments-sidebar")
 
-        marks.forEach(function(mark, index) {
-          var item = document.createElement('div');
-          item.className = 'comment-item';
-          item.dataset.index = index;
+    // MARK: - Files sidebar script
 
-          var textEl = document.createElement('div');
-          textEl.className = 'comment-annotated';
-          var annotated = mark.textContent || '';
-          textEl.textContent = annotated.length > 60 ? annotated.substring(0, 57) + '...' : annotated;
-          textEl.title = annotated;
-          item.appendChild(textEl);
-
-          var commentEl = document.createElement('div');
-          commentEl.className = 'comment-text';
-          commentEl.textContent = mark.getAttribute('data-comment') || '';
-          item.appendChild(commentEl);
-
-          var actions = document.createElement('div');
-          actions.className = 'comment-actions';
-          var editBtn = document.createElement('button');
-          editBtn.className = 'comment-action-btn';
-          editBtn.textContent = '\\u270E';
-          editBtn.title = 'Edit comment';
-          editBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
-              window.webkit.messageHandlers.commentAction.postMessage({
-                type: 'click',
-                index: index,
-                comment: mark.getAttribute('data-comment') || '',
-                text: mark.textContent || ''
-              });
-            }
-          });
-          actions.appendChild(editBtn);
-
-          var delBtn = document.createElement('button');
-          delBtn.className = 'comment-action-btn comment-delete-btn';
-          delBtn.textContent = '\\u2715';
-          delBtn.title = 'Delete comment';
-          delBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
-              window.webkit.messageHandlers.commentAction.postMessage({
-                type: 'sidebarDelete',
-                index: index
-              });
-            }
-          });
-          actions.appendChild(delBtn);
-          item.appendChild(actions);
-
-          // Click to navigate
-          item.addEventListener('click', function() {
-            mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            mark.classList.add('qmd-comment-flash');
-            setTimeout(function() { mark.classList.remove('qmd-comment-flash'); }, 1500);
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.commentAction) {
-              window.webkit.messageHandlers.commentAction.postMessage({
-                type: 'sidebarClick',
-                index: index
-              });
-            }
-            __highlightCommentInSidebar(index);
-          });
-
-          list.appendChild(item);
-        });
-      };
-
-      window.__highlightCommentInSidebar = function(index) {
-        var list = document.getElementById('comments-list');
-        if (!list) return;
-        list.querySelectorAll('.comment-item').forEach(function(item) {
-          item.classList.toggle('active', parseInt(item.dataset.index) === index);
-        });
-        var active = list.querySelector('.comment-item.active');
-        if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      };
-
-      __buildCommentsList();
-    })();
-    """
+    static let filesBrowserScript = loadScript("files-browser")
 
     // MARK: - Sidebar arrange script
 
-    static let sidebarArrangeScript = """
-    (function() {
-      var container = document.getElementById('sidebar-container');
-      if (!container) return;
-      var layout = document.getElementById('layout');
-
-      // Icon tab switching
-      var icons = container.querySelectorAll('.sidebar-icon');
-      icons.forEach(function(icon) {
-        icon.addEventListener('click', function() {
-          var panel = icon.dataset.panel;
-          // If clicking the active icon, toggle sidebar collapse
-          if (icon.classList.contains('active') && !container.classList.contains('collapsed')) {
-            container.classList.add('collapsed');
-            return;
-          }
-          container.classList.remove('collapsed');
-          icons.forEach(function(i) { i.classList.remove('active'); });
-          icon.classList.add('active');
-          container.querySelectorAll('.sidebar-panel').forEach(function(p) {
-            p.classList.toggle('active', p.id === panel + '-panel');
-          });
-        });
-      });
-
-      // Resize handle
-      var resize = document.getElementById('sidebar-resize');
-      if (resize) {
-        resize.addEventListener('mousedown', function(e) {
-          e.preventDefault();
-          if (container.classList.contains('collapsed')) return;
-          var startX = e.clientX, startW = container.offsetWidth;
-          resize.classList.add('dragging');
-          document.body.classList.add('sidebar-resizing');
-          function onMove(ev) {
-            var nw = Math.max(100, Math.min(startW + (ev.clientX - startX), window.innerWidth * 0.5));
-            container.style.width = nw + 'px';
-          }
-          function onUp() {
-            resize.classList.remove('dragging');
-            document.body.classList.remove('sidebar-resizing');
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-          }
-          document.addEventListener('mousemove', onMove);
-          document.addEventListener('mouseup', onUp);
-        });
-      }
-
-      // Show sidebar when comments are added (switch to comments tab)
-      window.__showCommentsPanel = function() {
-        if (!container) return;
-        container.classList.remove('collapsed');
-        icons.forEach(function(i) { i.classList.remove('active'); });
-        var commentsIcon = container.querySelector('.sidebar-icon[data-panel="comments"]');
-        if (commentsIcon) commentsIcon.classList.add('active');
-        container.querySelectorAll('.sidebar-panel').forEach(function(p) {
-          p.classList.toggle('active', p.id === 'comments-panel');
-        });
-      };
-
-      // Toggle sidebar visibility
-      window.__toggleSidebar = function() {
-        if (!container || !layout) return;
-        if (container.classList.contains('hidden')) {
-          container.classList.remove('hidden');
-          layout.classList.add('has-sidebar');
-        } else {
-          container.classList.add('hidden');
-          layout.classList.remove('has-sidebar');
-        }
-      };
-    })();
-    """
+    static let sidebarArrangeScript = loadScript("sidebar-arrange")
 
     /// Incremental content update: replaces article content and re-runs post-processing scripts.
     /// This avoids a full page reload which causes flickering during live editing.
     /// Note: The HTML is generated from the user's own markdown via the Down library (trusted content),
     /// and is injected via evaluateJavaScript from Swift — not from external/untrusted sources.
-    static let contentUpdateScript = """
-    (function() {
-      // Helper: highlight a single code block (pretty-print + hljs)
-      function highlightCode(code) {
-        if (code.classList.contains('language-json')) {
-          try { var obj = JSON.parse(code.textContent); code.textContent = JSON.stringify(obj, null, 2); } catch(e) {}
-        }
-        if ((code.classList.contains('language-yaml') || code.classList.contains('language-yml')) && window.jsyaml) {
-          try { var obj = jsyaml.load(code.textContent); code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 }); } catch(e) {}
-        }
-        if (window.hljs && !code.classList.contains('language-mermaid')) {
-          code.dataset.rawText = code.textContent;
-          hljs.highlightElement(code);
-        }
-      }
-
-      // Helper: add copy button to a <pre> if not already present
-      function addCopyButton(pre) {
-        if (pre.querySelector('.copy-btn')) return;
-        var code = pre.querySelector('code');
-        if (!code || code.classList.contains('language-mermaid')) return;
-        pre.style.position = 'relative';
-        var btn = document.createElement('button');
-        btn.className = 'copy-btn';
-        btn.textContent = 'Copy';
-        btn.addEventListener('click', function(e) {
-          e.preventDefault(); e.stopPropagation();
-          var text = code.textContent || '';
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(function() {
-              btn.textContent = 'Copied!'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
-            });
-          }
-        });
-        pre.appendChild(btn);
-      }
-
-      // Helper: render a mermaid code block
-      function renderMermaid(code, idx) {
-        var graphDefinition = code.textContent || '';
-        var host = document.createElement('div');
-        host.className = 'mermaid';
-        host.dataset.source = graphDefinition;
-        var pre = code.closest('pre');
-        if (pre) {
-          pre.replaceWith(host);
-          try {
-            mermaid.render('mermaid-upd-' + idx + '-' + Date.now(), graphDefinition)
-              .then(function(result) { host.innerHTML = result.svg; })
-              .catch(function() { host.textContent = 'Mermaid render error'; });
-          } catch(e) { host.textContent = 'Mermaid render error'; }
-        }
-      }
-
-      window.__updateContent = function(html) {
-        var article = document.querySelector('article.markdown-body');
-        if (!article) return;
-        var scrollEl = document.scrollingElement || document.documentElement;
-        var savedScroll = scrollEl.scrollTop;
-
-        // Track what changed for selective post-processing
-        var changedCodeBlocks = [];
-        var changedMermaidBlocks = [];
-        var headingsChanged = false;
-        var anyNodeChanged = false;
-
-        if (typeof morphdom === 'function') {
-          // Build a temporary container to parse new HTML
-          var template = document.createElement('article');
-          template.className = article.className;
-          template.innerHTML = html;
-
-          // Pre-process: convert mermaid <pre><code> in template to <div class="mermaid" data-source="...">
-          // so morphdom can match them against already-rendered mermaid divs in the DOM
-          template.querySelectorAll('pre > code.language-mermaid').forEach(function(code) {
-            var src = code.textContent || '';
-            var div = document.createElement('div');
-            div.className = 'mermaid';
-            div.dataset.source = src;
-            div.textContent = src;
-            code.closest('pre').replaceWith(div);
-          });
-
-          // Apply emoji to template before morphing so text nodes match
-          if (window.__applyEmoji) __applyEmoji(template);
-
-          morphdom(article, template, {
-            childrenOnly: true,
-            onBeforeElUpdated: function(fromEl, toEl) {
-              // Skip already-highlighted code blocks whose raw text hasn't changed
-              if (fromEl.tagName === 'CODE' && fromEl.parentElement && fromEl.parentElement.tagName === 'PRE') {
-                if (fromEl.dataset.rawText && fromEl.dataset.rawText === toEl.textContent) {
-                  return false;
-                }
-              }
-              // Skip mermaid divs whose source hasn't changed
-              if (fromEl.classList && fromEl.classList.contains('mermaid') && fromEl.dataset.source) {
-                if (fromEl.dataset.source === toEl.dataset.source) {
-                  return false;
-                }
-              }
-              return true;
-            },
-            onElUpdated: function(el) {
-              anyNodeChanged = true;
-              if (el.tagName === 'CODE' && el.parentElement && el.parentElement.tagName === 'PRE') {
-                changedCodeBlocks.push(el);
-              }
-              if (el.classList && el.classList.contains('mermaid') && el.dataset.source) {
-                changedMermaidBlocks.push(el);
-              }
-              if (/^H[1-6]$/.test(el.tagName)) headingsChanged = true;
-            },
-            onNodeAdded: function(node) {
-              anyNodeChanged = true;
-              if (node.nodeType !== 1) return node;
-              if (node.tagName === 'CODE' && node.parentElement && node.parentElement.tagName === 'PRE') {
-                changedCodeBlocks.push(node);
-              }
-              if (node.tagName === 'PRE') {
-                var code = node.querySelector('code');
-                if (code) changedCodeBlocks.push(code);
-              }
-              if (node.classList && node.classList.contains('mermaid') && node.dataset.source) {
-                changedMermaidBlocks.push(node);
-              }
-              if (/^H[1-6]$/.test(node.tagName)) headingsChanged = true;
-              // Check children for headings
-              if (node.querySelectorAll) {
-                if (node.querySelectorAll('h1,h2,h3,h4,h5,h6').length > 0) headingsChanged = true;
-                node.querySelectorAll('pre > code').forEach(function(c) { changedCodeBlocks.push(c); });
-                node.querySelectorAll('.mermaid[data-source]').forEach(function(m) { changedMermaidBlocks.push(m); });
-              }
-              return node;
-            },
-            onBeforeNodeDiscarded: function(node) {
-              if (node.nodeType === 1 && /^H[1-6]$/.test(node.tagName)) headingsChanged = true;
-              return true;
-            }
-          });
-
-          // Selectively highlight only changed code blocks
-          changedCodeBlocks.forEach(function(code) {
-            if (!code.classList.contains('language-mermaid')) {
-              highlightCode(code);
-            }
-          });
-
-          // Add copy buttons to parents of changed code blocks + any new pres
-          changedCodeBlocks.forEach(function(code) {
-            var pre = code.closest('pre');
-            if (pre) addCopyButton(pre);
-          });
-
-          // Re-render only changed mermaid blocks
-          if (window.mermaid && changedMermaidBlocks.length > 0) {
-            var dt = document.documentElement.getAttribute('data-theme');
-            var mermaidTheme;
-            if (dt === 'dark') { mermaidTheme = 'dark'; }
-            else if (dt === 'light') { mermaidTheme = 'neutral'; }
-            else { mermaidTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'neutral'; }
-            mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: mermaidTheme });
-            changedMermaidBlocks.forEach(function(div, idx) {
-              var src = div.dataset.source || '';
-              try {
-                mermaid.render('mermaid-upd-' + idx + '-' + Date.now(), src)
-                  .then(function(result) { div.innerHTML = result.svg; })
-                  .catch(function() { div.textContent = 'Mermaid render error'; });
-              } catch(e) { div.textContent = 'Mermaid render error'; }
-            });
-          }
-
-          // Selective post-processing
-          if (window.__setupCheckboxes) __setupCheckboxes();
-          if (window.__setupComments) __setupComments();
-          if (window.__buildCommentsList) __buildCommentsList();
-          if (headingsChanged) {
-            if (window.__buildTOC) __buildTOC();
-            if (window.__setupAnchorLinks) __setupAnchorLinks();
-          }
-          if (window.__setupFootnotes) __setupFootnotes();
-          if (window.__setupFrontmatter) __setupFrontmatter();
-
-        } else {
-          // Fallback: no morphdom available, replace innerHTML
-          article.innerHTML = html;
-          if (window.__applyEmoji) __applyEmoji();
-
-          document.querySelectorAll('pre > code.language-json').forEach(function(code) {
-            try { var obj = JSON.parse(code.textContent); code.textContent = JSON.stringify(obj, null, 2); } catch(e) {}
-          });
-          if (window.jsyaml) {
-            document.querySelectorAll('pre > code.language-yaml, pre > code.language-yml').forEach(function(code) {
-              try { var obj = jsyaml.load(code.textContent); code.textContent = jsyaml.dump(obj, { indent: 2, lineWidth: -1 }); } catch(e) {}
-            });
-          }
-          if (window.hljs) {
-            document.querySelectorAll('pre code').forEach(function(block) {
-              if (!block.classList.contains('language-mermaid')) {
-                block.dataset.rawText = block.textContent;
-                hljs.highlightElement(block);
-              }
-            });
-          }
-          document.querySelectorAll('pre > code').forEach(function(code) {
-            if (code.classList.contains('language-mermaid')) return;
-            var pre = code.parentElement;
-            if (pre) addCopyButton(pre);
-          });
-          if (window.mermaid) {
-            document.querySelectorAll('pre > code.language-mermaid').forEach(function(code, idx) {
-              renderMermaid(code, idx);
-            });
-          }
-          if (window.__setupCheckboxes) __setupCheckboxes();
-          if (window.__setupComments) __setupComments();
-          if (window.__buildCommentsList) __buildCommentsList();
-          if (window.__buildTOC) __buildTOC();
-          if (window.__setupAnchorLinks) __setupAnchorLinks();
-          if (window.__setupFootnotes) __setupFootnotes();
-          if (window.__setupFrontmatter) __setupFrontmatter();
-        }
-
-        scrollEl.scrollTop = savedScroll;
-      };
-    })();
-    """
+    static let contentUpdateScript: String = loadScript("content-update")
 
     /// Toggle the nth task list checkbox in markdown source between [ ] and [x].
     static func toggleCheckbox(at index: Int, checked: Bool, in text: String) -> String {
@@ -2639,25 +1086,8 @@ final class MarkdownDocumentModel: ObservableObject {
     }
 
     private static func wrapHTML(_ body: String, isMarkdown: Bool) -> String {
-        let sidebarsMarkup = isMarkdown ? """
-            <div id="sidebar-container" role="navigation" aria-label="Document sidebar">
-              <div id="sidebar-icons">
-                <button class="sidebar-icon active" data-panel="toc" title="Contents" aria-label="Table of contents">&#9776;</button>
-                <button class="sidebar-icon" data-panel="comments" title="Comments" aria-label="Comments panel">&#128488;</button>
-              </div>
-              <div id="sidebar-panels">
-                <div id="toc-panel" class="sidebar-panel active" role="navigation" aria-label="Table of contents">
-                  <div id="toc-header">Contents</div>
-                  <div id="toc-tree"></div>
-                </div>
-                <div id="comments-panel" class="sidebar-panel" role="navigation" aria-label="Comments">
-                  <div id="comments-header">Comments</div>
-                  <div id="comments-list"></div>
-                </div>
-              </div>
-              <div id="sidebar-resize"></div>
-            </div>
-        """ : ""
+        // Sidebar markup removed — sidebars are now native SwiftUI views
+        let sidebarsMarkup = ""
 
         let fileType = isMarkdown ? "markdown" : "code"
         return """
@@ -2846,177 +1276,14 @@ final class MarkdownDocumentModel: ObservableObject {
               }
               html[data-theme="dark"] .reading-stats { color: #999; border-bottom-color: #444c56; }
               html[data-theme="light"] .reading-stats { color: #656d76; border-bottom-color: #d0d7de; }
-              /* Sidebar layout */
+              /* Layout */
               #layout { height: 100vh; }
-              #layout:has(#sidebar-container:not(.hidden)), #layout.has-sidebar { display: flex; overflow: hidden; }
-              #layout:has(#sidebar-container:not(.hidden)) .markdown-body, #layout.has-sidebar .markdown-body { flex: 1; overflow-y: auto; min-height: 0; }
-              html:has(#sidebar-container:not(.hidden)), body:has(#sidebar-container:not(.hidden)),
-              html:has(#layout.has-sidebar), body:has(#layout.has-sidebar) { height: 100vh; overflow: hidden; }
-              /* Unified sidebar container */
-              #sidebar-container {
-                position: relative;
-                width: 220px; min-width: 100px; max-width: 50vw;
-                height: 100vh;
-                border-right: 1px solid #d0d7de;
-                background: #f6f8fa;
-                font-size: 13px;
-                display: flex; flex-direction: column;
-              }
-              #sidebar-container.hidden { display: none; }
-              #sidebar-container.collapsed { width: 36px !important; min-width: 36px; overflow: hidden; }
-              #sidebar-container.collapsed #sidebar-panels { display: none; }
-              #sidebar-container.collapsed #sidebar-resize { display: none; }
-              /* Icon tab bar */
-              #sidebar-icons {
-                display: flex; flex-shrink: 0;
-                border-bottom: 1px solid #d0d7de;
-              }
-              .sidebar-icon {
-                flex: 1; background: none; border: none; cursor: pointer;
-                font-size: 16px; padding: 7px 0; text-align: center;
-                color: #656d76; border-bottom: 2px solid transparent;
-                transition: color 0.15s, border-color 0.15s;
-              }
-              .sidebar-icon:hover { color: #1f2328; background: rgba(0,0,0,0.04); }
-              .sidebar-icon.active { color: #0969da; border-bottom-color: #0969da; }
-              .sidebar-icon { position: relative; }
-              .comment-badge {
-                position: absolute; top: 2px; right: 4px;
-                background: #d4a017; color: #fff; font-size: 9px;
-                min-width: 14px; height: 14px; line-height: 14px;
-                border-radius: 7px; text-align: center; padding: 0 3px;
-              }
-              /* Panels */
-              #sidebar-panels { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
-              .sidebar-panel { display: none; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
-              .sidebar-panel.active { display: flex; }
-              /* Resize handle */
-              #sidebar-resize {
-                position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
-                cursor: col-resize; z-index: 10;
-              }
-              #sidebar-resize:hover, #sidebar-resize.dragging { background: rgba(9,105,218,0.3); }
-              body.sidebar-resizing { cursor: col-resize; user-select: none; }
-              /* TOC panel */
-              #toc-header, #comments-header {
-                font-weight: 600; padding: 4px 10px 8px; font-size: 12px;
-                text-transform: uppercase; letter-spacing: 0.5px; color: #656d76;
-                flex-shrink: 0;
-              }
-              #toc-tree { flex: 1; overflow-y: auto; }
-              .toc-item {
-                display: flex; align-items: center;
-                padding: 3px 8px; cursor: pointer;
-                border-left: 3px solid transparent;
-              }
-              .toc-item:hover { background: #e8e8e8; }
-              .toc-item.active { border-left-color: #0969da; background: #dbeafe; }
-              .toc-toggle {
-                font-size: 8px; width: 14px; text-align: center;
-                flex-shrink: 0; transition: transform 0.15s; cursor: pointer;
-                user-select: none; color: #656d76;
-              }
-              .toc-toggle.no-children { visibility: hidden; }
-              .toc-item.collapsed .toc-toggle { transform: rotate(0deg); }
-              .toc-item:not(.collapsed) .toc-toggle:not(.no-children) { transform: rotate(90deg); }
-              .toc-label {
-                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                flex: 1; padding-left: 4px;
-              }
-              /* Comments panel */
-              #comments-list { flex: 1; overflow-y: auto; }
-              .comment-item {
-                padding: 8px 10px; cursor: pointer;
-                border-left: 3px solid transparent;
-                border-bottom: 1px solid rgba(0,0,0,0.06);
-                position: relative;
-              }
-              .comment-item:hover { background: #e8e8e8; }
-              .comment-item.active { border-left-color: #d4a017; background: #fefce8; }
-              .comment-annotated {
-                font-size: 12px; color: #1f2328;
-                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-              }
-              .comment-text {
-                font-size: 11px; color: #656d76; margin-top: 2px;
-                overflow: hidden; text-overflow: ellipsis;
-                display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-              }
-              .comment-actions {
-                position: absolute; top: 4px; right: 4px;
-                display: none; gap: 2px;
-              }
-              .comment-item:hover .comment-actions { display: flex; }
-              .comment-action-btn {
-                background: none; border: 1px solid #d0d7de; border-radius: 4px;
-                cursor: pointer; font-size: 12px; padding: 1px 5px; color: #656d76;
-                line-height: 1.2;
-              }
-              .comment-action-btn:hover { background: #e8e8e8; color: #1f2328; }
-              .comment-delete-btn:hover { background: #ffebe9; color: #cf222e; border-color: #cf222e; }
+              /* Comment flash animation (in-content highlights) */
               .qmd-comment-flash { animation: comment-flash 1.5s ease; }
               @keyframes comment-flash {
                 0%, 100% { background: rgba(255, 213, 79, 0.3); }
                 25%, 75% { background: rgba(255, 213, 79, 0.7); }
               }
-              /* Dark mode */
-              @media (prefers-color-scheme: dark) {
-                #sidebar-container { background: #252526; border-right-color: #444c56; }
-                #sidebar-icons { border-bottom-color: #444c56; }
-                .sidebar-icon { color: #999; }
-                .sidebar-icon:hover { color: #d4d4d4; background: rgba(255,255,255,0.04); }
-                .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
-                #toc-header, #comments-header { color: #999; }
-                .toc-item:hover { background: #2d2d2d; }
-                .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
-                .toc-toggle { color: #999; }
-                #sidebar-resize:hover, #sidebar-resize.dragging { background: rgba(88,166,255,0.3); }
-                .comment-item:hover { background: #2d2d2d; }
-                .comment-item.active { background: #3a3000; border-left-color: #a08000; }
-                .comment-annotated { color: #d4d4d4; }
-                .comment-text { color: #999; }
-                .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
-                .comment-action-btn { border-color: #444c56; color: #999; }
-                .comment-action-btn:hover { background: #2d2d2d; color: #d4d4d4; }
-                .comment-delete-btn:hover { background: #3d1214; color: #f85149; border-color: #f85149; }
-              }
-              html[data-theme="dark"] #sidebar-container { background: #252526; border-right-color: #444c56; }
-              html[data-theme="dark"] #sidebar-icons { border-bottom-color: #444c56; }
-              html[data-theme="dark"] .sidebar-icon { color: #999; }
-              html[data-theme="dark"] .sidebar-icon:hover { color: #d4d4d4; background: rgba(255,255,255,0.04); }
-              html[data-theme="dark"] .sidebar-icon.active { color: #58a6ff; border-bottom-color: #58a6ff; }
-              html[data-theme="dark"] #toc-header, html[data-theme="dark"] #comments-header { color: #999; }
-              html[data-theme="dark"] .toc-item:hover { background: #2d2d2d; }
-              html[data-theme="dark"] .toc-item.active { background: #264f78; border-left-color: #58a6ff; }
-              html[data-theme="dark"] .toc-toggle { color: #999; }
-              html[data-theme="dark"] #sidebar-resize:hover,
-              html[data-theme="dark"] #sidebar-resize.dragging { background: rgba(88,166,255,0.3); }
-              html[data-theme="dark"] .comment-item:hover { background: #2d2d2d; }
-              html[data-theme="dark"] .comment-item.active { background: #3a3000; border-left-color: #a08000; }
-              html[data-theme="dark"] .comment-annotated { color: #d4d4d4; }
-              html[data-theme="dark"] .comment-text { color: #999; }
-              html[data-theme="dark"] .comment-item { border-bottom-color: rgba(255,255,255,0.06); }
-              html[data-theme="dark"] .comment-action-btn { border-color: #444c56; color: #999; }
-              html[data-theme="dark"] .comment-action-btn:hover { background: #2d2d2d; color: #d4d4d4; }
-              html[data-theme="dark"] .comment-delete-btn:hover { background: #3d1214; color: #f85149; border-color: #f85149; }
-              html[data-theme="light"] #sidebar-container { background: #f6f8fa; border-right-color: #d0d7de; }
-              html[data-theme="light"] #sidebar-icons { border-bottom-color: #d0d7de; }
-              html[data-theme="light"] .sidebar-icon { color: #656d76; }
-              html[data-theme="light"] .sidebar-icon:hover { color: #1f2328; }
-              html[data-theme="light"] .sidebar-icon.active { color: #0969da; border-bottom-color: #0969da; }
-              html[data-theme="light"] #toc-header, html[data-theme="light"] #comments-header { color: #656d76; }
-              html[data-theme="light"] .toc-item:hover { background: #e8e8e8; }
-              html[data-theme="light"] .toc-item.active { background: #dbeafe; border-left-color: #0969da; }
-              html[data-theme="light"] .toc-toggle { color: #656d76; }
-              html[data-theme="light"] #sidebar-resize:hover,
-              html[data-theme="light"] #sidebar-resize.dragging { background: rgba(9,105,218,0.3); }
-              html[data-theme="light"] .comment-item:hover { background: #e8e8e8; }
-              html[data-theme="light"] .comment-item.active { background: #fefce8; border-left-color: #d4a017; }
-              html[data-theme="light"] .comment-annotated { color: #1f2328; }
-              html[data-theme="light"] .comment-text { color: #656d76; }
-              html[data-theme="light"] .comment-action-btn { border-color: #d0d7de; color: #656d76; }
-              html[data-theme="light"] .comment-action-btn:hover { background: #e8e8e8; color: #1f2328; }
-              html[data-theme="light"] .comment-delete-btn:hover { background: #ffebe9; color: #cf222e; border-color: #cf222e; }
               html[data-theme="dark"] .markdown-body h1,
               html[data-theme="dark"] .markdown-body h2 { border-bottom-color: #444c56; }
               html[data-theme="dark"] .markdown-body blockquote { border-left-color: #444c56; color: #999; }
@@ -3176,12 +1443,11 @@ final class MarkdownDocumentModel: ObservableObject {
               html[data-theme="light"] #speak-btn:hover { background: #e8e8e8; color: #656d76; }
               /* Print stylesheet */
               @media print {
-                #sidebar-container, #toc-container, .copy-btn, #speak-btn, #find-bar, #jump-bar,
+                #toc-container, .copy-btn, #speak-btn, #find-bar, #jump-bar,
                 .reading-stats, .pres-overlay, .mermaid-overlay { display: none !important; }
                 body { background: white !important; color: black !important; }
                 .markdown-body { padding: 0 !important; }
                 #layout { display: block !important; height: auto !important; }
-                #layout.has-sidebar .markdown-body, #layout.has-toc .markdown-body { overflow: visible !important; }
                 h1, h2, h3, h4, h5, h6 { page-break-after: avoid; }
                 pre, table, blockquote, img { page-break-inside: avoid; }
                 a[href]::after { content: ' (' attr(href) ')'; font-size: 0.85em; color: #666; }
