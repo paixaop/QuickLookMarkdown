@@ -242,7 +242,12 @@ final class MarkdownDocumentModel: ObservableObject {
         isDirty = false
     }
 
+    /// True while setContent is writing to disk — suppresses file watcher reload.
+    private var isSelfWriting = false
+
     /// Set rawContent with undo support. Use for programmatic changes (AI, toolbar actions).
+    /// Does NOT trigger a full page reload — the onChange(of: rawContent) observer
+    /// pushes an incremental DOM update instead, preserving scroll position.
     func setContent(_ newContent: String, actionName: String = "AI Transform") {
         let oldContent = rawContent
         undoManager.registerUndo(withTarget: self) { target in
@@ -251,9 +256,21 @@ final class MarkdownDocumentModel: ObservableObject {
         undoManager.setActionName(actionName)
         rawContent = newContent
         if let url = currentURL {
-            try? newContent.write(to: url, atomically: true, encoding: .utf8)
+            isSelfWriting = true
+            do {
+                try newContent.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                Self.log("ERROR: Failed to write file: \(error.localizedDescription)")
+            }
+            // Reset after a brief delay to let file watcher event pass
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.isSelfWriting = false
+            }
         }
-        rerender()
+        // Update frontmatter line count (needed for source-line sync) without
+        // updating html (which would trigger a full page reload and scroll reset).
+        let (_, fm) = Self.stripFrontmatter(newContent)
+        frontmatterLineCount = fm != nil ? fm!.components(separatedBy: "\n").count + 2 : 0
     }
     private var fileWatcherSource: DispatchSourceFileSystemObject?
 
@@ -446,6 +463,8 @@ final class MarkdownDocumentModel: ObservableObject {
             queue: .main
         )
         source.setEventHandler { [weak self] in
+            // Skip if this is our own write (from setContent)
+            guard self?.isSelfWriting != true else { return }
             // Check if file was deleted
             guard FileManager.default.fileExists(atPath: url.path) else {
                 Self.log("File was deleted: \(url.path)")

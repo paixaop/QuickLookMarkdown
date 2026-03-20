@@ -154,11 +154,13 @@ class ZoomableWebView: WKWebView {
         evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { [weak self] result, _ in
             var sourceLine = -1
             var offsetInBlock = -1
+            var endOffsetInBlock = -1
             if let info = result as? [String: Any] {
                 sourceLine = info["sourceLine"] as? Int ?? -1
                 offsetInBlock = info["offsetInBlock"] as? Int ?? -1
+                endOffsetInBlock = info["endOffsetInBlock"] as? Int ?? -1
             }
-            self?.commentCoordinator?.showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock)
+            self?.commentCoordinator?.showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
         }
     }
 
@@ -176,6 +178,7 @@ class ZoomableWebView: WKWebView {
         guard let model = AppDelegate.activeModel else { return }
         let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
         model.setContent(updated, actionName: "Remove Comment")
+        ContentView.pushIncrementalUpdate(model: model)
     }
 }
 
@@ -203,14 +206,19 @@ class WebViewStore: ObservableObject {
 
     // MARK: - Shared tab navigation history (for back/forward across tabs)
 
+    // Tab history: the back stack's TOP element is always the CURRENT tab.
+    // goBackTab pops the current, then switches to the new top (the previous tab).
     @Published var tabBackStack: [URL] = []
     @Published var tabForwardStack: [URL] = []
-    var canGoBackTab: Bool { !tabBackStack.isEmpty }
+    var canGoBackTab: Bool { tabBackStack.count >= 2 }
     var canGoForwardTab: Bool { !tabForwardStack.isEmpty }
 
-    /// Track that a tab is being navigated away from (push current onto back stack, clear forward)
+    /// Track that a tab is being navigated away from (push current onto back stack, clear forward).
+    /// Skips if the URL is already at the top (onTabBecameActive may have pushed it already).
     func pushTabHistory(_ url: URL) {
-        tabBackStack.append(url)
+        if tabBackStack.last?.standardizedFileURL.path != url.standardizedFileURL.path {
+            tabBackStack.append(url)
+        }
         tabForwardStack.removeAll()
     }
 
@@ -218,10 +226,7 @@ class WebViewStore: ObservableObject {
     /// Ensures the active tab is tracked at the top of the back stack so that
     /// "back" always returns to the last *actually visited* tab.
     func onTabBecameActive(_ url: URL) {
-        let standardized = url.standardizedFileURL.path
-        // If the active tab is already the top of the back stack, nothing to do
-        if let top = tabBackStack.last, top.standardizedFileURL.path == standardized { return }
-        // Push to back stack (don't clear forward — this is a tab switch, not a new navigation)
+        if tabBackStack.last?.standardizedFileURL.path == url.standardizedFileURL.path { return }
         tabBackStack.append(url)
     }
 
@@ -229,13 +234,12 @@ class WebViewStore: ObservableObject {
     var isNavigatingHistory = false
 
     func goBackTab() {
-        guard let prev = tabBackStack.popLast() else { return }
-        if let current = currentTabURL() {
-            // Don't push current if it's the same as where we're going
-            if current.standardizedFileURL.path != prev.standardizedFileURL.path {
-                tabForwardStack.append(current)
-            }
-        }
+        // Top of stack is the current tab — pop it and push to forward
+        guard tabBackStack.count >= 2 else { return }
+        let current = tabBackStack.removeLast()
+        tabForwardStack.append(current)
+        // The new top is the previous tab — switch to it (don't pop, it stays as current)
+        let prev = tabBackStack.last!
         isNavigatingHistory = true
         switchToTab(prev)
         isNavigatingHistory = false
@@ -243,11 +247,8 @@ class WebViewStore: ObservableObject {
 
     func goForwardTab() {
         guard let next = tabForwardStack.popLast() else { return }
-        if let current = currentTabURL() {
-            if current.standardizedFileURL.path != next.standardizedFileURL.path {
-                tabBackStack.append(current)
-            }
-        }
+        // Push the next tab onto back stack (it becomes the new current)
+        tabBackStack.append(next)
         isNavigatingHistory = true
         switchToTab(next)
         isNavigatingHistory = false
@@ -362,15 +363,16 @@ struct WebView: NSViewRepresentable {
                     let sourceLine = body["sourceLine"] as? Int ?? -1
                     let sourceCol = body["sourceCol"] as? Int ?? -1
                     let offsetInBlock = body["offsetInBlock"] as? Int ?? -1
+                    let endOffsetInBlock = body["endOffsetInBlock"] as? Int ?? -1
 
                     // If editor is not visible, show it first, then jump after a delay
                     if findEditorTextView() == nil {
                         WebViewStore.shared.showEditorCallback?()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
-                            self.jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock)
+                            self.jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
                         }
                     } else {
-                        jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock)
+                        jumpEditorToWord(word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
                     }
                 }
 
@@ -466,87 +468,23 @@ struct WebView: NSViewRepresentable {
 
             WebViewStore.shared.suppressEditorToRenderer = true
             Self.scrollTextView(textView, toSourceLine: line, fractionPast: fractionPast, frontmatterLineCount: model.frontmatterLineCount, rawContent: model.rawContent)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 WebViewStore.shared.suppressEditorToRenderer = false
             }
         }
 
         // MARK: - Double-click → jump to word in editor
 
-        private func jumpEditorToWord(_ word: String, sourceLine: Int, sourceCol: Int, offsetInBlock: Int) {
+        private func jumpEditorToWord(_ word: String, sourceLine: Int, sourceCol: Int, offsetInBlock: Int, endOffsetInBlock: Int = -1) {
             guard let model = AppDelegate.activeModel,
                   let textView = findEditorTextView() else { return }
-            let source = model.rawContent
-            if let range = Self.findWordRange(word: word, in: source, sourceLine: sourceLine, offsetInBlock: offsetInBlock, frontmatterLineCount: model.frontmatterLineCount) {
+            guard sourceLine > 0, offsetInBlock >= 0, endOffsetInBlock > offsetInBlock else { return }
+            if let range = Self.sourceRangeFromRenderedOffsets(
+                sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock,
+                frontmatterLineCount: model.frontmatterLineCount, source: model.rawContent
+            ) {
                 selectAndReveal(range, in: textView)
             }
-        }
-
-        /// Find the NSRange of a word in the source text using source-line mapping.
-        /// Extracted as a static method for testability.
-        static func findWordRange(word: String, in source: String, sourceLine: Int, offsetInBlock: Int, frontmatterLineCount: Int) -> NSRange? {
-            let nsSource = source as NSString
-
-            // Find all occurrences of the word in source
-            var occurrences: [NSRange] = []
-            var searchStart = 0
-            while searchStart < nsSource.length {
-                let range = nsSource.range(of: word, options: [.caseInsensitive],
-                                           range: NSRange(location: searchStart, length: nsSource.length - searchStart))
-                if range.location == NSNotFound { break }
-                occurrences.append(range)
-                searchStart = range.location + range.length
-            }
-
-            guard !occurrences.isEmpty else { return nil }
-
-            // If only one occurrence, use it directly
-            if occurrences.count == 1 {
-                return occurrences[0]
-            }
-
-            // If we have a source line, use it for precise matching
-            if sourceLine > 0 {
-                let lines = source.components(separatedBy: "\n")
-                let adjustedLine = sourceLine + frontmatterLineCount - 1 // 0-based
-                guard adjustedLine >= 0 && adjustedLine < lines.count else {
-                    // Fallback to closest-to-middle
-                    let mid = nsSource.length / 2
-                    return occurrences.min(by: { abs($0.location - mid) < abs($1.location - mid) })
-                }
-
-                // Calculate character offset of this line
-                var lineCharOffset = 0
-                for i in 0..<adjustedLine {
-                    lineCharOffset += lines[i].count + 1 // +1 for newline
-                }
-
-                // Find the block's extent: from this line until the next blank line or heading
-                var blockEndOffset = lineCharOffset
-                for i in adjustedLine..<lines.count {
-                    let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
-                    if i > adjustedLine && (trimmed.isEmpty || trimmed.hasPrefix("#")) { break }
-                    blockEndOffset += lines[i].count + 1
-                }
-
-                // Filter occurrences to those within this block range (with small margin)
-                let blockOccurrences = occurrences.filter {
-                    $0.location >= max(0, lineCharOffset - 5) && $0.location < blockEndOffset + 5
-                }
-
-                if blockOccurrences.count == 1 {
-                    return blockOccurrences[0]
-                }
-
-                // Use offsetInBlock to pick the closest occurrence
-                let candidates = blockOccurrences.isEmpty ? occurrences : blockOccurrences
-                let targetPos = lineCharOffset + max(0, offsetInBlock)
-                return candidates.min(by: { abs($0.location - targetPos) < abs($1.location - targetPos) })
-            }
-
-            // Final fallback: pick occurrence nearest to document middle fraction
-            let mid = nsSource.length / 2
-            return occurrences.min(by: { abs($0.location - mid) < abs($1.location - mid) })
         }
 
         private func selectAndReveal(_ range: NSRange, in textView: NSTextView) {
@@ -558,7 +496,7 @@ struct WebView: NSViewRepresentable {
 
         // MARK: - Comment Editor
 
-        func showCommentEditor(index: Int, comment: String, annotatedText: String, isNew: Bool, sourceLine: Int = -1, offsetInBlock: Int = -1) {
+        func showCommentEditor(index: Int, comment: String, annotatedText: String, isNew: Bool, sourceLine: Int = -1, offsetInBlock: Int = -1, endOffsetInBlock: Int = -1) {
             guard !WebViewStore.shared.commentPanelOpen else { return }
             WebViewStore.shared.commentPanelOpen = true
             let panel = NSPanel(
@@ -584,10 +522,11 @@ struct WebView: NSViewRepresentable {
                     panel.close()
                     guard let model = AppDelegate.activeModel else { return }
                     if isNew {
-                        self.addCommentToSource(text: annotatedText, comment: newComment, model: model, sourceLine: sourceLine, offsetInBlock: offsetInBlock)
+                        self.addCommentToSource(text: annotatedText, comment: newComment, model: model, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
                     } else {
                         let updated = MarkdownDocumentModel.updateComment(at: index, newComment: newComment, in: model.rawContent)
                         model.setContent(updated, actionName: "Update Comment")
+                        ContentView.pushIncrementalUpdate(model: model)
                     }
                 },
                 onDelete: isNew ? nil : {
@@ -596,6 +535,7 @@ struct WebView: NSViewRepresentable {
                     guard let model = AppDelegate.activeModel else { return }
                     let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
                     model.setContent(updated, actionName: "Remove Comment")
+                    ContentView.pushIncrementalUpdate(model: model)
                 },
                 onCancel: {
                     WebViewStore.shared.commentPanelOpen = false
@@ -607,32 +547,216 @@ struct WebView: NSViewRepresentable {
             panel.makeKeyAndOrderFront(nil)
         }
 
-        private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1) {
+        private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1, endOffsetInBlock: Int = -1) {
             let source = model.rawContent
-            // Decode HTML entities that may come from WebView selection
-            let trimmedText = text
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "&lt;", with: "<")
-                .replacingOccurrences(of: "&gt;", with: ">")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&#39;", with: "'")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Use the same source-line mapping algorithm as double-click sync
-            if let range = Self.findWordRange(word: trimmedText, in: source, sourceLine: sourceLine, offsetInBlock: offsetInBlock, frontmatterLineCount: model.frontmatterLineCount) {
-                let updated = MarkdownDocumentModel.addComment(around: range, comment: comment, in: source)
-                model.setContent(updated, actionName: "Add Comment")
-                return
+            // Primary: use source line + rendered offsets to locate text directly
+            if sourceLine > 0, offsetInBlock >= 0, endOffsetInBlock > offsetInBlock {
+                if let range = Self.sourceRangeFromRenderedOffsets(
+                    sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock,
+                    frontmatterLineCount: model.frontmatterLineCount, source: source
+                ) {
+                    let updated = MarkdownDocumentModel.addComment(around: range, comment: comment, in: source)
+                    model.setContent(updated, actionName: "Add Comment")
+                    ContentView.pushIncrementalUpdate(model: model)
+                    return
+                }
             }
 
-            // Fallback: try editor selection (user selected text in the editor, not renderer)
+            // Editor selection path (user selected text in the editor, not renderer)
             if let textView = findEditorTextView() {
                 let selectedRange = textView.selectedRange()
                 if selectedRange.length > 0 {
                     let updated = MarkdownDocumentModel.addComment(around: selectedRange, comment: comment, in: source)
                     model.setContent(updated, actionName: "Add Comment")
+                    ContentView.pushIncrementalUpdate(model: model)
                 }
             }
+        }
+
+        /// Map rendered text offsets (from the DOM) back to source character offsets.
+        /// Walks the source line character by character, skipping markdown markers and
+        /// comment annotations to build a rendered-offset → source-offset mapping.
+        static func sourceRangeFromRenderedOffsets(sourceLine: Int, offsetInBlock: Int, endOffsetInBlock: Int, frontmatterLineCount: Int, source: String) -> NSRange? {
+            let lines = source.components(separatedBy: "\n")
+            let adjustedLine = sourceLine + frontmatterLineCount - 1
+            guard adjustedLine >= 0, adjustedLine < lines.count else { return nil }
+
+            // Calculate character offset of this line in the source
+            var lineCharOffset = 0
+            for i in 0..<adjustedLine {
+                lineCharOffset += lines[i].count + 1
+            }
+
+            // Collect lines for this block (until next blank line or heading)
+            var blockText = ""
+            for i in adjustedLine..<lines.count {
+                let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                if i > adjustedLine && (trimmed.isEmpty || trimmed.hasPrefix("#")) { break }
+                if i > adjustedLine { blockText += "\n" }
+                blockText += lines[i]
+            }
+
+            // Walk blockText building a mapping: for each rendered character position,
+            // track the corresponding source position. Skip comment markers, inline markup,
+            // and block-level prefixes (list markers, heading markers, blockquote markers).
+            let nsBlock = blockText as NSString
+            var renderedPos = 0
+            var sourcePos = 0
+
+            // Skip block-level prefix at the start of the block
+            if let prefixLen = skipBlockPrefix(in: blockText) {
+                sourcePos = prefixLen
+            }
+            var startSourcePos = -1
+            var endSourcePos = -1
+
+            // Track the source position right after the last rendered character,
+            // used when endOffset falls after skipped markup.
+            var lastRenderedSourceEnd = 0
+
+            while sourcePos < nsBlock.length {
+                // Check for comment markers: <!-- COMMENT: ... --> or <!-- /COMMENT -->
+                if let commentRange = skipCommentMarker(in: blockText, at: sourcePos) {
+                    if renderedPos == endOffsetInBlock && endSourcePos < 0 { endSourcePos = sourcePos }
+                    sourcePos = commentRange.upperBound
+                    continue
+                }
+
+                // Check for inline markup markers: *, **, ***, _, __, ~~, `
+                if let markupLen = skipInlineMarkup(in: blockText, at: sourcePos) {
+                    if renderedPos == endOffsetInBlock && endSourcePos < 0 { endSourcePos = sourcePos }
+                    sourcePos += markupLen
+                    continue
+                }
+
+                // This is a rendered character
+                if renderedPos == offsetInBlock { startSourcePos = sourcePos }
+                renderedPos += 1
+                sourcePos += 1
+                lastRenderedSourceEnd = sourcePos
+
+                if renderedPos == endOffsetInBlock && endSourcePos < 0 { endSourcePos = lastRenderedSourceEnd }
+            }
+
+            // Handle end offset at the very end of the block
+            if endSourcePos < 0 && renderedPos == endOffsetInBlock { endSourcePos = lastRenderedSourceEnd }
+
+            guard startSourcePos >= 0, endSourcePos > startSourcePos else { return nil }
+            return NSRange(location: lineCharOffset + startSourcePos, length: endSourcePos - startSourcePos)
+        }
+
+        /// If blockText at `pos` starts with a comment marker, return the range past it.
+        private static func skipCommentMarker(in text: String, at pos: Int) -> Range<Int>? {
+            let nsText = text as NSString
+            let remaining = nsText.length - pos
+            guard remaining >= 7 else { return nil } // minimum: <!---->
+
+            // Check for <!-- at current position
+            guard nsText.substring(with: NSRange(location: pos, length: 4)) == "<!--" else { return nil }
+
+            // Find the closing -->
+            let searchRange = NSRange(location: pos + 4, length: nsText.length - pos - 4)
+            let closeRange = nsText.range(of: "-->", range: searchRange)
+            guard closeRange.location != NSNotFound else { return nil }
+
+            let markerText = nsText.substring(with: NSRange(location: pos, length: closeRange.location + 3 - pos))
+            // Only skip COMMENT markers, not arbitrary HTML comments
+            if markerText.contains("COMMENT") {
+                return pos..<(closeRange.location + 3)
+            }
+            return nil
+        }
+
+        /// If blockText at `pos` starts with inline markup (*, **, ***, _, __, ~~, `),
+        /// return the length of the markup.
+        private static func skipInlineMarkup(in text: String, at pos: Int) -> Int? {
+            let nsText = text as NSString
+            let remaining = nsText.length - pos
+            guard remaining > 0 else { return nil }
+
+            let ch = nsText.character(at: pos)
+
+            // Backtick runs
+            if ch == 0x60 { // `
+                var len = 1
+                while pos + len < nsText.length && nsText.character(at: pos + len) == 0x60 { len += 1 }
+                return len
+            }
+
+            // Strikethrough ~~
+            if ch == 0x7E && remaining >= 2 && nsText.character(at: pos + 1) == 0x7E { // ~
+                return 2
+            }
+
+            // Bold/italic: *, **, *** or _, __, ___
+            if ch == 0x2A || ch == 0x5F { // * or _
+                var len = 1
+                while pos + len < nsText.length && nsText.character(at: pos + len) == ch && len < 3 { len += 1 }
+                return len
+            }
+
+            return nil
+        }
+
+        /// Skip block-level markdown prefix at the start of a source line.
+        /// Handles: `- `, `* `, `+ ` (unordered list), `1. ` (ordered list),
+        /// `# `..`###### ` (headings), `> ` (blockquotes), `- [ ] ` / `- [x] ` (task lists).
+        private static func skipBlockPrefix(in text: String) -> Int? {
+            let nsText = text as NSString
+            guard nsText.length > 0 else { return nil }
+
+            // Leading whitespace (indented lists)
+            var pos = 0
+            while pos < nsText.length && (nsText.character(at: pos) == 0x20 || nsText.character(at: pos) == 0x09) {
+                pos += 1
+            }
+            guard pos < nsText.length else { return nil }
+            let afterIndent = pos
+
+            let ch = nsText.character(at: pos)
+
+            // Blockquote: > (possibly nested)
+            if ch == 0x3E { // >
+                pos += 1
+                if pos < nsText.length && nsText.character(at: pos) == 0x20 { pos += 1 }
+                return pos
+            }
+
+            // Heading: # through ######
+            if ch == 0x23 { // #
+                while pos < nsText.length && nsText.character(at: pos) == 0x23 && pos - afterIndent < 6 { pos += 1 }
+                if pos < nsText.length && nsText.character(at: pos) == 0x20 { pos += 1 }
+                return pos
+            }
+
+            // Unordered list: - , * , +  (followed by space)
+            if (ch == 0x2D || ch == 0x2A || ch == 0x2B) && pos + 1 < nsText.length && nsText.character(at: pos + 1) == 0x20 {
+                pos += 2
+                // Task list: - [ ] or - [x]
+                if pos + 3 <= nsText.length {
+                    let taskCheck = nsText.substring(with: NSRange(location: pos, length: min(3, nsText.length - pos)))
+                    if taskCheck == "[ ]" || taskCheck == "[x]" {
+                        pos += 3
+                        if pos < nsText.length && nsText.character(at: pos) == 0x20 { pos += 1 }
+                    }
+                }
+                return pos
+            }
+
+            // Ordered list: digits followed by . or ) and space
+            if ch >= 0x30 && ch <= 0x39 { // 0-9
+                var numEnd = pos + 1
+                while numEnd < nsText.length && nsText.character(at: numEnd) >= 0x30 && nsText.character(at: numEnd) <= 0x39 { numEnd += 1 }
+                if numEnd < nsText.length {
+                    let delim = nsText.character(at: numEnd)
+                    if (delim == 0x2E || delim == 0x29) && numEnd + 1 < nsText.length && nsText.character(at: numEnd + 1) == 0x20 {
+                        return numEnd + 2
+                    }
+                }
+            }
+
+            return afterIndent > 0 ? afterIndent : nil
         }
 
         private func findEditorTextView() -> NSTextView? {
@@ -1270,7 +1394,6 @@ struct ContentView: View {
     @State private var activePanel: SidebarPanel = .toc
     @State private var editorPosition = CodeEditor.Position()
     @State private var editorDebounceTask: Task<Void, Never>?
-    @State private var scrollSyncTask: Task<Void, Never>?
     @State private var showSearchBar = false
 
     var body: some View {
@@ -1484,14 +1607,16 @@ private struct ContentViewLifecycle: ViewModifier {
                 webView.evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { infoResult, _ in
                     var sourceLine = -1
                     var offsetInBlock = -1
+                    var endOffsetInBlock = -1
                     if let info = infoResult as? [String: Any] {
                         sourceLine = info["sourceLine"] as? Int ?? -1
                         offsetInBlock = info["offsetInBlock"] as? Int ?? -1
+                        endOffsetInBlock = info["endOffsetInBlock"] as? Int ?? -1
                     }
                     DispatchQueue.main.async {
                         webView.commentCoordinator?.showCommentEditor(
                             index: -1, comment: "", annotatedText: text,
-                            isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock
+                            isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock
                         )
                     }
                 }
@@ -1509,6 +1634,7 @@ private struct ContentViewLifecycle: ViewModifier {
                 if cursorLocation >= c.range.location && cursorLocation < c.range.location + c.range.length {
                     let updated = MarkdownDocumentModel.removeComment(at: i, in: model.rawContent)
                     model.setContent(updated, actionName: "Remove Comment")
+                    ContentView.pushIncrementalUpdate(model: model)
                     break
                 }
             }
@@ -1638,47 +1764,40 @@ extension ContentView {
 
     @ViewBuilder
     private func mainContentArea(html: String) -> some View {
-        if showEditor {
-            HSplitView {
-                WebView(html: html, baseURL: model.baseURL, theme: theme)
-                    .frame(minWidth: 200)
+        HSplitView {
+            WebView(html: html, baseURL: model.baseURL, theme: theme)
+                .frame(minWidth: 200)
+            if showEditor {
                 MarkdownEditorView(text: $model.rawContent, position: $editorPosition, onTopLineChange: { line, fractionPast in
                     WebViewStore.shared.lastEditorLine = line
                     guard !WebViewStore.shared.suppressEditorToRenderer else { return }
-                    scrollSyncTask?.cancel()
-                    scrollSyncTask = Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 50_000_000)
-                        guard !Task.isCancelled else { return }
-                        guard let webView = WebViewStore.shared.webView else { return }
-                        webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
-                        webView.evaluateJavaScript(
-                            "if(window.__scrollToLine) __scrollToLine(\(line), \(fractionPast));"
-                        ) { _, _ in
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
-                            }
+                    guard let webView = WebViewStore.shared.webView else { return }
+                    // Pause renderer→editor sync to prevent feedback loop
+                    webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
+                    webView.evaluateJavaScript(
+                        "if(window.__scrollToLine) __scrollToLine(\(line), \(fractionPast));"
+                    ) { _, _ in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
                         }
                     }
                 }, currentFileURL: { model.currentURL })
                     .frame(minWidth: 200)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onChange(of: model.rawContent) { _, _ in
-                if let window = WebViewStore.shared.webView?.window {
-                    window.isDocumentEdited = true
-                }
-                model.isDirty = true
-                editorDebounceTask?.cancel()
-                editorDebounceTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    guard !Task.isCancelled else { return }
-                    model.refreshParsedComments()
-                    ContentView.pushIncrementalUpdate(model: model)
-                }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: model.rawContent) { _, _ in
+            if let window = WebViewStore.shared.webView?.window {
+                window.isDocumentEdited = true
             }
-        } else {
-            WebView(html: html, baseURL: model.baseURL, theme: theme)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            model.isDirty = true
+            editorDebounceTask?.cancel()
+            editorDebounceTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled else { return }
+                model.refreshParsedComments()
+                ContentView.pushIncrementalUpdate(model: model)
+            }
         }
     }
 
@@ -1690,14 +1809,25 @@ extension ContentView {
             model: model,
             activePanel: $activePanel,
             onTOCClick: { heading in
-                // Scroll preview to heading element
+                // Pause sync to prevent feedback loop, then scroll preview to heading
+                guard let webView = WebViewStore.shared.webView else { return }
+                webView.evaluateJavaScript("if(window.__editorSyncPause) __editorSyncPause()") { _, _ in }
                 let safeID = heading.id.replacingOccurrences(of: "'", with: "\\'")
-                WebViewStore.shared.webView?.evaluateJavaScript(
-                    "document.getElementById('\(safeID)')?.scrollIntoView({behavior:'smooth'})"
-                ) { _, _ in }
+                webView.evaluateJavaScript(
+                    "var el = document.getElementById('\(safeID)'); if(el) el.scrollIntoView({behavior:'smooth', block:'start'})"
+                ) { _, _ in
+                    // Resume sync after scroll animation settles
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        webView.evaluateJavaScript("if(window.__editorSyncResume) __editorSyncResume()") { _, _ in }
+                    }
+                }
                 // Scroll editor to heading's source line
-                if let textView = findEditableTextView(in: NSApp.keyWindow?.contentView) {
+                if showEditor, let textView = findEditableTextView(in: NSApp.keyWindow?.contentView) {
+                    WebViewStore.shared.suppressEditorToRenderer = true
                     WebView.Coordinator.scrollTextView(textView, toSourceLine: heading.sourceLine, frontmatterLineCount: model.frontmatterLineCount, rawContent: model.rawContent)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        WebViewStore.shared.suppressEditorToRenderer = false
+                    }
                 }
             },
             onCommentClick: { comment in
@@ -1722,6 +1852,7 @@ extension ContentView {
             onCommentDelete: { comment in
                 let updated = MarkdownDocumentModel.removeComment(at: comment.id, in: model.rawContent)
                 model.setContent(updated, actionName: "Remove Comment")
+                ContentView.pushIncrementalUpdate(model: model)
                 model.refreshParsedComments()
             },
             onFileClick: { path in

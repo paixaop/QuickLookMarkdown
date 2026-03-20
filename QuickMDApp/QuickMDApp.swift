@@ -762,7 +762,7 @@ struct QuickMDApp: App {
                         activeModel?.goBack()
                     }
                 }
-                .keyboardShortcut(.leftArrow, modifiers: [.command])
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                 Button("Forward") {
                     let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
                     if openInNewTab {
@@ -771,7 +771,7 @@ struct QuickMDApp: App {
                         activeModel?.goForward()
                     }
                 }
-                .keyboardShortcut(.rightArrow, modifiers: [.command])
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .shift])
                 Divider()
                 Button("Zoom In") {
                     WebViewStore.shared.webView?.zoomIn()

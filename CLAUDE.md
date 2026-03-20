@@ -138,7 +138,7 @@ The `extensionToLanguage` dictionary in both `MarkdownDocumentModel.swift` and `
 
 6. **Test edge cases in the browser, not just in Swift.** Markdown formatting (`**bold**`, `[link](url)`, `# heading`), comment annotations, frontmatter, nested structures — all affect how the DOM looks. The browser may handle these differently than you expect.
 
-7. **Expose testable static functions.** When testing algorithms that live inside UI code (like `jumpEditorToWord` on the Coordinator), extract the core logic into a `static func` so tests can call it without needing a full UI context. Example: `WebView.Coordinator.findWordRange(word:in:sourceLine:offsetInBlock:frontmatterLineCount:)`.
+7. **Expose testable static functions.** When testing algorithms that live inside UI code (like `jumpEditorToWord` on the Coordinator), extract the core logic into a `static func` so tests can call it without needing a full UI context. Example: `WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine:offsetInBlock:endOffsetInBlock:frontmatterLineCount:source:)`.
 
 ### Test Structure
 
@@ -170,12 +170,55 @@ xcodebuild test -scheme QuickMDApp -only-testing QuickMDUITests \
 - **Bug fix** → Write a test that reproduces the bug first, then fix it
 - **Changed HTML structure** → Update existing tests that check for specific HTML tags (e.g., `<h1>` → `<h1 data-source-line=` after adding source mapping)
 
+## Source Line Mapping — CRITICAL RULE
+
+**Always use `data-source-line` attributes to navigate, position, and calculate document offsets. NEVER use text searches to find document positions.** Files can have the same text strings repeated many times, and text-based searches will end up at the wrong position.
+
+### How it works
+
+Every block-level HTML element rendered from markdown gets a `data-source-line="N"` attribute (1-based line number in the source file). This is the single source of truth for mapping between the rendered preview and the source text.
+
+### JS → Swift mapping (renderer to source)
+
+1. `__getSelectionSourceInfo()` returns `{ sourceLine, offsetInBlock, endOffsetInBlock, text }` where:
+   - `sourceLine` — the `data-source-line` value of the nearest ancestor element
+   - `offsetInBlock` — character offset of the selection start within the rendered text of that block
+   - `endOffsetInBlock` — character offset of the selection end within the rendered text
+2. `__findSourceLineAncestor(node)` walks up the DOM to find the nearest element with `data-source-line`
+3. `__getOffsetInBlock(blockEl, range)` computes the character offset of a Range within a block element
+
+### Swift: mapping rendered offsets → source positions
+
+`WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine:offsetInBlock:endOffsetInBlock:frontmatterLineCount:source:)` maps rendered text offsets back to source character positions by walking the source line character-by-character, skipping:
+- Comment markers (`<!-- COMMENT: ... -->`, `<!-- /COMMENT -->`)
+- Inline markdown markers (`**`, `*`, `__`, `_`, `~~`, backticks)
+
+This produces the exact `NSRange` in the source text — no string searching involved.
+
+### When to use what
+
+| Task | Method | Why |
+|------|--------|-----|
+| Place a comment | `sourceRangeFromRenderedOffsets` | Exact position via line + offsets |
+| Double-click jump to editor | `sourceLine` + `offsetInBlock` | Direct line lookup |
+| Scroll sync | `__scrollToLine(line, fractionPast)` | Line-based, no text search |
+| TOC navigation | `heading.sourceLine` | Each heading stores its source line |
+| `findWordRange` (legacy fallback) | Only as last resort | May match wrong occurrence |
+
+### Rules for new code
+
+1. Any new feature that maps between renderer and source MUST use `data-source-line` + character offsets
+2. The `findWordRange` text-search function exists only as a legacy fallback — do not use it as the primary method
+3. When adding new JS→Swift interactions, always pass `sourceLine` and offset data from `__getSelectionSourceInfo()`
+4. Test with documents that have duplicate text — the same word/phrase appearing multiple times on different lines
+
 ## Architecture
 
-- **App target**: SwiftUI + WKWebView + Down (markdown→HTML) + highlight.js/js-yaml/mermaid via WKUserScript
-- **Extension target**: QLPreviewingController + QLPreviewReply (data-based HTML) + Down + highlight.js/js-yaml/mermaid inlined in HTML
+- **App target**: SwiftUI + WKWebView + swift-markdown (markdown→HTML) + highlight.js/js-yaml/mermaid via WKUserScript
+- **Extension target**: QLPreviewingController + QLPreviewReply (data-based HTML) + swift-markdown + highlight.js/js-yaml/mermaid inlined in HTML
 - **Shared**: `Resources/` folder bundled in both targets:
   - `mermaid.min.js` (~2.9MB) — Mermaid diagram rendering
   - `highlight.min.js` (~127KB) — Syntax highlighting
   - `highlight-github.css` / `highlight-github-dark.css` (~1.3KB each) — GitHub theme
   - `js-yaml.min.js` (~39KB) — YAML parsing
+  - `Resources/scripts/utils.js` — shared JS helpers loaded first (`__postWebkitMessage`, `__findSourceLineAncestor`, `__getOffsetInBlock`, `__getMermaidTheme`)

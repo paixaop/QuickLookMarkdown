@@ -178,7 +178,7 @@ final class EditorRendererSyncE2ETests: XCTestCase {
     }
 
     /// Get the source line info for the current selection using __getSelectionSourceInfo.
-    private func getSelectionSourceInfo() -> (sourceLine: Int, offsetInBlock: Int, text: String)? {
+    private func getSelectionSourceInfo() -> (sourceLine: Int, offsetInBlock: Int, endOffsetInBlock: Int, text: String)? {
         let js = "window.__getSelectionSourceInfo ? JSON.stringify(__getSelectionSourceInfo()) : null"
         guard let jsonStr = evalJS(js) as? String,
               let data = jsonStr.data(using: .utf8),
@@ -188,13 +188,14 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         return (
             sourceLine: dict["sourceLine"] as? Int ?? -1,
             offsetInBlock: dict["offsetInBlock"] as? Int ?? -1,
+            endOffsetInBlock: dict["endOffsetInBlock"] as? Int ?? -1,
             text: dict["text"] as? String ?? ""
         )
     }
 
     /// Simulate a double-click by selecting a word and reading source mapping in one JS turn.
     /// (Splitting find + read across two `evaluateJavaScript` calls can lose the selection in WKWebView.)
-    private func simulateDoubleClick(selectingWord word: String, occurrence: Int = 1) -> (sourceLine: Int, sourceCol: Int, offsetInBlock: Int)? {
+    private func simulateDoubleClick(selectingWord word: String, occurrence: Int = 1) -> (sourceLine: Int, sourceCol: Int, offsetInBlock: Int, endOffsetInBlock: Int)? {
         let escaped = word.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
         let js = """
         (function() {
@@ -223,15 +224,30 @@ final class EditorRendererSyncE2ETests: XCTestCase {
             var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
             var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
             var offsetInBlock = -1;
+            var endOffsetInBlock = -1;
             try {
                 var r = sel.getRangeAt(0);
+                // Compute offset excluding heading anchor text (injected "#" not in source)
+                var anchorLen = 0;
+                var anchors = el.querySelectorAll('.heading-anchor');
+                for (var j = 0; j < anchors.length; j++) {
+                    var aRange = document.createRange();
+                    aRange.selectNode(anchors[j]);
+                    if (aRange.compareBoundaryPoints(Range.END_TO_START, r) <= 0) {
+                        anchorLen += anchors[j].textContent.length;
+                    }
+                }
                 var preRange = document.createRange();
                 preRange.setStart(el, 0);
                 preRange.setEnd(r.startContainer, r.startOffset);
-                offsetInBlock = preRange.toString().length;
+                offsetInBlock = Math.max(0, preRange.toString().length - anchorLen);
+                var endRange = document.createRange();
+                endRange.setStart(el, 0);
+                endRange.setEnd(r.endContainer, r.endOffset);
+                endOffsetInBlock = Math.max(0, endRange.toString().length - anchorLen);
             } catch(ex) {}
 
-            return JSON.stringify({sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock});
+            return JSON.stringify({sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock});
         })()
         """
         guard let jsonStr = evalJS(js) as? String,
@@ -242,7 +258,8 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         return (
             sourceLine: dict["sourceLine"] as? Int ?? -1,
             sourceCol: dict["sourceCol"] as? Int ?? -1,
-            offsetInBlock: dict["offsetInBlock"] as? Int ?? -1
+            offsetInBlock: dict["offsetInBlock"] as? Int ?? -1,
+            endOffsetInBlock: dict["endOffsetInBlock"] as? Int ?? -1
         )
     }
 
@@ -352,17 +369,17 @@ final class EditorRendererSyncE2ETests: XCTestCase {
 
         // Now verify the Swift algorithm picks the right range for each
         if let info1 = info1 {
-            let range1 = WebView.Coordinator.findWordRange(word: "apple", in: model.rawContent, sourceLine: info1.sourceLine, offsetInBlock: info1.offsetInBlock, frontmatterLineCount: model.frontmatterLineCount)
+            let range1 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info1.sourceLine, offsetInBlock: info1.offsetInBlock, endOffsetInBlock: info1.endOffsetInBlock, frontmatterLineCount: model.frontmatterLineCount, source: model.rawContent)
             XCTAssertNotNil(range1)
             XCTAssertLessThan(range1!.location, 25, "First apple should be in first paragraph")
         }
         if let info2 = info2 {
-            let range2 = WebView.Coordinator.findWordRange(word: "apple", in: model.rawContent, sourceLine: info2.sourceLine, offsetInBlock: info2.offsetInBlock, frontmatterLineCount: model.frontmatterLineCount)
+            let range2 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info2.sourceLine, offsetInBlock: info2.offsetInBlock, endOffsetInBlock: info2.endOffsetInBlock, frontmatterLineCount: model.frontmatterLineCount, source: model.rawContent)
             XCTAssertNotNil(range2)
             XCTAssertGreaterThan(range2!.location, 25, "Second apple should be past first paragraph")
         }
         if let info3 = info3 {
-            let range3 = WebView.Coordinator.findWordRange(word: "apple", in: model.rawContent, sourceLine: info3.sourceLine, offsetInBlock: info3.offsetInBlock, frontmatterLineCount: model.frontmatterLineCount)
+            let range3 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info3.sourceLine, offsetInBlock: info3.offsetInBlock, endOffsetInBlock: info3.endOffsetInBlock, frontmatterLineCount: model.frontmatterLineCount, source: model.rawContent)
             XCTAssertNotNil(range3)
             XCTAssertGreaterThan(range3!.location, 50, "Third apple should be in last paragraph")
         }
@@ -385,9 +402,9 @@ final class EditorRendererSyncE2ETests: XCTestCase {
             XCTAssertLessThan(i1.sourceLine, i2.sourceLine, "H1 should be before H2")
             XCTAssertLessThan(i2.sourceLine, i3.sourceLine, "H2 should be before H3")
 
-            let r1 = WebView.Coordinator.findWordRange(word: "Section", in: model.rawContent, sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, frontmatterLineCount: 0)
-            let r2 = WebView.Coordinator.findWordRange(word: "Section", in: model.rawContent, sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, frontmatterLineCount: 0)
-            let r3 = WebView.Coordinator.findWordRange(word: "Section", in: model.rawContent, sourceLine: i3.sourceLine, offsetInBlock: i3.offsetInBlock, frontmatterLineCount: 0)
+            let r1 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, endOffsetInBlock: i1.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
+            let r2 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, endOffsetInBlock: i2.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
+            let r3 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: i3.sourceLine, offsetInBlock: i3.offsetInBlock, endOffsetInBlock: i3.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
             XCTAssertNotNil(r1)
             XCTAssertNotNil(r2)
             XCTAssertNotNil(r3)
@@ -411,7 +428,7 @@ final class EditorRendererSyncE2ETests: XCTestCase {
 
         // Verify Swift algorithm disambiguates correctly
         for info in [info1, info2, info3, info4].compactMap({ $0 }) {
-            let range = WebView.Coordinator.findWordRange(word: "data", in: model.rawContent, sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, frontmatterLineCount: 0)
+            let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, endOffsetInBlock: info.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
             XCTAssertNotNil(range, "Should find range for data at line \(info.sourceLine)")
         }
     }
@@ -430,11 +447,11 @@ final class EditorRendererSyncE2ETests: XCTestCase {
 
     func testOffsetInBlockDiffersForDifferentWords() throws {
         let (_, _) = try loadMarkdown("First middle last in one paragraph.")
-        let info1: (sourceLine: Int, offsetInBlock: Int, text: String)? = {
+        let info1: (sourceLine: Int, offsetInBlock: Int, endOffsetInBlock: Int, text: String)? = {
             guard selectText("First") else { return nil }
             return getSelectionSourceInfo()
         }()
-        let info2: (sourceLine: Int, offsetInBlock: Int, text: String)? = {
+        let info2: (sourceLine: Int, offsetInBlock: Int, endOffsetInBlock: Int, text: String)? = {
             guard selectText("last") else { return nil }
             return getSelectionSourceInfo()
         }()
@@ -709,7 +726,7 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         XCTAssertNotNil(info)
 
         if let info = info {
-            let range = WebView.Coordinator.findWordRange(word: "paragraph", in: model.rawContent, sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, frontmatterLineCount: model.frontmatterLineCount)
+            let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, endOffsetInBlock: info.endOffsetInBlock, frontmatterLineCount: model.frontmatterLineCount, source: model.rawContent)
             XCTAssertNotNil(range)
             // "Second paragraph" is in the second paragraph — verify it's past the first
             let firstParagraphEnd = (model.rawContent as NSString).range(of: "First paragraph.").location + "First paragraph.".count
@@ -730,8 +747,8 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         XCTAssertNotNil(info2)
 
         if let i1 = info1, let i2 = info2 {
-            let r1 = WebView.Coordinator.findWordRange(word: "qmdBoldToken", in: model.rawContent, sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, frontmatterLineCount: 0)
-            let r2 = WebView.Coordinator.findWordRange(word: "qmdItalicToken", in: model.rawContent, sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, frontmatterLineCount: 0)
+            let r1 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, endOffsetInBlock: i1.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
+            let r2 = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, endOffsetInBlock: i2.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
             XCTAssertNotNil(r1)
             XCTAssertNotNil(r2)
             XCTAssertNotEqual(r1!.location, r2!.location, "Should find different occurrences")
@@ -768,7 +785,7 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         for i in 1...5 {
             if let info = simulateDoubleClick(selectingWord: "testing", occurrence: i) {
                 foundLines.append(info.sourceLine)
-                let range = WebView.Coordinator.findWordRange(word: "testing", in: model.rawContent, sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, frontmatterLineCount: 0)
+                let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(sourceLine: info.sourceLine, offsetInBlock: info.offsetInBlock, endOffsetInBlock: info.endOffsetInBlock, frontmatterLineCount: 0, source: model.rawContent)
                 XCTAssertNotNil(range, "Should find range for occurrence \(i) at line \(info.sourceLine)")
             }
         }
@@ -875,12 +892,12 @@ final class EditorRendererSyncE2ETests: XCTestCase {
                        "Each list item should have a unique source line. Got: \(foundSourceLines)")
     }
 
-    /// E2E: simulate adding a comment to each list item via findWordRange (the same path as addCommentToSource).
+    /// E2E: simulate adding a comment to each list item via sourceRangeFromRenderedOffsets (the same path as addCommentToSource).
     func testArchitectureFixtureCommentEachListItem() throws {
         let (_, model) = try loadMarkdown(architectureFixture)
         let source = model.rawContent
 
-        // For each list item, select a unique word, get source info, then verify findWordRange
+        // For each list item, select a unique word, get source info, then verify sourceRangeFromRenderedOffsets
         // picks a position INSIDE that specific list item line
         let uniqueWords = [
             "Reliability-first",
@@ -908,15 +925,15 @@ final class EditorRendererSyncE2ETests: XCTestCase {
                 continue
             }
 
-            // Use findWordRange — same algorithm as addCommentToSource
-            guard let range = WebView.Coordinator.findWordRange(
-                word: word,
-                in: source,
+            // Use sourceRangeFromRenderedOffsets — same algorithm as addCommentToSource
+            guard let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(
                 sourceLine: info.sourceLine,
                 offsetInBlock: info.offsetInBlock,
-                frontmatterLineCount: model.frontmatterLineCount
+                endOffsetInBlock: info.endOffsetInBlock,
+                frontmatterLineCount: model.frontmatterLineCount,
+                source: source
             ) else {
-                XCTFail("findWordRange returned nil for '\(word)' at line \(info.sourceLine)")
+                XCTFail("sourceRangeFromRenderedOffsets returned nil for '\(word)' at line \(info.sourceLine)")
                 continue
             }
 
@@ -958,14 +975,14 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         guard let info = getSelectionSourceInfo() else {
             XCTFail("No source info"); return
         }
-        guard let range = WebView.Coordinator.findWordRange(
-            word: "Reliability-first",
-            in: source,
+        guard let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(
             sourceLine: info.sourceLine,
             offsetInBlock: info.offsetInBlock,
-            frontmatterLineCount: model.frontmatterLineCount
+            endOffsetInBlock: info.endOffsetInBlock,
+            frontmatterLineCount: model.frontmatterLineCount,
+            source: source
         ) else {
-            XCTFail("findWordRange returned nil"); return
+            XCTFail("sourceRangeFromRenderedOffsets returned nil"); return
         }
 
         let updated = MarkdownDocumentModel.addComment(around: range, comment: "needs review", in: source)
@@ -1078,13 +1095,14 @@ final class EditorRendererSyncE2ETests: XCTestCase {
             guard let info = getSelectionSourceInfo() else {
                 XCTFail("No source info for '\(word)' (#\(i))"); continue
             }
-            guard let range = WebView.Coordinator.findWordRange(
-                word: word, in: source,
+            guard let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(
                 sourceLine: info.sourceLine,
                 offsetInBlock: info.offsetInBlock,
-                frontmatterLineCount: model.frontmatterLineCount
+                endOffsetInBlock: info.endOffsetInBlock,
+                frontmatterLineCount: model.frontmatterLineCount,
+                source: source
             ) else {
-                XCTFail("findWordRange nil for '\(word)' (#\(i))"); continue
+                XCTFail("sourceRangeFromRenderedOffsets nil for '\(word)' (#\(i))"); continue
             }
             allRanges.append((word: word, range: range, sourceLine: info.sourceLine))
         }
@@ -1306,5 +1324,39 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         let updatedText = getArticleText().trimmingCharacters(in: .whitespacesAndNewlines)
         XCTAssertTrue(updatedText.isEmpty || !updatedText.contains("Title"),
                        "Content should be cleared after empty update")
+    }
+
+    // MARK: - Comment rendering E2E
+
+    /// E2E: verify comment inside paragraph with inline code renders as highlighted mark.
+    func testCommentRenderingWithInlineCode() throws {
+        let md = "The `OverrideVerdict` host function enforces <!-- COMMENT: non escalations -->escalation-only<!-- /COMMENT --> semantics:"
+        let (html, _) = try loadMarkdown(md)
+
+        // HTML should contain the mark tag
+        XCTAssertTrue(html.contains("qmd-comment"), "HTML should contain qmd-comment class: \(html)")
+
+        // DOM should have the mark element after JS runs
+        let markCount = evalJS("document.querySelectorAll('.qmd-comment').length") as? Int ?? 0
+        XCTAssertEqual(markCount, 1, "Should have exactly 1 comment mark in DOM")
+
+        // The comment text should be accessible
+        let commentText = evalJS("document.querySelector('.qmd-comment')?.getAttribute('data-comment')") as? String
+        XCTAssertEqual(commentText, "non escalations")
+    }
+
+    /// E2E: verify comment wrapping bold text renders correctly.
+    func testCommentRenderingWithBoldContent() throws {
+        let md = "Their decisions are <!-- COMMENT: review -->**discarded**<!-- /COMMENT --> by the system."
+        let (html, _) = try loadMarkdown(md)
+
+        XCTAssertTrue(html.contains("qmd-comment"), "HTML should contain qmd-comment class")
+
+        let markCount = evalJS("document.querySelectorAll('.qmd-comment').length") as? Int ?? 0
+        XCTAssertEqual(markCount, 1, "Should have exactly 1 comment mark in DOM")
+
+        // The bold should be rendered inside the comment mark
+        let hasBoldInside = evalJS("document.querySelector('.qmd-comment strong') !== null") as? Bool ?? false
+        XCTAssertTrue(hasBoldInside, "Bold text should be rendered inside the comment mark")
     }
 }

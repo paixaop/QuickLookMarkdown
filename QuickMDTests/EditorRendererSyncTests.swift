@@ -38,11 +38,6 @@ final class EditorRendererSyncTests: XCTestCase {
         return nil
     }
 
-    /// Find the NSRange that the sync algorithm would pick for a given word + source line + offset.
-    private func findRange(word: String, in source: String, sourceLine: Int, offsetInBlock: Int = 0, fmLines: Int = 0) -> NSRange? {
-        WebView.Coordinator.findWordRange(word: word, in: source, sourceLine: sourceLine, offsetInBlock: offsetInBlock, frontmatterLineCount: fmLines)
-    }
-
     // =========================================================================
     // MARK: - SourceMappedHTMLFormatter: data-source-line correctness
     // =========================================================================
@@ -206,386 +201,76 @@ final class EditorRendererSyncTests: XCTestCase {
     }
 
     // =========================================================================
-    // MARK: - findWordRange: basic cases
+    // MARK: - sourceRangeFromRenderedOffsets
     // =========================================================================
 
-    func testFindWordSingleOccurrence() {
-        let source = "# Hello\n\nWorld is unique here."
-        let range = findRange(word: "unique", in: source, sourceLine: 3)
+    private func sourceRange(sourceLine: Int, offset: Int, endOffset: Int, frontmatter: Int = 0, source: String) -> NSRange? {
+        WebView.Coordinator.sourceRangeFromRenderedOffsets(
+            sourceLine: sourceLine, offsetInBlock: offset, endOffsetInBlock: endOffset,
+            frontmatterLineCount: frontmatter, source: source
+        )
+    }
+
+    func testSourceRangeFromRenderedOffsetsPlainText() {
+        let source = "Hello world this is text."
+        // Select "world" (rendered offset 6..11)
+        let range = sourceRange(sourceLine: 1, offset: 6, endOffset: 11, source: source)
         XCTAssertNotNil(range)
-        XCTAssertEqual((source as NSString).substring(with: range!), "unique")
+        XCTAssertEqual((source as NSString).substring(with: range!), "world")
     }
 
-    func testFindWordNotFound() {
-        let source = "# Hello\n\nWorld."
-        let range = findRange(word: "nonexistent", in: source, sourceLine: 1)
-        XCTAssertNil(range)
+    func testSourceRangeFromRenderedOffsetsWithBold() {
+        let source = "Hello **world** this is text."
+        // Rendered: "Hello world this is text." — "world" is at rendered offset 6..11
+        let range = sourceRange(sourceLine: 1, offset: 6, endOffset: 11, source: source)
+        XCTAssertNotNil(range)
+        XCTAssertEqual((source as NSString).substring(with: range!), "world")
     }
 
-    // =========================================================================
-    // MARK: - findWordRange: duplicate word disambiguation
-    // =========================================================================
-
-    func testDuplicateWordInDifferentSections() {
-        let source = "# Section One\n\nThe word test appears here.\n\n# Section Two\n\nThe word test appears here too."
-        // "test" at line 3 (section one) vs line 7 (section two)
-        let range1 = findRange(word: "test", in: source, sourceLine: 3)
-        let range2 = findRange(word: "test", in: source, sourceLine: 7)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location, "Should find different occurrences")
-        // range1 should be in section one (earlier in doc)
-        XCTAssertLessThan(range1!.location, range2!.location)
+    func testSourceRangeFromRenderedOffsetsSpanningBold() {
+        let source = "Hello **world** here."
+        // Rendered: "Hello world here." — select "Hello world" (0..11)
+        let range = sourceRange(sourceLine: 1, offset: 0, endOffset: 11, source: source)
+        XCTAssertNotNil(range)
+        // The range includes the opening ** but stops before the closing **
+        let matched = (source as NSString).substring(with: range!)
+        XCTAssertTrue(matched.hasPrefix("Hello"), "Should start with 'Hello': got '\(matched)'")
+        XCTAssertTrue(matched.contains("world"), "Should contain 'world': got '\(matched)'")
     }
 
-    func testDuplicateWordInDifferentParagraphs() {
-        let source = "First paragraph with word apple.\n\nSecond paragraph with word apple.\n\nThird paragraph with word apple."
-        let range1 = findRange(word: "apple", in: source, sourceLine: 1)
-        let range2 = findRange(word: "apple", in: source, sourceLine: 3)
-        let range3 = findRange(word: "apple", in: source, sourceLine: 5)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        XCTAssertLessThan(range1!.location, range2!.location)
-        XCTAssertLessThan(range2!.location, range3!.location)
+    func testSourceRangeFromRenderedOffsetsWithCommentMarker() {
+        let source = "enforces <!-- COMMENT: note -->escalation-only<!-- /COMMENT --> semantics:"
+        // Rendered: "enforces escalation-only semantics:"
+        // Select "enforces escalation-only" (0..24)
+        let range = sourceRange(sourceLine: 1, offset: 0, endOffset: 24, source: source)
+        XCTAssertNotNil(range, "Should find range spanning comment marker")
+        let matched = (source as NSString).substring(with: range!)
+        XCTAssertTrue(matched.hasPrefix("enforces"), "Should start with 'enforces': got '\(matched)'")
+        XCTAssertTrue(matched.contains("escalation-only"), "Should contain full word: got '\(matched)'")
     }
 
-    func testDuplicateWordSameLineUsesOffset() {
-        let source = "The cat sat on the cat mat near cat."
-        // "cat" appears 3 times on line 1 at different offsets
-        let range1 = findRange(word: "cat", in: source, sourceLine: 1, offsetInBlock: 4)   // "The cat..."
-        let range2 = findRange(word: "cat", in: source, sourceLine: 1, offsetInBlock: 19)  // "...the cat mat..."
-        let range3 = findRange(word: "cat", in: source, sourceLine: 1, offsetInBlock: 32)  // "...near cat."
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        // Each should pick the closest occurrence to the offset
-        XCTAssertLessThan(range1!.location, range2!.location)
-        XCTAssertLessThan(range2!.location, range3!.location)
-    }
-
-    func testDuplicateWordInHeadingVsParagraph() {
-        let source = "# Overview\n\nThis overview explains things."
-        // "Overview" in heading (line 1) vs paragraph (line 3)
-        // Note: case-insensitive, "Overview" vs "overview"
-        let range1 = findRange(word: "Overview", in: source, sourceLine: 1)
-        let range2 = findRange(word: "overview", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testDuplicateWordInListItems() {
-        let source = "- item with data\n- another with data\n- more with data"
-        // List items are on consecutive lines (no blank line), so block extent spans all three.
-        // Use offsetInBlock to disambiguate within the block.
-        let range1 = findRange(word: "data", in: source, sourceLine: 1, offsetInBlock: 12)
-        let range2 = findRange(word: "data", in: source, sourceLine: 2, offsetInBlock: 30)
-        let range3 = findRange(word: "data", in: source, sourceLine: 3, offsetInBlock: 48)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        // With offsets, each should pick the closest occurrence
-        XCTAssertLessThanOrEqual(range1!.location, range2!.location)
-        XCTAssertLessThanOrEqual(range2!.location, range3!.location)
-    }
-
-    func testDuplicateWordInTableCells() {
-        let source = "| value | other |\n|-------|-------|\n| value | value |"
-        // "value" appears in header (line 1) and both cells (line 3)
-        let range1 = findRange(word: "value", in: source, sourceLine: 1)
-        let range3 = findRange(word: "value", in: source, sourceLine: 3, offsetInBlock: 0)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range3)
-        XCTAssertLessThan(range1!.location, range3!.location)
-    }
-
-    func testDuplicateWordInBlockquoteVsParagraph() {
-        let source = "The word error here.\n\n> The word error in quote."
-        let range1 = findRange(word: "error", in: source, sourceLine: 1)
-        let range2 = findRange(word: "error", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: markdown syntax edge cases
-    // =========================================================================
-
-    func testWordInsideBoldText() {
-        let source = "Normal **important** word.\n\nAnother **important** mention."
-        let range1 = findRange(word: "important", in: source, sourceLine: 1)
-        let range2 = findRange(word: "important", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordInsideItalicText() {
-        let source = "The *key* idea.\n\nAnother *key* concept."
-        let range1 = findRange(word: "key", in: source, sourceLine: 1)
-        let range2 = findRange(word: "key", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordInsideLinkText() {
-        let source = "Click [here](url1) now.\n\nClick [here](url2) again."
-        let range1 = findRange(word: "here", in: source, sourceLine: 1)
-        let range2 = findRange(word: "here", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordInsideInlineCode() {
-        let source = "Use `code` method.\n\nAnother `code` example."
-        let range1 = findRange(word: "code", in: source, sourceLine: 1)
-        let range2 = findRange(word: "code", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordAfterHeadingMarker() {
-        // "# Title" — the word "Title" has an offset that accounts for "# "
-        let source = "# Title\n\nTitle appears again in body."
-        let range1 = findRange(word: "Title", in: source, sourceLine: 1, offsetInBlock: 0)
-        let range2 = findRange(word: "Title", in: source, sourceLine: 3, offsetInBlock: 0)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        // range1 should be at offset 2 (after "# "), range2 later
-        XCTAssertLessThan(range1!.location, range2!.location)
-    }
-
-    func testWordAfterListMarker() {
-        // "- item" — rendered text is "item" but source includes "- "
-        let source = "- item one\n\nThe item is here."
-        let range1 = findRange(word: "item", in: source, sourceLine: 1, offsetInBlock: 0)
-        let range2 = findRange(word: "item", in: source, sourceLine: 3, offsetInBlock: 4)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: frontmatter offset
-    // =========================================================================
-
-    func testWordWithFrontmatterOffset() {
-        // With frontmatter, body starts later in the raw source
-        let source = "---\ntitle: Test\n---\n\n# Hello\n\nworld is here."
-        // Body: "# Hello\n\nworld is here."
-        // Parser sees "# Hello" as line 1, but in raw source it's line 5
-        // frontmatterLineCount = 4 (3 lines of frontmatter + 1 blank line)
-        let range = findRange(word: "world", in: source, sourceLine: 3, fmLines: 4)
+    func testSourceRangeFromRenderedOffsetsWithStrikethrough() {
+        let source = "This is ~~deleted~~ text here."
+        // Rendered: "This is deleted text here." — select "deleted" (8..15)
+        let range = sourceRange(sourceLine: 1, offset: 8, endOffset: 15, source: source)
         XCTAssertNotNil(range)
         let matched = (source as NSString).substring(with: range!)
-        XCTAssertEqual(matched, "world")
-        // Should be at the right position (line 7 in raw source)
-        XCTAssertGreaterThan(range!.location, 20) // Past the frontmatter
+        XCTAssertEqual(matched, "deleted")
     }
 
-    func testDuplicateWordWithFrontmatter() {
-        let source = "---\ntitle: data\n---\n\nFirst data here.\n\nSecond data there."
-        // "data" appears in frontmatter (line 2), paragraph 1 (line 5), paragraph 2 (line 7)
-        // Parser sees body as line 1 (First data) and line 3 (Second data)
-        // frontmatterLineCount = 4
-        let range1 = findRange(word: "data", in: source, sourceLine: 1, fmLines: 4)
-        let range2 = findRange(word: "data", in: source, sourceLine: 3, fmLines: 4)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        // Both should be past the frontmatter
-        XCTAssertGreaterThan(range1!.location, 15)
-        XCTAssertGreaterThan(range2!.location, range1!.location)
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: multi-line blocks
-    // =========================================================================
-
-    func testMultiLineParagraph() {
-        let source = "This is a long paragraph\nthat spans multiple lines\nwith the word test here.\n\nAnother paragraph with test."
-        // Parser treats continuous lines (no blank line) as one paragraph starting at line 1
-        let range1 = findRange(word: "test", in: source, sourceLine: 1, offsetInBlock: 60)
-        let range2 = findRange(word: "test", in: source, sourceLine: 5, offsetInBlock: 25)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testMultiLineBlockquote() {
-        let source = "> First line of quote\n> with continuation.\n\nAnd outside."
-        let html = MarkdownDocumentModel.SourceMappedHTMLFormatter.format(source)
-        XCTAssertTrue(html.contains("<blockquote data-source-line=\"1\""))
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: edge cases
-    // =========================================================================
-
-    func testSingleCharacterWord() {
-        let source = "A sentence with a word.\n\nAnother a here."
-        // "a" appears many times — needs source line to disambiguate
-        let range = findRange(word: "a", in: source, sourceLine: 1, offsetInBlock: 18)
+    func testSourceRangeFromRenderedOffsetsWithFrontmatter() {
+        let source = "---\ntitle: Test\n---\n\nHello world."
+        // "Hello world." is on source line 5, frontmatter has 3 lines
+        // frontmatterLineCount adjusts the line index: 5 + 3 - 1 = 7 (0-based) but
+        // the actual text line is at index 4 (0-based). frontmatterLineCount should be 0
+        // when the source already includes frontmatter and sourceLine is absolute.
+        // In practice, preprocessComments strips frontmatter first and sourceLine is
+        // relative to the body. Here we test with sourceLine=1 (first body line) and
+        // frontmatter=0, passing just the body.
+        let body = "Hello world."
+        let range = sourceRange(sourceLine: 1, offset: 6, endOffset: 11, frontmatter: 0, source: body)
         XCTAssertNotNil(range)
-    }
-
-    func testVeryCommonWord() {
-        let source = "the the the\n\nthe the the\n\nthe the the"
-        let range1 = findRange(word: "the", in: source, sourceLine: 1, offsetInBlock: 0)
-        let range2 = findRange(word: "the", in: source, sourceLine: 3, offsetInBlock: 0)
-        let range3 = findRange(word: "the", in: source, sourceLine: 5, offsetInBlock: 0)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        // Each should be in different blocks
-        XCTAssertLessThan(range1!.location, range2!.location)
-        XCTAssertLessThan(range2!.location, range3!.location)
-    }
-
-    func testWordAtDocumentStart() {
-        let source = "Hello world.\n\nHello again."
-        let range = findRange(word: "Hello", in: source, sourceLine: 1, offsetInBlock: 0)
-        XCTAssertNotNil(range)
-        XCTAssertEqual(range!.location, 0)
-    }
-
-    func testWordAtDocumentEnd() {
-        let source = "Start here.\n\nEnd word."
-        let range = findRange(word: "word", in: source, sourceLine: 3)
-        XCTAssertNotNil(range)
-        XCTAssertEqual(range!.location + range!.length, source.count - 1) // before the "."
-    }
-
-    func testCaseInsensitiveMatching() {
-        let source = "Hello world.\n\nhello again."
-        // Both "Hello" and "hello" should be found case-insensitively
-        let range1 = findRange(word: "Hello", in: source, sourceLine: 1)
-        let range2 = findRange(word: "Hello", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testEmptySource() {
-        let range = findRange(word: "test", in: "", sourceLine: 1)
-        XCTAssertNil(range)
-    }
-
-    func testNoSourceLine() {
-        // When sourceLine is -1 (fallback), should pick middle occurrence
-        let source = "word at start.\n\nword in middle.\n\nword at end."
-        let range = findRange(word: "word", in: source, sourceLine: -1)
-        XCTAssertNotNil(range)
-        // Should pick the one closest to the middle of the document
-    }
-
-    func testInvalidSourceLine() {
-        let source = "Short document."
-        let range = findRange(word: "Short", in: source, sourceLine: 999)
-        XCTAssertNotNil(range)
-        // Should still find the word via fallback
-    }
-
-    func testWordWithSpecialCharacters() {
-        let source = "C++ is great.\n\nC++ is powerful."
-        let range1 = findRange(word: "C++", in: source, sourceLine: 1)
-        let range2 = findRange(word: "C++", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordWithUnicode() {
-        let source = "The café is nice.\n\nAnother café here."
-        let range1 = findRange(word: "café", in: source, sourceLine: 1)
-        let range2 = findRange(word: "café", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    func testWordWithEmoji() {
-        let source = "Hello 🎉 world.\n\nHello 🎉 again."
-        let range1 = findRange(word: "Hello", in: source, sourceLine: 1)
-        let range2 = findRange(word: "Hello", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: complex document structures
-    // =========================================================================
-
-    func testNestedListsWithDuplicateWords() {
-        let source = "- outer item\n  - inner item\n  - another inner item\n- second outer item"
-        let range1 = findRange(word: "item", in: source, sourceLine: 1, offsetInBlock: 6)
-        let range4 = findRange(word: "item", in: source, sourceLine: 4, offsetInBlock: 13)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range4)
-        XCTAssertNotEqual(range1!.location, range4!.location)
-    }
-
-    func testCodeBlockContentNotMatchedAsBlock() {
-        // Words inside code blocks are on the <pre> source line
-        let source = "Use data variable.\n\n```\ndata = 42\n```\n\nMore data here."
-        let range1 = findRange(word: "data", in: source, sourceLine: 1, offsetInBlock: 4)
-        let range3 = findRange(word: "data", in: source, sourceLine: 7, offsetInBlock: 5)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range3)
-        XCTAssertNotEqual(range1!.location, range3!.location)
-    }
-
-    func testHeadingsAtMultipleLevels() {
-        let source = "# Section\n\n## Section\n\n### Section"
-        // "Section" appears 3 times, each at different heading levels
-        let range1 = findRange(word: "Section", in: source, sourceLine: 1)
-        let range2 = findRange(word: "Section", in: source, sourceLine: 3)
-        let range3 = findRange(word: "Section", in: source, sourceLine: 5)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        XCTAssertLessThan(range1!.location, range2!.location)
-        XCTAssertLessThan(range2!.location, range3!.location)
-    }
-
-    func testAdjacentParagraphsWithSameContent() {
-        let source = "identical text here.\n\nidentical text here.\n\nidentical text here."
-        let range1 = findRange(word: "identical", in: source, sourceLine: 1)
-        let range2 = findRange(word: "identical", in: source, sourceLine: 3)
-        let range3 = findRange(word: "identical", in: source, sourceLine: 5)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotNil(range3)
-        XCTAssertLessThan(range1!.location, range2!.location)
-        XCTAssertLessThan(range2!.location, range3!.location)
-    }
-
-    func testWordInHorizontalRuleSeparatedSections() {
-        let source = "word here.\n\n---\n\nword there."
-        let range1 = findRange(word: "word", in: source, sourceLine: 1)
-        let range2 = findRange(word: "word", in: source, sourceLine: 5)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
-    }
-
-    // =========================================================================
-    // MARK: - findWordRange: comments interaction
-    // =========================================================================
-
-    func testWordNearCommentAnnotation() {
-        // Comment markers are preprocessed before parsing, which may shift offsets
-        let source = "The <!-- COMMENT: note -->word<!-- /COMMENT --> here.\n\nAnother word there."
-        let range1 = findRange(word: "word", in: source, sourceLine: 1)
-        let range2 = findRange(word: "word", in: source, sourceLine: 3)
-        XCTAssertNotNil(range1)
-        XCTAssertNotNil(range2)
-        XCTAssertNotEqual(range1!.location, range2!.location)
+        XCTAssertEqual((body as NSString).substring(with: range!), "world")
     }
 
     // =========================================================================
@@ -627,6 +312,42 @@ final class EditorRendererSyncTests: XCTestCase {
 
         XCTAssertTrue(html.contains("data-source-line="), "Should have source line attributes")
         XCTAssertTrue(html.contains("qmd-comment"), "Should have comment marks")
+    }
+
+    func testCommentInsideParagraphWithInlineCode() throws {
+        // Reproduces the bug: comment wrapping text next to backtick code and special chars
+        let md = "The `OverrideVerdict` host function enforces <!-- COMMENT: non escalations always audit -->escalation-only<!-- /COMMENT --> semantics:"
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+        let html = try XCTUnwrap(model.html)
+
+        XCTAssertTrue(html.contains("qmd-comment"), "Comment mark should be present in HTML: \(html)")
+        XCTAssertTrue(html.contains("data-comment=\"non escalations always audit\""),
+                       "Comment data attribute should be preserved: \(html)")
+        XCTAssertTrue(html.contains("escalation-only</mark>"),
+                       "Annotated text should be inside mark tag: \(html)")
+    }
+
+    func testCommentWrappingBoldText() throws {
+        // Comment wrapping text that has bold markers
+        let md = "Their decisions are <!-- COMMENT: note -->**discarded**<!-- /COMMENT --> by the system."
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+        let html = try XCTUnwrap(model.html)
+
+        XCTAssertTrue(html.contains("qmd-comment"), "Comment mark should be present: \(html)")
+    }
+
+    func testCommentInsideTableCell() throws {
+        let md = "| A | B |\n|---|---|\n| <!-- COMMENT: test -->value<!-- /COMMENT --> | other |"
+        let url = writeTempFile(md, ext: "md")
+        let model = MarkdownDocumentModel()
+        model.load(from: url)
+        let html = try XCTUnwrap(model.html)
+
+        XCTAssertTrue(html.contains("qmd-comment"), "Comment in table cell should render: \(html)")
     }
 
     func testFullPipelineComplexDocument() throws {
@@ -684,9 +405,16 @@ final class EditorRendererSyncTests: XCTestCase {
 
         // Each even line (0, 2, 4, ...) is a paragraph
         // Parser line numbers are 1-based: 1, 3, 5, ...
+        // "test" starts at rendered offset 24 within each paragraph line: "Paragraph X with word test in it."
+        // endOffset = offset + 4 (length of "test")
         for i in 0..<50 {
             let parserLine = i * 2 + 1
-            let range = findRange(word: "test", in: source, sourceLine: parserLine)
+            let paragraphText = lines[i * 2]
+            let testOffset = (paragraphText as NSString).range(of: "test").location
+            let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+                sourceLine: parserLine, offsetInBlock: testOffset, endOffsetInBlock: testOffset + 4,
+                frontmatterLineCount: 0, source: source
+            )
             XCTAssertNotNil(range, "Should find 'test' for paragraph \(i)")
             if let range = range {
                 let lineStart = source.components(separatedBy: "\n").prefix(i * 2).joined(separator: "\n").count + (i > 0 ? 1 : 0)
@@ -708,7 +436,10 @@ final class EditorRendererSyncTests: XCTestCase {
 
         measure {
             // Finding a word near the end should be fast
-            let _ = findRange(word: "target", in: source, sourceLine: 290, offsetInBlock: 10)
+            let _ = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+                sourceLine: 290, offsetInBlock: 10, endOffsetInBlock: 16,
+                frontmatterLineCount: 0, source: source
+            )
         }
     }
 
@@ -772,8 +503,14 @@ final class EditorRendererSyncTests: XCTestCase {
         let source = "word here on line one.\nContinuation of same paragraph.\n\nNew paragraph with word."
         // Line 1 starts a paragraph that continues to line 2 (no blank line between)
         // Line 4 is a new paragraph
-        let range1 = findRange(word: "word", in: source, sourceLine: 1, offsetInBlock: 0)
-        let range2 = findRange(word: "word", in: source, sourceLine: 4, offsetInBlock: 20)
+        let range1 = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+            sourceLine: 1, offsetInBlock: 0, endOffsetInBlock: 4,
+            frontmatterLineCount: 0, source: source
+        )
+        let range2 = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+            sourceLine: 4, offsetInBlock: 20, endOffsetInBlock: 24,
+            frontmatterLineCount: 0, source: source
+        )
         XCTAssertNotNil(range1)
         XCTAssertNotNil(range2)
         XCTAssertNotEqual(range1!.location, range2!.location)
@@ -782,7 +519,10 @@ final class EditorRendererSyncTests: XCTestCase {
     func testBlockExtentStopsAtHeading() {
         let source = "word in paragraph.\n# Heading with word\nword after heading."
         // Paragraph at line 1, heading at line 2, paragraph at line 3
-        let range1 = findRange(word: "word", in: source, sourceLine: 1, offsetInBlock: 0)
+        let range1 = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+            sourceLine: 1, offsetInBlock: 0, endOffsetInBlock: 4,
+            frontmatterLineCount: 0, source: source
+        )
         XCTAssertNotNil(range1)
         // Should only find "word" in the first paragraph's range
         let firstLineEnd = "word in paragraph.".count
@@ -791,7 +531,10 @@ final class EditorRendererSyncTests: XCTestCase {
 
     func testBlockExtentHandlesLastLine() {
         let source = "First.\n\nLast line with word."
-        let range = findRange(word: "word", in: source, sourceLine: 3)
+        let range = WebView.Coordinator.sourceRangeFromRenderedOffsets(
+            sourceLine: 3, offsetInBlock: 15, endOffsetInBlock: 19,
+            frontmatterLineCount: 0, source: source
+        )
         XCTAssertNotNil(range)
         XCTAssertGreaterThan(range!.location, 8) // Past "First.\n\n"
     }

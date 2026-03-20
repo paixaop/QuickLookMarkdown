@@ -25,12 +25,12 @@
   function onScroll() {
     if (!syncEnabled) return;
     if (scrollTimer) clearTimeout(scrollTimer);
-    scrollTimer = setTimeout(function() {
+    scrollTimer = setTimeout(function() {  // ~1 frame delay to batch scroll events
       var info = getTopVisibleLine();
       if (info) {
         __postWebkitMessage('editorSync', { type: 'scroll', line: info.line, fractionPast: info.fractionPast });
       }
-    }, 30);
+    }, 16);
   }
 
   window.addEventListener('scroll', onScroll, { passive: true });
@@ -84,10 +84,12 @@
 
     var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
     var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
-    var offsetInBlock = sel.rangeCount > 0 ? __getOffsetInBlock(el, sel.getRangeAt(0)) : -1;
+    var range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    var offsetInBlock = range ? __getOffsetInBlock(el, range) : -1;
+    var endOffsetInBlock = range ? __getEndOffsetInBlock(el, range) : -1;
 
     __postWebkitMessage('editorSync', {
-      type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock
+      type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock
     });
   });
 })();

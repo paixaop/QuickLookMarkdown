@@ -92,8 +92,10 @@
     var el = __findSourceLineAncestor(sel.anchorNode);
     if (!el) return null;
     var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
-    var offsetInBlock = sel.rangeCount > 0 ? __getOffsetInBlock(el, sel.getRangeAt(0)) : -1;
-    return { sourceLine: sourceLine, offsetInBlock: offsetInBlock, text: sel.toString().trim() };
+    var range = sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    var offsetInBlock = range ? __getOffsetInBlock(el, range) : -1;
+    var endOffsetInBlock = range ? __getEndOffsetInBlock(el, range) : -1;
+    return { sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock, text: sel.toString().trim() };
   };
 
   // Helpers for native context menu integration.
