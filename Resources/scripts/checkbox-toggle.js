@@ -5,10 +5,7 @@
       cb.disabled = false;
       cb.style.cursor = 'pointer';
       cb.addEventListener('change', function(e) {
-        var checked = e.target.checked;
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.checkboxToggle) {
-          window.webkit.messageHandlers.checkboxToggle.postMessage({index: index, checked: checked});
-        }
+        __postWebkitMessage('checkboxToggle', { index: index, checked: e.target.checked });
       });
     });
   };

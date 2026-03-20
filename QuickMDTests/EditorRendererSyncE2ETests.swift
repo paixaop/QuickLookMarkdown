@@ -74,6 +74,7 @@ final class EditorRendererSyncE2ETests: XCTestCase {
     /// katex, graphviz) which can fail to load in test environments. These aren't needed
     /// for DOM structure, interaction, and navigation E2E tests.
     private static let coreScripts: [String] = [
+        MarkdownDocumentModel.utilsScript,
         MarkdownDocumentModel.themeScript,
         MarkdownDocumentModel.highlightRenderScript,
         MarkdownDocumentModel.lineNumbersScript,
@@ -191,18 +192,26 @@ final class EditorRendererSyncE2ETests: XCTestCase {
         )
     }
 
-    /// Simulate a double-click by selecting a word and calling the dblclick logic manually.
-    /// Returns the message that would be sent to Swift.
+    /// Simulate a double-click by selecting a word and reading source mapping in one JS turn.
+    /// (Splitting find + read across two `evaluateJavaScript` calls can lose the selection in WKWebView.)
     private func simulateDoubleClick(selectingWord word: String, occurrence: Int = 1) -> (sourceLine: Int, sourceCol: Int, offsetInBlock: Int)? {
-        guard selectText(word, occurrence: occurrence) else { return nil }
-
-        // Call the source info function (same logic as dblclick handler)
+        let escaped = word.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
         let js = """
         (function() {
+            window.getSelection().removeAllRanges();
+            var range = document.createRange();
+            var article = document.querySelector('article.markdown-body');
+            if (!article) return null;
+            range.setStart(article, 0);
+            range.collapse(true);
+            window.getSelection().addRange(range);
+            for (var i = 0; i < \(occurrence); i++) {
+                if (!window.find('\(escaped)', false, false, true)) return null;
+            }
             var sel = window.getSelection();
-            if (!sel || sel.rangeCount === 0) return null;
-            var word = sel.toString().trim();
-            if (!word) return null;
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+            var w = sel.toString().trim();
+            if (!w) return null;
 
             var el = sel.anchorNode;
             while (el && el !== document.body) {
@@ -213,13 +222,12 @@ final class EditorRendererSyncE2ETests: XCTestCase {
 
             var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
             var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
-
             var offsetInBlock = -1;
             try {
-                var range = sel.getRangeAt(0);
+                var r = sel.getRangeAt(0);
                 var preRange = document.createRange();
                 preRange.setStart(el, 0);
-                preRange.setEnd(range.startContainer, range.startOffset);
+                preRange.setEnd(r.startContainer, r.startOffset);
                 offsetInBlock = preRange.toString().length;
             } catch(ex) {}
 
@@ -710,18 +718,20 @@ final class EditorRendererSyncE2ETests: XCTestCase {
     }
 
     func testFullRoundTripWithFormatting() throws {
-        let md = "The **word** is bold.\n\nThe *word* is italic."
+        // Use distinctive tokens: reading-stats.js prepends "… words · … min read" to the article,
+        // and window.find('word') matches the substring "word" inside "words" before real content.
+        let md = "The **qmdBoldToken** is strong.\n\nThe *qmdItalicToken* is emphasis."
         let (_, model) = try loadMarkdown(md)
 
-        let info1 = simulateDoubleClick(selectingWord: "word", occurrence: 1)
-        let info2 = simulateDoubleClick(selectingWord: "word", occurrence: 2)
+        let info1 = simulateDoubleClick(selectingWord: "qmdBoldToken", occurrence: 1)
+        let info2 = simulateDoubleClick(selectingWord: "qmdItalicToken", occurrence: 1)
 
         XCTAssertNotNil(info1)
         XCTAssertNotNil(info2)
 
         if let i1 = info1, let i2 = info2 {
-            let r1 = WebView.Coordinator.findWordRange(word: "word", in: model.rawContent, sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, frontmatterLineCount: 0)
-            let r2 = WebView.Coordinator.findWordRange(word: "word", in: model.rawContent, sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, frontmatterLineCount: 0)
+            let r1 = WebView.Coordinator.findWordRange(word: "qmdBoldToken", in: model.rawContent, sourceLine: i1.sourceLine, offsetInBlock: i1.offsetInBlock, frontmatterLineCount: 0)
+            let r2 = WebView.Coordinator.findWordRange(word: "qmdItalicToken", in: model.rawContent, sourceLine: i2.sourceLine, offsetInBlock: i2.offsetInBlock, frontmatterLineCount: 0)
             XCTAssertNotNil(r1)
             XCTAssertNotNil(r2)
             XCTAssertNotEqual(r1!.location, r2!.location, "Should find different occurrences")

@@ -1011,9 +1011,11 @@ final class MarkdownDocumentModelTests: XCTestCase {
 
     // MARK: - Font Size Script
 
-    func testFontSizeScriptIsEmpty() {
-        // Zoom is handled natively via WKWebView.pageZoom
-        XCTAssertEqual(MarkdownDocumentModel.fontSizeScript, "", "Font size script should be empty (native zoom)")
+    func testFontSizeScriptKeyboardZoom() {
+        let script = MarkdownDocumentModel.fontSizeScript
+        XCTAssertTrue(script.contains("fontSize"), "Should adjust root font size")
+        XCTAssertTrue(script.contains("metaKey"), "Should use ⌘ for shortcuts")
+        XCTAssertTrue(script.contains("keydown"), "Should listen for keydown")
     }
 
     // MARK: - Highlight Render Script

@@ -124,7 +124,7 @@ The `extensionToLanguage` dictionary in both `MarkdownDocumentModel.swift` and `
 2. **E2E test pattern:**
    - Create a `WKWebView` in the test
    - Load rendered HTML via `MarkdownDocumentModel` (use `loadHTMLString`)
-   - Inject all JS scripts (`editorSyncScript`, `commentScript`, `commentsSidebarScript`, `sidebarArrangeScript`)
+   - Inject the same scripts as `EditorRendererSyncE2ETests.coreScripts` (theme, highlight, `headingDataScript`, `editorSyncScript`, `commentScript`, `contentUpdateScript`, etc.) — sidebar UI is native SwiftUI, not JS
    - Wait for load (use `expectation` with ~1.5s timeout)
    - Use `evaluateJavaScript` to interact with the DOM (select text, click elements, read attributes)
    - Verify the JS functions return correct values

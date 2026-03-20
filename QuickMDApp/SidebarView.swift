@@ -313,6 +313,7 @@ struct FileNodeRow: View {
 struct SidebarResizeHandle: View {
     @Binding var width: Double
     var isLeading: Bool
+    @GestureState private var dragStartWidth: Double? = nil
 
     var body: some View {
         Rectangle()
@@ -328,9 +329,13 @@ struct SidebarResizeHandle: View {
             }
             .gesture(
                 DragGesture(minimumDistance: 1)
+                    .updating($dragStartWidth) { _, state, _ in
+                        if state == nil { state = width }
+                    }
                     .onChanged { value in
+                        let startWidth = dragStartWidth ?? width
                         let delta = isLeading ? value.translation.width : -value.translation.width
-                        width = max(100, min(width + delta, 500))
+                        width = max(100, min(startWidth + delta, 500))
                     }
             )
     }

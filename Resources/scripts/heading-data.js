@@ -5,12 +5,10 @@
   function buildHeadingData() {
     var headings = content.querySelectorAll('h1, h2, h3, h4, h5, h6');
     if (headings.length === 0) {
-      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.tocData) {
-        window.webkit.messageHandlers.tocData.postMessage({ headings: [] });
-      }
+      __postWebkitMessage('tocData', { headings: [] });
       return;
     }
-    // Assign slug IDs (GitHub-style)
+    // Assign slug IDs (GitHub-style).
     var slugCounts = {};
     headings.forEach(function(h) {
       var text = h.textContent || '';
@@ -22,38 +20,30 @@
       h.id = slug;
     });
 
-    // Build heading data array
+    // Build heading data array.
     var data = [];
     headings.forEach(function(h) {
-      var sourceLine = parseInt(h.getAttribute('data-source-line') || '0', 10);
       data.push({
         id: h.id,
         text: h.textContent.trim(),
         level: parseInt(h.tagName.charAt(1), 10),
-        sourceLine: sourceLine
+        sourceLine: parseInt(h.getAttribute('data-source-line') || '0', 10)
       });
     });
-    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.tocData) {
-      window.webkit.messageHandlers.tocData.postMessage({ headings: data });
-    }
+    __postWebkitMessage('tocData', { headings: data });
 
-    // Active heading tracking via IntersectionObserver
+    // Active heading tracking via IntersectionObserver.
     if (window.__tocObserver) window.__tocObserver.disconnect();
     window.__tocObserver = new IntersectionObserver(function(entries) {
       entries.forEach(function(entry) {
         if (entry.isIntersecting && entry.target.id) {
-          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.tocData) {
-            window.webkit.messageHandlers.tocData.postMessage({ activeHeadingID: entry.target.id });
-          }
+          __postWebkitMessage('tocData', { activeHeadingID: entry.target.id });
         }
       });
     }, { root: null, rootMargin: '0px 0px -70% 0px', threshold: 0.1 });
     headings.forEach(function(h) { window.__tocObserver.observe(h); });
   }
 
-  // Expose for incremental updates
   window.__rebuildHeadingData = buildHeadingData;
-
-  // Initial build
   buildHeadingData();
 })();

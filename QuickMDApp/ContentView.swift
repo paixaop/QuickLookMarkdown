@@ -225,7 +225,8 @@ class WebViewStore: ObservableObject {
         tabBackStack.append(url)
     }
 
-    private var isNavigatingHistory = false
+    /// True while programmatic tab history navigation is in progress (suppresses duplicate stack pushes).
+    var isNavigatingHistory = false
 
     func goBackTab() {
         guard let prev = tabBackStack.popLast() else { return }
@@ -279,6 +280,13 @@ struct WebView: NSViewRepresentable {
         var lastHTML: String?
         var lastTheme: String?
 
+        /// Scroll a WKWebView to an element by its ID (fragment/anchor).
+        private func scrollToFragment(_ fragment: String, in webView: WKWebView) {
+            let safeFragment = fragment.replacingOccurrences(of: "'", with: "\\'")
+            let js = "document.getElementById('\(safeFragment)')?.scrollIntoView({behavior:'auto'})"
+            webView.evaluateJavaScript(js) { _, _ in }
+        }
+
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let body = message.body as? [String: Any] else { return }
 
@@ -321,24 +329,6 @@ struct WebView: NSViewRepresentable {
                 } else if type == "add" {
                     let text = body["text"] as? String ?? ""
                     showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true)
-                } else if type == "sidebarClick" {
-                    // Jump editor to comment at index
-                    let index = body["index"] as? Int ?? 0
-                    guard let model = AppDelegate.activeModel else { return }
-                    let comments = MarkdownDocumentModel.parseComments(in: model.rawContent)
-                    guard index < comments.count else { return }
-                    let comment = comments[index]
-                    // Find the editor text view and jump to the comment
-                    if let textView = self.findEditorTextView() {
-                        textView.setSelectedRange(comment.range)
-                        textView.scrollRangeToVisible(comment.range)
-                    }
-                } else if type == "sidebarDelete" {
-                    let index = body["index"] as? Int ?? 0
-                    guard let model = AppDelegate.activeModel else { return }
-                    let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
-                    model.setContent(updated, actionName: "Remove Comment")
-                    self.forceRefreshContent(model: model)
                 }
 
             case "tocData":
@@ -399,7 +389,7 @@ struct WebView: NSViewRepresentable {
             }
         }
 
-        private func openFileLink(_ url: URL) {
+        func openFileLink(_ url: URL) {
             let standardized = url.standardizedFileURL
 
             // Check if already open in an existing tab/window
@@ -414,10 +404,8 @@ struct WebView: NSViewRepresentable {
                         tabGroup.selectedWindow = window
                     }
                     // Scroll to anchor fragment if present
-                    if let fragment = url.fragment {
-                        let safeFragment = fragment.replacingOccurrences(of: "'", with: "\\'")
-                        let js = "document.getElementById('\(safeFragment)')?.scrollIntoView({behavior:'auto'})"
-                        Self.findWebView(in: window)?.evaluateJavaScript(js) { _, _ in }
+                    if let fragment = url.fragment, let wk = Self.findWebView(in: window) {
+                        scrollToFragment(fragment, in: wk)
                     }
                     return
                 }
@@ -445,37 +433,39 @@ struct WebView: NSViewRepresentable {
 
         // MARK: - Renderer → Editor scroll sync (line-anchored)
 
-        private func scrollEditorToLine(_ line: Int, fractionPast: CGFloat = 0) {
-            guard let model = AppDelegate.activeModel,
-                  let textView = findEditorTextView(),
-                  let scrollView = textView.enclosingScrollView,
+        /// Scroll a text view to a given source line. Shared by editor sync and sidebar TOC click.
+        static func scrollTextView(_ textView: NSTextView, toSourceLine line: Int, fractionPast: CGFloat = 0, frontmatterLineCount: Int, rawContent: String) {
+            guard let scrollView = textView.enclosingScrollView,
                   let layoutManager = textView.layoutManager,
                   let textContainer = textView.textContainer else { return }
 
-            let source = model.rawContent
-            let adjustedLine = line + model.frontmatterLineCount - 1 // 0-based
-            let lines = source.components(separatedBy: "\n")
+            let adjustedLine = line + frontmatterLineCount - 1 // 0-based
+            let lines = rawContent.components(separatedBy: "\n")
             guard adjustedLine >= 0, adjustedLine < lines.count else { return }
 
-            // Calculate character offset for this line
             var charOffset = 0
             for i in 0..<adjustedLine {
-                charOffset += lines[i].count + 1 // +1 for newline
+                charOffset += lines[i].count + 1
             }
 
-            let nsLength = (source as NSString).length
+            let nsLength = (rawContent as NSString).length
             guard nsLength > 0 else { return }
 
-            // Get the glyph rect for this character position
             let safeOffset = min(charOffset, nsLength - 1)
             let glyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: safeOffset, length: 1), actualCharacterRange: nil)
             let lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
 
-            // Scroll to this line, offset by fractionPast * line height
-            WebViewStore.shared.suppressEditorToRenderer = true
             let targetY = lineRect.origin.y + (fractionPast * lineRect.height) - textView.textContainerInset.height
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
             scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+
+        private func scrollEditorToLine(_ line: Int, fractionPast: CGFloat = 0) {
+            guard let model = AppDelegate.activeModel,
+                  let textView = findEditorTextView() else { return }
+
+            WebViewStore.shared.suppressEditorToRenderer = true
+            Self.scrollTextView(textView, toSourceLine: line, fractionPast: fractionPast, frontmatterLineCount: model.frontmatterLineCount, rawContent: model.rawContent)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 WebViewStore.shared.suppressEditorToRenderer = false
             }
@@ -599,7 +589,6 @@ struct WebView: NSViewRepresentable {
                         let updated = MarkdownDocumentModel.updateComment(at: index, newComment: newComment, in: model.rawContent)
                         model.setContent(updated, actionName: "Update Comment")
                     }
-                    self.forceRefreshContent(model: model)
                 },
                 onDelete: isNew ? nil : {
                     WebViewStore.shared.commentPanelOpen = false
@@ -607,7 +596,6 @@ struct WebView: NSViewRepresentable {
                     guard let model = AppDelegate.activeModel else { return }
                     let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
                     model.setContent(updated, actionName: "Remove Comment")
-                    self.forceRefreshContent(model: model)
                 },
                 onCancel: {
                     WebViewStore.shared.commentPanelOpen = false
@@ -668,17 +656,6 @@ struct WebView: NSViewRepresentable {
             return nil
         }
 
-        /// Force an immediate incremental content refresh in the WebView after comment changes.
-        private func forceRefreshContent(model: MarkdownDocumentModel) {
-            guard let webView = WebViewStore.shared.webView else { return }
-            let bodyHTML = MarkdownDocumentModel.markdownBodyHTML(from: model.rawContent)
-            let escaped = bodyHTML
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "`", with: "\\`")
-                .replacingOccurrences(of: "${", with: "\\${")
-            webView.evaluateJavaScript("if(window.__updateContent) __updateContent(`\(escaped)`)") { _, _ in }
-        }
-
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             // Allow initial page load and fragment (anchor) navigation
             if navigationAction.navigationType == .other {
@@ -736,14 +713,14 @@ struct WebView: NSViewRepresentable {
             // Scroll to anchor fragment if navigating to a URL with #fragment
             if let fragment = AppDelegate.activeModel?.pendingFragment {
                 AppDelegate.activeModel?.pendingFragment = nil
-                let safeFragment = fragment.replacingOccurrences(of: "'", with: "\\'")
-                let js = "document.getElementById('\(safeFragment)')?.scrollIntoView({behavior:'auto'})"
-                webView.evaluateJavaScript(js) { _, _ in }
+                scrollToFragment(fragment, in: webView)
             }
 
-            // Refresh native sidebar file tree
-            DispatchQueue.main.async {
-                AppDelegate.activeModel?.refreshFileTree()
+            // Refresh native sidebar file tree (skip for edit-driven reloads — file tree doesn't change)
+            if !store.isEditReload {
+                DispatchQueue.main.async {
+                    AppDelegate.activeModel?.refreshFileTree()
+                }
             }
         }
 
@@ -769,7 +746,13 @@ struct WebView: NSViewRepresentable {
         MarkdownDocumentModel.log("WebView.makeNSView called, html length=\(html.count)")
         let config = WKWebViewConfiguration()
 
-        // 1. Theme script (first, so __setTheme is available)
+        // 0. Utils script (first, so shared helpers are available to all scripts)
+        config.userContentController.addUserScript(WKUserScript(
+            source: MarkdownDocumentModel.utilsScript,
+            injectionTime: .atDocumentEnd, forMainFrameOnly: true
+        ))
+
+        // 1. Theme script (so __setTheme is available)
         config.userContentController.addUserScript(WKUserScript(
             source: MarkdownDocumentModel.themeScript,
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
@@ -911,7 +894,7 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
         ))
 
-        // 20. Anchor links (after TOC assigns IDs)
+        // 20. Anchor links (after heading-data assigns IDs)
         config.userContentController.addUserScript(WKUserScript(
             source: MarkdownDocumentModel.anchorLinksScript,
             injectionTime: .atDocumentEnd, forMainFrameOnly: true
@@ -1263,6 +1246,17 @@ struct SearchBar: View {
     }
 }
 
+// MARK: - ContentView helpers
+
+fileprivate func findEditableTextView(in view: NSView?) -> NSTextView? {
+    guard let view = view else { return nil }
+    if let tv = view as? NSTextView, tv.isEditable { return tv }
+    for sub in view.subviews {
+        if let found = findEditableTextView(in: sub) { return found }
+    }
+    return nil
+}
+
 // MARK: - ContentView
 
 struct ContentView: View {
@@ -1283,7 +1277,6 @@ struct ContentView: View {
         contentLayout
             .modifier(ContentViewToolbar(model: model, webViewStore: webViewStore, showEditor: $showEditor, showSearchBar: $showSearchBar, showSidebar: $showSidebar, activePanel: $activePanel))
             .modifier(ContentViewLifecycle(model: model, showEditor: $showEditor))
-            .modifier(ContentViewNotifications(model: model))
     }
 }
 
@@ -1436,7 +1429,7 @@ private struct ContentViewLifecycle: ViewModifier {
                 if let window = WebViewStore.shared.webView?.window {
                     window.isDocumentEdited = false
                 }
-                Self.pushIncrementalUpdate(model: model)
+                ContentView.pushIncrementalUpdate(model: model)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .addCommentAction)) { _ in
@@ -1445,7 +1438,7 @@ private struct ContentViewLifecycle: ViewModifier {
             guard !WebViewStore.shared.commentPanelOpen else { return }
             // Try editor selection first
             if let window = NSApp.keyWindow,
-               let textView = findEditorTextViewInContentView(window.contentView),
+               let textView = findEditableTextView(in: window.contentView),
                textView.selectedRange().length > 0,
                let selectedText = (textView.string as NSString?)?.substring(with: textView.selectedRange()) {
                 let selectedRange = textView.selectedRange()
@@ -1508,7 +1501,7 @@ private struct ContentViewLifecycle: ViewModifier {
             guard AppDelegate.activeModel === model else { return }
             // Remove the comment at the cursor position in the editor
             guard let window = NSApp.keyWindow,
-                  let textView = findEditorTextViewInContentView(window.contentView) else { return }
+                  let textView = findEditableTextView(in: window.contentView) else { return }
             let cursorLocation = textView.selectedRange().location
             let comments = MarkdownDocumentModel.parseComments(in: model.rawContent)
             // Find the comment whose range contains the cursor
@@ -1521,6 +1514,9 @@ private struct ContentViewLifecycle: ViewModifier {
             }
         }
     }
+}
+
+extension ContentView {
 
     // MARK: - Content Layout
 
@@ -1672,12 +1668,12 @@ private struct ContentViewLifecycle: ViewModifier {
                     window.isDocumentEdited = true
                 }
                 model.isDirty = true
-                model.refreshParsedComments()
                 editorDebounceTask?.cancel()
                 editorDebounceTask = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     guard !Task.isCancelled else { return }
-                    Self.pushIncrementalUpdate(model: model)
+                    model.refreshParsedComments()
+                    ContentView.pushIncrementalUpdate(model: model)
                 }
             }
         } else {
@@ -1700,26 +1696,12 @@ private struct ContentViewLifecycle: ViewModifier {
                     "document.getElementById('\(safeID)')?.scrollIntoView({behavior:'smooth'})"
                 ) { _, _ in }
                 // Scroll editor to heading's source line
-                if let textView = findEditorTextViewInContentView(NSApp.keyWindow?.contentView),
-                   let scrollView = textView.enclosingScrollView,
-                   let layoutManager = textView.layoutManager,
-                   let textContainer = textView.textContainer {
-                    let adjustedLine = heading.sourceLine + model.frontmatterLineCount - 1
-                    let lines = model.rawContent.components(separatedBy: "\n")
-                    guard adjustedLine >= 0, adjustedLine < lines.count else { return }
-                    var charOffset = 0
-                    for i in 0..<adjustedLine { charOffset += lines[i].count + 1 }
-                    let nsLength = (model.rawContent as NSString).length
-                    guard nsLength > 0 else { return }
-                    let safeOffset = min(charOffset, nsLength - 1)
-                    let glyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: safeOffset, length: 1), actualCharacterRange: nil)
-                    let lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-                    scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, lineRect.origin.y - textView.textContainerInset.height)))
-                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                if let textView = findEditableTextView(in: NSApp.keyWindow?.contentView) {
+                    WebView.Coordinator.scrollTextView(textView, toSourceLine: heading.sourceLine, frontmatterLineCount: model.frontmatterLineCount, rawContent: model.rawContent)
                 }
             },
             onCommentClick: { comment in
-                if let textView = findEditorTextViewInContentView(NSApp.keyWindow?.contentView) {
+                if let textView = findEditableTextView(in: NSApp.keyWindow?.contentView) {
                     if !showEditor { showEditor = true }
                     DispatchQueue.main.asyncAfter(deadline: .now() + (showEditor ? 0 : 0.3)) {
                         textView.setSelectedRange(comment.range)
@@ -1741,35 +1723,12 @@ private struct ContentViewLifecycle: ViewModifier {
                 let updated = MarkdownDocumentModel.removeComment(at: comment.id, in: model.rawContent)
                 model.setContent(updated, actionName: "Remove Comment")
                 model.refreshParsedComments()
-                Self.pushIncrementalUpdate(model: model)
             },
             onFileClick: { path in
                 let url = URL(fileURLWithPath: path)
-                if url.isFileURL {
-                    // Same logic as fileClick handler
-                    let _ = MarkdownDocumentModel.accessDirectoryForFile(url)
-                    let openInNewTab = UserDefaults.standard.bool(forKey: "openLinksInNewTab")
-                    if openInNewTab {
-                        if let current = AppDelegate.activeModel?.currentURL {
-                            WebViewStore.shared.pushTabHistory(current)
-                        }
-                        AppDelegate.pendingURL = url
-                        NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
-                    } else {
-                        model.navigateTo(url)
-                    }
-                }
+                WebViewStore.shared.webView?.commentCoordinator?.openFileLink(url)
             }
         )
-    }
-
-    private func findEditorTextViewInContentView(_ view: NSView?) -> NSTextView? {
-        guard let view = view else { return nil }
-        if let tv = view as? NSTextView, tv.isEditable { return tv }
-        for sub in view.subviews {
-            if let found = findEditorTextViewInContentView(sub) { return found }
-        }
-        return nil
     }
 
     /// Push an incremental DOM update to the renderer WebView from the current model content.

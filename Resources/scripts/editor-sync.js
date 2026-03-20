@@ -3,7 +3,7 @@
   window.__editorSyncPause = function() { syncEnabled = false; };
   window.__editorSyncResume = function() { syncEnabled = true; };
 
-  // Line-anchored sync: find the topmost visible element with data-source-line
+  // Line-anchored sync: find the topmost visible element with data-source-line.
   function getTopVisibleLine() {
     var elements = document.querySelectorAll('[data-source-line]');
     for (var i = 0; i < elements.length; i++) {
@@ -20,24 +20,22 @@
     return null;
   }
 
-  // Report scroll position as line number to Swift
+  // Report scroll position as line number to Swift.
   var scrollTimer = null;
   function onScroll() {
     if (!syncEnabled) return;
     if (scrollTimer) clearTimeout(scrollTimer);
     scrollTimer = setTimeout(function() {
       var info = getTopVisibleLine();
-      if (info && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-        window.webkit.messageHandlers.editorSync.postMessage({
-          type: 'scroll', line: info.line, fractionPast: info.fractionPast
-        });
+      if (info) {
+        __postWebkitMessage('editorSync', { type: 'scroll', line: info.line, fractionPast: info.fractionPast });
       }
     }, 30);
   }
 
-  window.addEventListener('scroll', onScroll, {passive: true});
+  window.addEventListener('scroll', onScroll, { passive: true });
 
-  // Scroll renderer to a specific source line
+  // Scroll renderer to a specific source line.
   window.__scrollToLine = function(line, fractionPast) {
     fractionPast = fractionPast || 0;
     var elements = document.querySelectorAll('[data-source-line]');
@@ -54,10 +52,9 @@
     }
   };
 
-  // Expose for external queries
   window.__getTopVisibleLine = getTopVisibleLine;
 
-  // Deprecated fraction-based API kept for scroll preservation on reload
+  // Deprecated fraction-based API kept for scroll preservation on reload.
   window.__getScrollFraction = function() {
     var el = document.documentElement;
     var maxScroll = el.scrollHeight - el.clientHeight;
@@ -69,47 +66,28 @@
     if (maxScroll > 0) el.scrollTop = fraction * maxScroll;
   };
 
-  // Double-click: find the clicked text and use data-source-line for precise mapping
+  // Double-click: find the clicked text and use data-source-line for precise mapping.
   document.addEventListener('dblclick', function(e) {
     var sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return;
     var word = sel.toString().trim();
     if (!word) return;
 
-    // Walk up to find nearest element with data-source-line
-    var el = sel.anchorNode;
-    while (el && el !== document.body) {
-      if (el.nodeType === 1 && el.hasAttribute('data-source-line')) break;
-      el = el.parentNode;
-    }
+    var el = __findSourceLineAncestor(sel.anchorNode);
 
-    if (!el || !el.hasAttribute || !el.hasAttribute('data-source-line')) {
-      // Fallback: send without source line
-      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-        window.webkit.messageHandlers.editorSync.postMessage({
-          type: 'dblclick', word: word, sourceLine: -1, sourceCol: -1, offsetInBlock: -1
-        });
-      }
+    if (!el) {
+      __postWebkitMessage('editorSync', {
+        type: 'dblclick', word: word, sourceLine: -1, sourceCol: -1, offsetInBlock: -1
+      });
       return;
     }
 
     var sourceLine = parseInt(el.getAttribute('data-source-line'), 10);
     var sourceCol = parseInt(el.getAttribute('data-source-col') || '1', 10);
+    var offsetInBlock = sel.rangeCount > 0 ? __getOffsetInBlock(el, sel.getRangeAt(0)) : -1;
 
-    // Character offset of clicked word within this block's text
-    var offsetInBlock = -1;
-    try {
-      var range = sel.getRangeAt(0);
-      var preRange = document.createRange();
-      preRange.setStart(el, 0);
-      preRange.setEnd(range.startContainer, range.startOffset);
-      offsetInBlock = preRange.toString().length;
-    } catch(ex) {}
-
-    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorSync) {
-      window.webkit.messageHandlers.editorSync.postMessage({
-        type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock
-      });
-    }
+    __postWebkitMessage('editorSync', {
+      type: 'dblclick', word: word, sourceLine: sourceLine, sourceCol: sourceCol, offsetInBlock: offsetInBlock
+    });
   });
 })();
