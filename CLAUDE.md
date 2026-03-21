@@ -1,5 +1,10 @@
 # QuickMD - Project Notes
 
+## Code Rules
+
+- **No silent fallbacks.** If a code path fails, it must log the error and surface it visibly — never silently try an alternative approach. Fix the root cause instead of adding fallback logic. Fallbacks mask bugs and make debugging harder.
+- **No silent failures.** Every `catch` block must log the error with enough context to diagnose the problem (function name, parameters, what was attempted). File write failures in particular must be immediately visible.
+
 ## GitHub
 
 - **Always use the `paixaop` GitHub account** for this repo (not `darksectorai`). **You must** run `gh auth switch --user paixaop` before any `gh` commands in this workspace — do not assume the default logged-in user is correct.

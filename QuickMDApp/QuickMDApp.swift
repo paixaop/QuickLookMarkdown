@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
@@ -14,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MarkdownDocumentModel.log("applicationDidFinishLaunching")
         NSWindow.allowsAutomaticWindowTabbing = true
-        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true, "spellCheck": true, "autoPair": true])
+        UserDefaults.standard.register(defaults: ["openLinksInNewTab": true, "spellCheck": true, "autoPair": true, "focusMode": false])
         // Disable state restoration so previous documents don't reopen on launch
         UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         // Close restored blank windows — keep only windows that have content or the one that will receive a file
@@ -71,16 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MarkdownDocumentModel.log("openFiles called: \(filenames)")
         if let path = filenames.first {
             let url = URL(fileURLWithPath: path)
-            // Always store as pending — macOS creates a new tab for document opens,
-            // so the new tab's onAppear will pick it up.
             Self.pendingURL = url
-            // Fallback: if no new tab appears within 0.5s, load into active tab
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                if Self.pendingURL != nil, let model = Self.activeModel {
-                    model.load(from: url)
-                    Self.pendingURL = nil
-                }
-            }
+            // Notify any active ContentView to load the file.
+            // On cold start, onAppear will pick up pendingURL directly.
+            NotificationCenter.default.post(name: .openFileRequest, object: url)
         }
         sender.reply(toOpenOrPrint: .success)
     }
@@ -452,6 +447,7 @@ struct QuickMDApp: App {
     @AppStorage("wordWrap") private var wordWrap = false
     @AppStorage("spellCheck") private var spellCheck = true
     @AppStorage("autoPair") private var autoPair = true
+    @AppStorage("focusMode") private var focusMode = false
     @FocusedValue(\.documentModel) private var activeModel
     @FocusedValue(\.showEditor) private var showEditor
     @FocusedValue(\.showSearchBar) private var showSearchBar
@@ -500,11 +496,18 @@ struct QuickMDApp: App {
                 Divider()
 
                 Button("Save") {
-                    guard let model = activeModel ?? AppDelegate.activeModel,
+                    guard let model = activeModel,
                           let url = model.currentURL else { return }
+                    // Re-acquire sandbox access for the write
+                    let dirAccess = MarkdownDocumentModel.accessDirectoryForFile(url)
+                    let didAccess = url.startAccessingSecurityScopedResource()
+                    defer {
+                        if didAccess { url.stopAccessingSecurityScopedResource() }
+                        dirAccess?.stopAccessingSecurityScopedResource()
+                    }
                     try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
                     model.markClean()
-                    if let window = WebViewStore.shared.webView?.window {
+                    if let window = NSApp.keyWindow {
                         window.isDocumentEdited = false
                     }
                     ContentView.pushIncrementalUpdate(model: model)
@@ -803,6 +806,9 @@ struct QuickMDApp: App {
                         if !binding.wrappedValue { binding.wrappedValue = true }
                     }
                 }
+                Divider()
+                Toggle("Focus Mode", isOn: $focusMode)
+                    .help("Hide sidebar and in-window search for a distraction-free layout")
             }
             CommandMenu("Tools") {
                 Button("Find\u{2026}") {
@@ -966,7 +972,7 @@ extension QuickMDApp {
 
     @available(macOS 26.0, *)
     private func aiTransform(action: AIHelper.Action) {
-        guard let model = activeModel ?? AppDelegate.activeModel else { return }
+        guard let model = activeModel else { return }
         let selectedText = getSelectedEditorText()
         let selectionRange = getEditorSelectionRange()
         let textToTransform = selectedText ?? model.rawContent
@@ -1006,7 +1012,7 @@ extension QuickMDApp {
 
     @available(macOS 26.0, *)
     private func aiGenerateFrontmatter() {
-        guard let model = activeModel ?? AppDelegate.activeModel, !model.rawContent.isEmpty else { return }
+        guard let model = activeModel, !model.rawContent.isEmpty else { return }
         guard !model.rawContent.hasPrefix("---\n") else {
             let alert = NSAlert()
             alert.messageText = "Frontmatter Exists"
@@ -1034,7 +1040,7 @@ extension QuickMDApp {
 
     @available(macOS 26.0, *)
     private func aiCleanupDocument() {
-        guard let model = activeModel ?? AppDelegate.activeModel, !model.rawContent.isEmpty else { return }
+        guard let model = activeModel, !model.rawContent.isEmpty else { return }
 
         AIProgressHUD.shared.show("Cleaning up document\u{2026}")
         Task { @MainActor in
@@ -1224,6 +1230,86 @@ private func setEditorSelection(_ range: NSRange) {
     tv.scrollRangeToVisible(range)
 }
 
+// MARK: - File Type Association Model
+
+struct FileTypeAssociation: Identifiable {
+    let id: String  // primary UTI
+    let name: String
+    let extensions: [String]
+    let utis: [String]
+    let category: String
+}
+
+private let fileTypeAssociations: [FileTypeAssociation] = [
+    // Documents
+    FileTypeAssociation(id: "net.daringfireball.markdown", name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd"], utis: ["net.daringfireball.markdown", "public.markdown", "org.commonmark.markdown"], category: "Documents"),
+    FileTypeAssociation(id: "public.json", name: "JSON", extensions: ["json"], utis: ["public.json"], category: "Documents"),
+    FileTypeAssociation(id: "public.yaml", name: "YAML", extensions: ["yaml", "yml"], utis: ["public.yaml"], category: "Documents"),
+    FileTypeAssociation(id: "public.html", name: "HTML", extensions: ["html", "htm"], utis: ["public.html"], category: "Documents"),
+    FileTypeAssociation(id: "public.xml", name: "XML", extensions: ["xml"], utis: ["public.xml"], category: "Documents"),
+    FileTypeAssociation(id: "public.toml", name: "TOML", extensions: ["toml"], utis: ["public.toml"], category: "Documents"),
+    FileTypeAssociation(id: "public.ini", name: "INI / Config", extensions: ["ini", "conf", "cfg"], utis: ["public.ini"], category: "Documents"),
+    FileTypeAssociation(id: "public.css", name: "CSS", extensions: ["css"], utis: ["public.css"], category: "Documents"),
+    FileTypeAssociation(id: "public.sql", name: "SQL", extensions: ["sql"], utis: ["public.sql"], category: "Documents"),
+    // Languages
+    FileTypeAssociation(id: "public.swift-source", name: "Swift", extensions: ["swift"], utis: ["public.swift-source"], category: "Languages"),
+    FileTypeAssociation(id: "public.python-script", name: "Python", extensions: ["py"], utis: ["public.python-script"], category: "Languages"),
+    FileTypeAssociation(id: "com.netscape.javascript-source", name: "JavaScript", extensions: ["js", "jsx", "mjs"], utis: ["com.netscape.javascript-source"], category: "Languages"),
+    FileTypeAssociation(id: "public.type-script", name: "TypeScript", extensions: ["ts", "tsx"], utis: ["public.type-script", "com.microsoft.typescript"], category: "Languages"),
+    FileTypeAssociation(id: "com.sun.java-source", name: "Java", extensions: ["java"], utis: ["com.sun.java-source"], category: "Languages"),
+    FileTypeAssociation(id: "org.rust-lang.rust", name: "Rust", extensions: ["rs"], utis: ["org.rust-lang.rust"], category: "Languages"),
+    FileTypeAssociation(id: "org.go-lang.go", name: "Go", extensions: ["go"], utis: ["org.go-lang.go"], category: "Languages"),
+    FileTypeAssociation(id: "public.c-source", name: "C / C++", extensions: ["c", "h", "cpp", "hpp", "cc", "cxx"], utis: ["public.c-source", "public.c-header", "public.c-plus-plus-source", "public.c-plus-plus-header"], category: "Languages"),
+    FileTypeAssociation(id: "public.objective-c-source", name: "Objective-C", extensions: ["m", "mm"], utis: ["public.objective-c-source", "public.objective-c-plus-plus-source"], category: "Languages"),
+    FileTypeAssociation(id: "public.ruby-script", name: "Ruby", extensions: ["rb"], utis: ["public.ruby-script"], category: "Languages"),
+    FileTypeAssociation(id: "public.shell-script", name: "Shell", extensions: ["sh", "bash", "zsh"], utis: ["public.shell-script"], category: "Languages"),
+    FileTypeAssociation(id: "public.perl-script", name: "Perl", extensions: ["pl"], utis: ["public.perl-script"], category: "Languages"),
+    FileTypeAssociation(id: "public.php-script", name: "PHP", extensions: ["php"], utis: ["public.php-script"], category: "Languages"),
+    FileTypeAssociation(id: "com.microsoft.c-sharp", name: "C#", extensions: ["cs"], utis: ["com.microsoft.c-sharp"], category: "Languages"),
+    FileTypeAssociation(id: "com.microsoft.f-sharp", name: "F#", extensions: ["fs"], utis: ["com.microsoft.f-sharp"], category: "Languages"),
+    FileTypeAssociation(id: "org.jetbrains.kotlin", name: "Kotlin", extensions: ["kt", "kts"], utis: ["org.jetbrains.kotlin"], category: "Languages"),
+    FileTypeAssociation(id: "org.scala-lang.scala", name: "Scala", extensions: ["scala"], utis: ["org.scala-lang.scala"], category: "Languages"),
+    FileTypeAssociation(id: "org.haskell.source", name: "Haskell", extensions: ["hs"], utis: ["org.haskell.source"], category: "Languages"),
+    FileTypeAssociation(id: "public.lua-script", name: "Lua", extensions: ["lua"], utis: ["public.lua-script"], category: "Languages"),
+    FileTypeAssociation(id: "com.google.dart", name: "Dart", extensions: ["dart"], utis: ["com.google.dart"], category: "Languages"),
+    FileTypeAssociation(id: "org.elixir-lang.source", name: "Elixir", extensions: ["ex", "exs"], utis: ["org.elixir-lang.source"], category: "Languages"),
+    FileTypeAssociation(id: "org.erlang.source", name: "Erlang", extensions: ["erl"], utis: ["org.erlang.source"], category: "Languages"),
+    FileTypeAssociation(id: "org.clojure.source", name: "Clojure", extensions: ["clj"], utis: ["org.clojure.source"], category: "Languages"),
+    FileTypeAssociation(id: "org.r-project.r", name: "R", extensions: ["r"], utis: ["org.r-project.r"], category: "Languages"),
+    FileTypeAssociation(id: "org.ziglang.source", name: "Zig", extensions: ["zig"], utis: ["org.ziglang.source"], category: "Languages"),
+    FileTypeAssociation(id: "org.nim-lang.source", name: "Nim", extensions: ["nim"], utis: ["org.nim-lang.source"], category: "Languages"),
+    FileTypeAssociation(id: "org.codehaus.groovy", name: "Groovy", extensions: ["groovy", "gradle"], utis: ["org.codehaus.groovy"], category: "Languages"),
+    // Other
+    FileTypeAssociation(id: "com.docker.dockerfile", name: "Dockerfile", extensions: ["dockerfile"], utis: ["com.docker.dockerfile"], category: "Other"),
+    FileTypeAssociation(id: "public.make-source", name: "Makefile", extensions: ["makefile"], utis: ["public.make-source"], category: "Other"),
+    FileTypeAssociation(id: "public.plain-text", name: "Plain Text", extensions: ["txt"], utis: ["public.plain-text"], category: "Other"),
+]
+
+private let bundleID = Bundle.main.bundleIdentifier ?? "com.pedro.QuickMDApp"
+
+/// Check if QuickMD is the current default handler for a UTI.
+private func isDefaultHandler(for uti: String) -> Bool {
+    let utiCF = uti as CFString
+    guard let handler = LSCopyDefaultRoleHandlerForContentType(utiCF, .all)?.takeRetainedValue() else {
+        return false
+    }
+    return (handler as String).caseInsensitiveCompare(bundleID) == .orderedSame
+}
+
+/// Register or unregister QuickMD as the default handler for a set of UTIs.
+private func setDefaultHandler(for utis: [String], enabled: Bool) {
+    let appID = bundleID as CFString
+    for uti in utis {
+        let utiCF = uti as CFString
+        if enabled {
+            LSSetDefaultRoleHandlerForContentType(utiCF, .all, appID)
+        } else {
+            // Setting to empty string reverts to system default
+            LSSetDefaultRoleHandlerForContentType(utiCF, .all, "" as CFString)
+        }
+    }
+}
+
 struct SettingsView: View {
     @AppStorage("theme") private var theme = "system"
     @AppStorage("lineNumbers") private var lineNumbers = false
@@ -1231,6 +1317,9 @@ struct SettingsView: View {
     @AppStorage("openLinksInNewTab") private var openLinksInNewTab = true
     @AppStorage("spellCheck") private var spellCheck = true
     @AppStorage("autoPair") private var autoPair = true
+    @State private var associationStates: [String: Bool] = [:]
+
+    private var categories: [String] { ["Documents", "Languages", "Other"] }
 
     var body: some View {
         Form {
@@ -1242,9 +1331,13 @@ struct SettingsView: View {
                 }
                 .pickerStyle(.segmented)
 
-                HStack {
-                    Text("Default font size")
-                    Stepper("\(fontSize)px", value: $fontSize, in: 10...32, step: 2)
+                Stepper(value: $fontSize, in: 10...32, step: 2) {
+                    HStack {
+                        Text("Default font size")
+                        Spacer()
+                        Text("\(fontSize)px")
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -1268,16 +1361,46 @@ struct SettingsView: View {
             }
 
             Section {
-                Text("QuickMD handles Markdown, JSON, YAML, and source code files. File type associations are configured at build time via Info.plist.")
+                Text("Toggle which file types open with QuickMD by default when double-clicked in Finder.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+
+                ForEach(categories, id: \.self) { category in
+                    let items = fileTypeAssociations.filter { $0.category == category }
+                    DisclosureGroup(category) {
+                        ForEach(items) { assoc in
+                            HStack {
+                                Toggle(isOn: Binding(
+                                    get: { associationStates[assoc.id] ?? false },
+                                    set: { newValue in
+                                        associationStates[assoc.id] = newValue
+                                        setDefaultHandler(for: assoc.utis, enabled: newValue)
+                                    }
+                                )) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(assoc.name)
+                                        Text(assoc.extensions.map { ".\($0)" }.joined(separator: ", "))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } header: {
                 Text("File Associations")
             }
         }
         .formStyle(.grouped)
-        .frame(width: 380)
+        .frame(width: 480, height: 600)
         .navigationTitle("Settings")
+        .onAppear {
+            // Read current system state for each file type
+            for assoc in fileTypeAssociations {
+                associationStates[assoc.id] = isDefaultHandler(for: assoc.utis.first ?? assoc.id)
+            }
+        }
     }
 }
 

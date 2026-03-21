@@ -242,6 +242,20 @@ final class MarkdownDocumentModel: ObservableObject {
         isDirty = false
     }
 
+    /// Window/tab title: "parent/filename — QuickMD" with a bullet prefix when dirty.
+    var windowTitle: String {
+        guard let url = currentURL else { return "QuickMD" }
+        let components = url.pathComponents
+        let filePart: String
+        if components.count >= 3 {
+            filePart = components.suffix(2).joined(separator: "/")
+        } else {
+            filePart = fileName ?? url.lastPathComponent
+        }
+        let prefix = isDirty ? "\u{25CF} " : ""
+        return "\(prefix)\(filePart) \u{2014} QuickMD"
+    }
+
     /// True while setContent is writing to disk — suppresses file watcher reload.
     private var isSelfWriting = false
 
@@ -257,6 +271,13 @@ final class MarkdownDocumentModel: ObservableObject {
         rawContent = newContent
         if let url = currentURL {
             isSelfWriting = true
+            // Re-acquire sandbox access for the file's parent directory
+            let dirAccess = Self.accessDirectoryForFile(url)
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if didAccess { url.stopAccessingSecurityScopedResource() }
+                dirAccess?.stopAccessingSecurityScopedResource()
+            }
             do {
                 try newContent.write(to: url, atomically: true, encoding: .utf8)
             } catch {

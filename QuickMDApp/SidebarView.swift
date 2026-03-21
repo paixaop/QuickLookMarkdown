@@ -1,5 +1,4 @@
 import SwiftUI
-import WebKit
 
 // MARK: - Sidebar Container
 
@@ -11,37 +10,44 @@ struct SidebarView: View {
     var onCommentEdit: ((ParsedComment) -> Void)?
     var onCommentDelete: ((ParsedComment) -> Void)?
     var onFileClick: ((String) -> Void)?
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(spacing: 0) {
-            ActivityBar(
-                activePanel: $activePanel,
-                commentCount: model.parsedComments.count
-            )
-            Divider()
-            switch activePanel {
-            case .toc:
-                TOCPanelView(
-                    headings: model.tocHeadings,
-                    activeHeadingID: model.activeTOCHeadingID,
-                    onHeadingClick: { heading in onTOCClick?(heading) }
+        ZStack {
+            SidebarChromeBackground(colorScheme: colorScheme)
+            VStack(spacing: 0) {
+                ActivityBar(
+                    activePanel: $activePanel,
+                    commentCount: model.parsedComments.count,
+                    colorScheme: colorScheme
                 )
-            case .comments:
-                CommentsPanelView(
-                    comments: model.parsedComments,
-                    onClick: { comment in onCommentClick?(comment) },
-                    onEdit: { comment in onCommentEdit?(comment) },
-                    onDelete: { comment in onCommentDelete?(comment) }
-                )
-            case .files:
-                FilesPanelView(
-                    nodes: model.fileTree,
-                    currentFilePath: model.currentURL?.path ?? "",
-                    onFileClick: { path in onFileClick?(path) }
-                )
+                .background(QuickMDDesignTokens.surfaceContainerHigh(for: colorScheme))
+                switch activePanel {
+                case .toc:
+                    TOCPanelView(
+                        headings: model.tocHeadings,
+                        activeHeadingID: model.activeTOCHeadingID,
+                        onHeadingClick: { heading in onTOCClick?(heading) },
+                        colorScheme: colorScheme
+                    )
+                case .comments:
+                    CommentsPanelView(
+                        comments: model.parsedComments,
+                        onClick: { comment in onCommentClick?(comment) },
+                        onEdit: { comment in onCommentEdit?(comment) },
+                        onDelete: { comment in onCommentDelete?(comment) },
+                        colorScheme: colorScheme
+                    )
+                case .files:
+                    FilesPanelView(
+                        nodes: model.fileTree,
+                        currentFilePath: model.currentURL?.path ?? "",
+                        onFileClick: { path in onFileClick?(path) },
+                        colorScheme: colorScheme
+                    )
+                }
             }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
         .clipped()
     }
 }
@@ -51,19 +57,24 @@ struct SidebarView: View {
 struct ActivityBar: View {
     @Binding var activePanel: SidebarPanel
     var commentCount: Int
+    var colorScheme: ColorScheme
+
+    private var primary: Color { QuickMDDesignTokens.primary(for: colorScheme) }
 
     var body: some View {
         HStack(spacing: 0) {
             ForEach(SidebarPanel.allCases, id: \.self) { panel in
                 Button {
-                    activePanel = panel
+                    withAnimation(QuickMDDesignTokens.contentAnimation()) {
+                        activePanel = panel
+                    }
                 } label: {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: panel.icon)
                             .font(.system(size: 14))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 7)
-                            .foregroundStyle(activePanel == panel ? Color.accentColor : .secondary)
+                            .foregroundStyle(activePanel == panel ? primary : QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
 
                         if panel == .comments && commentCount > 0 {
                             Text("\(commentCount)")
@@ -78,11 +89,12 @@ struct ActivityBar: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .overlay(alignment: .bottom) {
+                .overlay(alignment: .leading) {
                     if activePanel == panel {
-                        Rectangle()
-                            .fill(Color.accentColor)
-                            .frame(height: 2)
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(primary)
+                            .frame(width: 2)
+                            .padding(.vertical, 6)
                     }
                 }
             }
@@ -97,13 +109,14 @@ struct TOCPanelView: View {
     let headings: [TOCHeading]
     let activeHeadingID: String?
     var onHeadingClick: ((TOCHeading) -> Void)?
+    var colorScheme: ColorScheme
 
     var body: some View {
         if headings.isEmpty {
             VStack {
                 Spacer()
                 Text("No headings")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                     .font(.caption)
                 Spacer()
             }
@@ -118,18 +131,24 @@ struct TOCPanelView: View {
                             Text(heading.text)
                                 .font(.system(size: fontSize(for: heading.level)))
                                 .fontWeight(heading.level <= 2 ? .semibold : .regular)
-                                .foregroundStyle(heading.id == activeHeadingID ? Color.accentColor : .primary)
+                                .foregroundStyle(
+                                    heading.id == activeHeadingID
+                                        ? QuickMDDesignTokens.primary(for: colorScheme)
+                                        : QuickMDDesignTokens.onSurface(for: colorScheme)
+                                )
                                 .lineLimit(2)
                                 .truncationMode(.tail)
                             Spacer()
                         }
                         .padding(.leading, CGFloat((heading.level - 1) * 12))
+                        .padding(.vertical, 6)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .listRowSeparator(.hidden)
                     .listRowBackground(
                         heading.id == activeHeadingID
-                            ? Color.accentColor.opacity(0.1)
+                            ? QuickMDDesignTokens.surfaceContainerHighest(for: colorScheme)
                             : Color.clear
                     )
                     .id(heading.id)
@@ -137,7 +156,7 @@ struct TOCPanelView: View {
                 .listStyle(.plain)
                 .onChange(of: activeHeadingID) { _, newID in
                     if let newID {
-                        withAnimation(.easeInOut(duration: 0.2)) {
+                        withAnimation(QuickMDDesignTokens.contentAnimation()) {
                             proxy.scrollTo(newID, anchor: .center)
                         }
                     }
@@ -162,13 +181,14 @@ struct CommentsPanelView: View {
     var onClick: ((ParsedComment) -> Void)?
     var onEdit: ((ParsedComment) -> Void)?
     var onDelete: ((ParsedComment) -> Void)?
+    var colorScheme: ColorScheme
 
     var body: some View {
         if comments.isEmpty {
             VStack {
                 Spacer()
                 Text("No comments")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                     .font(.caption)
                 Spacer()
             }
@@ -179,8 +199,10 @@ struct CommentsPanelView: View {
                     comment: comment,
                     onClick: { onClick?(comment) },
                     onEdit: { onEdit?(comment) },
-                    onDelete: { onDelete?(comment) }
+                    onDelete: { onDelete?(comment) },
+                    colorScheme: colorScheme
                 )
+                .listRowSeparator(.hidden)
             }
             .listStyle(.plain)
         }
@@ -192,6 +214,7 @@ struct CommentRow: View {
     var onClick: (() -> Void)?
     var onEdit: (() -> Void)?
     var onDelete: (() -> Void)?
+    var colorScheme: ColorScheme
     @State private var isHovered = false
 
     var body: some View {
@@ -201,15 +224,15 @@ struct CommentRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(comment.annotatedText.prefix(80))
                     .font(.system(size: 12))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurface(for: colorScheme))
                     .lineLimit(2)
                 Text(comment.comment)
                     .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                     .lineLimit(2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
+            .padding(.vertical, 6)
             .overlay(alignment: .topTrailing) {
                 if isHovered {
                     HStack(spacing: 4) {
@@ -241,13 +264,14 @@ struct FilesPanelView: View {
     let nodes: [FileNode]
     let currentFilePath: String
     var onFileClick: ((String) -> Void)?
+    var colorScheme: ColorScheme
 
     var body: some View {
         if nodes.isEmpty {
             VStack {
                 Spacer()
                 Text("No files")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                     .font(.caption)
                 Spacer()
             }
@@ -258,8 +282,10 @@ struct FilesPanelView: View {
                     FileNodeRow(
                         node: node,
                         currentFilePath: currentFilePath,
-                        onFileClick: onFileClick
+                        onFileClick: onFileClick,
+                        colorScheme: colorScheme
                     )
+                    .listRowSeparator(.hidden)
                 }
             }
             .listStyle(.plain)
@@ -271,6 +297,7 @@ struct FileNodeRow: View {
     let node: FileNode
     let currentFilePath: String
     var onFileClick: ((String) -> Void)?
+    var colorScheme: ColorScheme
 
     var body: some View {
         if node.isDirectory {
@@ -279,12 +306,14 @@ struct FileNodeRow: View {
                     FileNodeRow(
                         node: child,
                         currentFilePath: currentFilePath,
-                        onFileClick: onFileClick
+                        onFileClick: onFileClick,
+                        colorScheme: colorScheme
                     )
                 }
             } label: {
                 Label(node.name, systemImage: "folder")
                     .font(.system(size: 12))
+                    .foregroundStyle(QuickMDDesignTokens.onSurface(for: colorScheme))
             }
         } else {
             Button {
@@ -293,15 +322,20 @@ struct FileNodeRow: View {
                 HStack {
                     Label(node.name, systemImage: "doc.text")
                         .font(.system(size: 12))
-                        .foregroundStyle(node.path == currentFilePath ? Color.accentColor : .primary)
+                        .foregroundStyle(
+                            node.path == currentFilePath
+                                ? QuickMDDesignTokens.primary(for: colorScheme)
+                                : QuickMDDesignTokens.onSurface(for: colorScheme)
+                        )
                     Spacer()
                 }
+                .padding(.vertical, 4)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .listRowBackground(
                 node.path == currentFilePath
-                    ? Color.accentColor.opacity(0.1)
+                    ? QuickMDDesignTokens.surfaceContainerHighest(for: colorScheme)
                     : Color.clear
             )
         }

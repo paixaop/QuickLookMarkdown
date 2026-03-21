@@ -8,6 +8,7 @@ import CodeEditorView
 extension Notification.Name {
     static let addCommentAction = Notification.Name("addCommentAction")
     static let removeCommentAction = Notification.Name("removeCommentAction")
+    static let openFileRequest = Notification.Name("openFileRequest")
 }
 
 // MARK: - FocusedValue for active document model
@@ -95,10 +96,13 @@ class ZoomableWebView: WKWebView {
         let jsX = locationInView.x
         let jsY = bounds.height - locationInView.y  // Flip Y for web coordinates
 
-        // Check if there's a comment at the click point
+        // Check if there's a comment at the click point, and capture
+        // selection text + source info atomically (before menu interaction
+        // can collapse or shift the WebView selection).
         let group = DispatchGroup()
         var commentAtPoint: [String: Any]? = nil
         var selectedText: String = ""
+        var selectionSourceInfo: [String: Any]? = nil
 
         group.enter()
         evaluateJavaScript("window.__getCommentAtPoint ? __getCommentAtPoint(\(jsX), \(jsY)) : null") { result, _ in
@@ -109,8 +113,17 @@ class ZoomableWebView: WKWebView {
         }
 
         group.enter()
-        evaluateJavaScript("window.__getSelectionText ? __getSelectionText() : ''") { result, _ in
-            selectedText = result as? String ?? ""
+        evaluateJavaScript("""
+            (function() {
+                var text = window.__getSelectionText ? __getSelectionText() : '';
+                var info = window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null;
+                return { text: text, info: info };
+            })()
+            """) { result, _ in
+            if let dict = result as? [String: Any] {
+                selectedText = dict["text"] as? String ?? ""
+                selectionSourceInfo = dict["info"] as? [String: Any]
+            }
             group.leave()
         }
 
@@ -137,7 +150,13 @@ class ZoomableWebView: WKWebView {
             } else if !selectedText.isEmpty {
                 let addItem = NSMenuItem(title: "Add Comment\u{2026}", action: #selector(self.addCommentAction(_:)), keyEquivalent: "")
                 addItem.target = self
-                addItem.representedObject = selectedText
+                // Pass both text and source info so addCommentAction doesn't need to re-query JS
+                addItem.representedObject = [
+                    "text": selectedText,
+                    "sourceLine": selectionSourceInfo?["sourceLine"] ?? -1,
+                    "offsetInBlock": selectionSourceInfo?["offsetInBlock"] ?? -1,
+                    "endOffsetInBlock": selectionSourceInfo?["endOffsetInBlock"] ?? -1
+                ] as [String: Any]
                 menu.insertItem(addItem, at: insertIndex)
                 insertIndex += 1
 
@@ -149,19 +168,13 @@ class ZoomableWebView: WKWebView {
     }
 
     @objc private func addCommentAction(_ sender: NSMenuItem) {
-        guard let text = sender.representedObject as? String else { return }
-        // Try to get source line info for precise comment placement
-        evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { [weak self] result, _ in
-            var sourceLine = -1
-            var offsetInBlock = -1
-            var endOffsetInBlock = -1
-            if let info = result as? [String: Any] {
-                sourceLine = info["sourceLine"] as? Int ?? -1
-                offsetInBlock = info["offsetInBlock"] as? Int ?? -1
-                endOffsetInBlock = info["endOffsetInBlock"] as? Int ?? -1
-            }
-            self?.commentCoordinator?.showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
-        }
+        // Source info was pre-captured in willOpenMenu to avoid stale/collapsed selection
+        guard let info = sender.representedObject as? [String: Any],
+              let text = info["text"] as? String else { return }
+        let sourceLine = info["sourceLine"] as? Int ?? -1
+        let offsetInBlock = info["offsetInBlock"] as? Int ?? -1
+        let endOffsetInBlock = info["endOffsetInBlock"] as? Int ?? -1
+        commentCoordinator?.showCommentEditor(index: -1, comment: "", annotatedText: text, isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
     }
 
     @objc private func editCommentAction(_ sender: NSMenuItem) {
@@ -175,10 +188,40 @@ class ZoomableWebView: WKWebView {
     @objc private func deleteCommentAction(_ sender: NSMenuItem) {
         guard let info = sender.representedObject as? [String: Any] else { return }
         let index = info["index"] as? Int ?? 0
-        guard let model = AppDelegate.activeModel else { return }
+        guard let model = commentCoordinator?.model else { return }
         let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
         model.setContent(updated, actionName: "Remove Comment")
         ContentView.pushIncrementalUpdate(model: model)
+    }
+}
+
+/// Intercepts window close to prompt for unsaved changes.
+class WindowCloseDelegate: NSObject, NSWindowDelegate {
+    weak var model: MarkdownDocumentModel?
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender.isDocumentEdited else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Do you want to save the changes to this document?"
+        alert.informativeText = "Your changes will be lost if you don\u{2019}t save them."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Don\u{2019}t Save")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            if let model = model, let url = model.currentURL {
+                try? model.rawContent.write(to: url, atomically: true, encoding: .utf8)
+                model.markClean()
+                sender.isDocumentEdited = false
+            }
+            return true
+        case .alertSecondButtonReturn:
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -255,7 +298,7 @@ class WebViewStore: ObservableObject {
     }
 
     private func currentTabURL() -> URL? {
-        AppDelegate.activeModel?.currentURL ?? NSApp.keyWindow?.representedURL
+        webView?.commentCoordinator?.model?.currentURL ?? NSApp.keyWindow?.representedURL
     }
 
     private func switchToTab(_ url: URL) {
@@ -276,10 +319,13 @@ struct WebView: NSViewRepresentable {
     let html: String
     let baseURL: URL?
     let theme: String
+    let model: MarkdownDocumentModel
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var lastHTML: String?
         var lastTheme: String?
+        /// The model for this tab's document — use this instead of AppDelegate.activeModel.
+        weak var model: MarkdownDocumentModel?
 
         /// Scroll a WKWebView to an element by its ID (fragment/anchor).
         private func scrollToFragment(_ fragment: String, in webView: WKWebView) {
@@ -295,7 +341,7 @@ struct WebView: NSViewRepresentable {
             case "checkboxToggle":
                 guard let index = body["index"] as? Int,
                       let checked = body["checked"] as? Bool,
-                      let model = AppDelegate.activeModel else { return }
+                      let model = self.model else { return }
                 let updated = MarkdownDocumentModel.toggleCheckbox(at: index, checked: checked, in: model.rawContent)
                 model.rawContent = updated
                 if let url = model.currentURL {
@@ -341,12 +387,12 @@ struct WebView: NSViewRepresentable {
                         let sourceLine = dict["sourceLine"] as? Int ?? 0
                         return TOCHeading(id: id, text: text, level: level, sourceLine: sourceLine)
                     }
-                    DispatchQueue.main.async {
-                        AppDelegate.activeModel?.tocHeadings = headings
+                    DispatchQueue.main.async { [weak self] in
+                        self?.model?.tocHeadings = headings
                     }
                 } else if let activeID = body["activeHeadingID"] as? String {
-                    DispatchQueue.main.async {
-                        AppDelegate.activeModel?.activeTOCHeadingID = activeID
+                    DispatchQueue.main.async { [weak self] in
+                        self?.model?.activeTOCHeadingID = activeID
                     }
                 }
 
@@ -398,7 +444,7 @@ struct WebView: NSViewRepresentable {
             for window in NSApp.windows {
                 if let represented = window.representedURL, represented.standardizedFileURL == standardized {
                     // Track in shared tab history for back/forward
-                    if let current = AppDelegate.activeModel?.currentURL {
+                    if let current = self.model?.currentURL {
                         WebViewStore.shared.pushTabHistory(current)
                     }
                     window.makeKeyAndOrderFront(nil)
@@ -419,14 +465,14 @@ struct WebView: NSViewRepresentable {
 
             if openInNewTab {
                 // Track in shared tab history for back/forward
-                if let current = AppDelegate.activeModel?.currentURL {
+                if let current = self.model?.currentURL {
                     WebViewStore.shared.pushTabHistory(current)
                 }
                 AppDelegate.pendingDirAccess = dirURL
                 AppDelegate.pendingURL = url
                 NSApp.sendAction(#selector(NSWindow.newWindowForTab(_:)), to: nil, from: nil)
             } else {
-                if let model = AppDelegate.activeModel {
+                if let model = self.model {
                     model.navigateTo(url)
                 }
                 if let dirURL { dirURL.stopAccessingSecurityScopedResource() }
@@ -463,7 +509,7 @@ struct WebView: NSViewRepresentable {
         }
 
         private func scrollEditorToLine(_ line: Int, fractionPast: CGFloat = 0) {
-            guard let model = AppDelegate.activeModel,
+            guard let model = self.model,
                   let textView = findEditorTextView() else { return }
 
             WebViewStore.shared.suppressEditorToRenderer = true
@@ -476,7 +522,7 @@ struct WebView: NSViewRepresentable {
         // MARK: - Double-click → jump to word in editor
 
         private func jumpEditorToWord(_ word: String, sourceLine: Int, sourceCol: Int, offsetInBlock: Int, endOffsetInBlock: Int = -1) {
-            guard let model = AppDelegate.activeModel,
+            guard let model = self.model,
                   let textView = findEditorTextView() else { return }
             guard sourceLine > 0, offsetInBlock >= 0, endOffsetInBlock > offsetInBlock else { return }
             if let range = Self.sourceRangeFromRenderedOffsets(
@@ -499,6 +545,10 @@ struct WebView: NSViewRepresentable {
         func showCommentEditor(index: Int, comment: String, annotatedText: String, isNew: Bool, sourceLine: Int = -1, offsetInBlock: Int = -1, endOffsetInBlock: Int = -1) {
             guard !WebViewStore.shared.commentPanelOpen else { return }
             WebViewStore.shared.commentPanelOpen = true
+            // Capture the model NOW from the tab's own coordinator, not a global.
+            // If the user switches tabs before saving, a global would point
+            // to the wrong file.
+            guard let capturedModel = self.model else { return }
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
                 styleMask: [.titled, .closable, .resizable],
@@ -520,22 +570,20 @@ struct WebView: NSViewRepresentable {
                 onSave: { newComment in
                     WebViewStore.shared.commentPanelOpen = false
                     panel.close()
-                    guard let model = AppDelegate.activeModel else { return }
                     if isNew {
-                        self.addCommentToSource(text: annotatedText, comment: newComment, model: model, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
+                        self.addCommentToSource(text: annotatedText, comment: newComment, model: capturedModel, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock)
                     } else {
-                        let updated = MarkdownDocumentModel.updateComment(at: index, newComment: newComment, in: model.rawContent)
-                        model.setContent(updated, actionName: "Update Comment")
-                        ContentView.pushIncrementalUpdate(model: model)
+                        let updated = MarkdownDocumentModel.updateComment(at: index, newComment: newComment, in: capturedModel.rawContent)
+                        capturedModel.setContent(updated, actionName: "Update Comment")
+                        ContentView.pushIncrementalUpdate(model: capturedModel)
                     }
                 },
                 onDelete: isNew ? nil : {
                     WebViewStore.shared.commentPanelOpen = false
                     panel.close()
-                    guard let model = AppDelegate.activeModel else { return }
-                    let updated = MarkdownDocumentModel.removeComment(at: index, in: model.rawContent)
-                    model.setContent(updated, actionName: "Remove Comment")
-                    ContentView.pushIncrementalUpdate(model: model)
+                    let updated = MarkdownDocumentModel.removeComment(at: index, in: capturedModel.rawContent)
+                    capturedModel.setContent(updated, actionName: "Remove Comment")
+                    ContentView.pushIncrementalUpdate(model: capturedModel)
                 },
                 onCancel: {
                     WebViewStore.shared.commentPanelOpen = false
@@ -579,33 +627,53 @@ struct WebView: NSViewRepresentable {
         /// comment annotations to build a rendered-offset → source-offset mapping.
         static func sourceRangeFromRenderedOffsets(sourceLine: Int, offsetInBlock: Int, endOffsetInBlock: Int, frontmatterLineCount: Int, source: String) -> NSRange? {
             let lines = source.components(separatedBy: "\n")
-            let adjustedLine = sourceLine + frontmatterLineCount - 1
+            var adjustedLine = sourceLine + frontmatterLineCount - 1
             guard adjustedLine >= 0, adjustedLine < lines.count else { return nil }
 
-            // Calculate character offset of this line in the source
+            // Detect fenced code blocks: data-source-line points to the opening
+            // fence (``` or ~~~) but the rendered text is only the content inside.
+            // Skip the fence line and collect content until the closing fence.
+            let fenceTrimmed = lines[adjustedLine].trimmingCharacters(in: .whitespaces)
+            let isFencedCode = fenceTrimmed.hasPrefix("```") || fenceTrimmed.hasPrefix("~~~")
+
+            // Calculate character offset of the starting line in the source
             var lineCharOffset = 0
             for i in 0..<adjustedLine {
                 lineCharOffset += lines[i].count + 1
             }
 
-            // Collect lines for this block (until next blank line or heading)
             var blockText = ""
-            for i in adjustedLine..<lines.count {
-                let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
-                if i > adjustedLine && (trimmed.isEmpty || trimmed.hasPrefix("#")) { break }
-                if i > adjustedLine { blockText += "\n" }
-                blockText += lines[i]
+            if isFencedCode {
+                // Skip the opening fence line
+                lineCharOffset += lines[adjustedLine].count + 1
+                adjustedLine += 1
+                // Collect content lines until the closing fence or end of file
+                for i in adjustedLine..<lines.count {
+                    let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                    if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") { break }
+                    if i > adjustedLine { blockText += "\n" }
+                    blockText += lines[i]
+                }
+            } else {
+                // Collect lines for this block (until next blank line or heading)
+                for i in adjustedLine..<lines.count {
+                    let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                    if i > adjustedLine && (trimmed.isEmpty || trimmed.hasPrefix("#")) { break }
+                    if i > adjustedLine { blockText += "\n" }
+                    blockText += lines[i]
+                }
             }
 
             // Walk blockText building a mapping: for each rendered character position,
-            // track the corresponding source position. Skip comment markers, inline markup,
-            // and block-level prefixes (list markers, heading markers, blockquote markers).
+            // track the corresponding source position.
             let nsBlock = blockText as NSString
             var renderedPos = 0
             var sourcePos = 0
 
-            // Skip block-level prefix at the start of the block
-            if let prefixLen = skipBlockPrefix(in: blockText) {
+            // For non-code blocks: skip block prefixes, inline markup, and comment markers.
+            // For code blocks: only skip comment markers (code renders literally, but
+            // preprocessComments converts comment markers to <mark> before parsing).
+            if !isFencedCode, let prefixLen = skipBlockPrefix(in: blockText) {
                 sourcePos = prefixLen
             }
             var startSourcePos = -1
@@ -623,8 +691,8 @@ struct WebView: NSViewRepresentable {
                     continue
                 }
 
-                // Check for inline markup markers: *, **, ***, _, __, ~~, `
-                if let markupLen = skipInlineMarkup(in: blockText, at: sourcePos) {
+                // Check for inline markup markers (not applicable inside code blocks)
+                if !isFencedCode, let markupLen = skipInlineMarkup(in: blockText, at: sourcePos) {
                     if renderedPos == endOffsetInBlock && endSourcePos < 0 { endSourcePos = sourcePos }
                     sourcePos += markupLen
                     continue
@@ -835,15 +903,15 @@ struct WebView: NSViewRepresentable {
             }
 
             // Scroll to anchor fragment if navigating to a URL with #fragment
-            if let fragment = AppDelegate.activeModel?.pendingFragment {
-                AppDelegate.activeModel?.pendingFragment = nil
+            if let fragment = self.model?.pendingFragment {
+                self.model?.pendingFragment = nil
                 scrollToFragment(fragment, in: webView)
             }
 
             // Refresh native sidebar file tree (skip for edit-driven reloads — file tree doesn't change)
             if !store.isEditReload {
-                DispatchQueue.main.async {
-                    AppDelegate.activeModel?.refreshFileTree()
+                DispatchQueue.main.async { [weak self] in
+                    self?.model?.refreshFileTree()
                 }
             }
         }
@@ -864,7 +932,11 @@ struct WebView: NSViewRepresentable {
         // injectFileTree removed — file tree is now native SwiftUI via model.refreshFileTree()
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator {
+        let coordinator = Coordinator()
+        coordinator.model = model
+        return coordinator
+    }
 
     func makeNSView(context: Context) -> ZoomableWebView {
         MarkdownDocumentModel.log("WebView.makeNSView called, html length=\(html.count)")
@@ -1255,11 +1327,12 @@ struct SearchBar: View {
     @State private var matchCount = 0
     @State private var currentIndex = -1
     @FocusState private var isFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
             TextField("Search\u{2026}", text: $query)
                 .textFieldStyle(.plain)
                 .focused($isFocused)
@@ -1269,7 +1342,7 @@ struct SearchBar: View {
             if matchCount > 0 {
                 Text("\(currentIndex + 1)/\(matchCount)")
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                     .accessibilityLabel("Match \(currentIndex + 1) of \(matchCount)")
             }
             Button(action: navigatePrev) {
@@ -1291,8 +1364,17 @@ struct SearchBar: View {
             .accessibilityLabel("Close search")
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .padding(.vertical, 8)
+        .background(QuickMDDesignTokens.surfaceContainerLow(for: colorScheme))
+        .overlay(
+            RoundedRectangle(cornerRadius: QuickMDDesignTokens.cornerRadiusStitch)
+                .stroke(
+                    isFocused
+                        ? QuickMDDesignTokens.primary(for: colorScheme).opacity(0.22)
+                        : Color.clear,
+                    lineWidth: 1.5
+                )
+        )
         .onAppear { isFocused = true }
     }
 
@@ -1390,14 +1472,24 @@ struct ContentView: View {
     @AppStorage("showSidebar") var showSidebar = true
     @AppStorage("sidebarPosition") var sidebarPosition = "leading"
     @AppStorage("sidebarWidth") var sidebarWidth: Double = 220
+    @AppStorage("focusMode") var focusMode = false
+    @Environment(\.colorScheme) private var colorScheme
     @State private var showEditor = false
     @State private var activePanel: SidebarPanel = .toc
     @State private var editorPosition = CodeEditor.Position()
     @State private var editorDebounceTask: Task<Void, Never>?
     @State private var showSearchBar = false
 
+    /// Stitch Focus Mode: hide sidebar and in-window search; main column uses full tonal surface.
+    private var chromeSidebarVisible: Bool { !focusMode && showSidebar }
+    private var chromeSearchVisible: Bool { !focusMode && showSearchBar }
+
     var body: some View {
         contentLayout
+            .navigationTitle(model.windowTitle)
+            .tint(QuickMDDesignTokens.primary(for: colorScheme))
+            .toolbarBackground(focusMode ? .hidden : .automatic, for: .windowToolbar)
+            .animation(QuickMDDesignTokens.contentAnimation(), value: focusMode)
             .modifier(ContentViewToolbar(model: model, webViewStore: webViewStore, showEditor: $showEditor, showSearchBar: $showSearchBar, showSidebar: $showSidebar, activePanel: $activePanel))
             .modifier(ContentViewLifecycle(model: model, showEditor: $showEditor))
     }
@@ -1475,6 +1567,15 @@ private struct ContentViewLifecycle: ViewModifier {
             }
             model.refreshParsedComments()
             model.refreshFileTree()
+            // Install window close delegate to prompt for unsaved changes
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                if let window = WebViewStore.shared.webView?.window {
+                    let closeDelegate = WindowCloseDelegate()
+                    closeDelegate.model = model
+                    objc_setAssociatedObject(window, "windowCloseDelegate", closeDelegate, .OBJC_ASSOCIATION_RETAIN)
+                    window.delegate = closeDelegate
+                }
+            }
             // Track tab activation for back/forward history
             NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { notification in
                 guard let window = notification.object as? NSWindow,
@@ -1528,20 +1629,16 @@ private struct ContentViewLifecycle: ViewModifier {
         .onChange(of: model.fileName) { _ in
             model.refreshParsedComments()
             model.refreshFileTree()
+            // Mark clean on file load (new file = no unsaved changes)
+            model.markClean()
             DispatchQueue.main.async {
-                if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-                    if let url = model.currentURL {
-                        let pathComponents = url.pathComponents
-                        let count = pathComponents.count
-                        if count >= 3 {
-                            window.title = pathComponents[(count - 2)...].joined(separator: "/")
-                        } else {
-                            window.title = model.fileName ?? "QuickMD"
-                        }
-                    } else {
-                        window.title = model.fileName ?? "QuickMD"
+                // Set representedURL for tab proxy icon and window identification
+                for window in NSApp.windows where window.isVisible && !window.isSheet {
+                    if window.representedURL == nil || window.representedURL == model.currentURL {
+                        window.representedURL = model.currentURL
+                        window.isDocumentEdited = false
+                        break
                     }
-                    window.representedURL = model.currentURL
                 }
             }
         }
@@ -1600,25 +1697,26 @@ private struct ContentViewLifecycle: ViewModifier {
                 return
             }
 
-            // Fall through to renderer (WebView) selection
+            // Fall through to renderer (WebView) selection — capture text + source info atomically
             guard let webView = WebViewStore.shared.webView else { return }
-            webView.evaluateJavaScript("window.__getSelectionText ? __getSelectionText() : ''") { result, _ in
-                guard let text = result as? String, !text.isEmpty else { return }
-                webView.evaluateJavaScript("window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null") { infoResult, _ in
-                    var sourceLine = -1
-                    var offsetInBlock = -1
-                    var endOffsetInBlock = -1
-                    if let info = infoResult as? [String: Any] {
-                        sourceLine = info["sourceLine"] as? Int ?? -1
-                        offsetInBlock = info["offsetInBlock"] as? Int ?? -1
-                        endOffsetInBlock = info["endOffsetInBlock"] as? Int ?? -1
-                    }
-                    DispatchQueue.main.async {
-                        webView.commentCoordinator?.showCommentEditor(
-                            index: -1, comment: "", annotatedText: text,
-                            isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock
-                        )
-                    }
+            webView.evaluateJavaScript("""
+                (function() {
+                    var text = window.__getSelectionText ? __getSelectionText() : '';
+                    var info = window.__getSelectionSourceInfo ? __getSelectionSourceInfo() : null;
+                    return { text: text, info: info };
+                })()
+                """) { result, _ in
+                guard let dict = result as? [String: Any],
+                      let text = dict["text"] as? String, !text.isEmpty else { return }
+                let info = dict["info"] as? [String: Any]
+                let sourceLine = info?["sourceLine"] as? Int ?? -1
+                let offsetInBlock = info?["offsetInBlock"] as? Int ?? -1
+                let endOffsetInBlock = info?["endOffsetInBlock"] as? Int ?? -1
+                DispatchQueue.main.async {
+                    webView.commentCoordinator?.showCommentEditor(
+                        index: -1, comment: "", annotatedText: text,
+                        isNew: true, sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock
+                    )
                 }
             }
         }
@@ -1639,6 +1737,14 @@ private struct ContentViewLifecycle: ViewModifier {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openFileRequest)) { notification in
+            // Only the active model or an empty model should respond.
+            // Without this guard, ALL tabs would load the file.
+            guard AppDelegate.activeModel === model || model.currentURL == nil else { return }
+            guard let url = notification.object as? URL else { return }
+            model.load(from: url)
+            AppDelegate.pendingURL = nil
+        }
     }
 }
 
@@ -1648,24 +1754,26 @@ extension ContentView {
 
     private var contentLayout: some View {
         VStack(spacing: 0) {
-            if showSearchBar {
+            if chromeSearchVisible {
                 SearchBar(isVisible: $showSearchBar)
             }
             ZStack(alignment: .bottomLeading) {
                 HStack(spacing: 0) {
-                    if sidebarPosition == "leading" && showSidebar && model.html != nil {
+                    if sidebarPosition == "leading" && chromeSidebarVisible && model.html != nil {
                         sidebarContent
                             .frame(width: sidebarWidth)
                         SidebarResizeHandle(width: $sidebarWidth, isLeading: true)
-                        Divider()
                     }
-                    if let html = model.html {
-                        mainContentArea(html: html)
-                    } else {
-                        welcomeScreen
+                    Group {
+                        if let html = model.html {
+                            mainContentArea(html: html)
+                        } else {
+                            welcomeScreen
+                        }
                     }
-                    if sidebarPosition == "trailing" && showSidebar && model.html != nil {
-                        Divider()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(QuickMDDesignTokens.surface(for: colorScheme))
+                    if sidebarPosition == "trailing" && chromeSidebarVisible && model.html != nil {
                         SidebarResizeHandle(width: $sidebarWidth, isLeading: false)
                         sidebarContent
                             .frame(width: sidebarWidth)
@@ -1676,21 +1784,27 @@ extension ContentView {
                 }
             }
         }
+        .background(QuickMDDesignTokens.surface(for: colorScheme))
     }
 
     private var hoveredLinkIndicator: some View {
         Text(webViewStore.hoveredLinkURL)
             .font(.system(size: 11))
+            .foregroundStyle(QuickMDDesignTokens.onSurface(for: colorScheme))
             .lineLimit(1)
             .truncationMode(.middle)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 4))
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: QuickMDDesignTokens.cornerRadiusStitch))
+            .overlay(
+                RoundedRectangle(cornerRadius: QuickMDDesignTokens.cornerRadiusStitch)
+                    .stroke(QuickMDDesignTokens.outlineVariant(for: colorScheme).opacity(0.15), lineWidth: 1)
+            )
             .padding(.leading, 4)
             .padding(.bottom, 4)
             .allowsHitTesting(false)
             .transition(.opacity)
-            .animation(.easeInOut(duration: 0.15), value: webViewStore.hoveredLinkURL)
+            .animation(QuickMDDesignTokens.contentAnimation(duration: 0.15), value: webViewStore.hoveredLinkURL)
     }
 
     // MARK: - Welcome Screen
@@ -1700,17 +1814,17 @@ extension ContentView {
             Spacer()
             Image(systemName: "doc.richtext")
                 .font(.system(size: 60))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme).opacity(0.5))
             Text("QuickMD")
-                .font(.largeTitle)
-                .fontWeight(.bold)
+                .font(.system(size: 34, weight: .bold))
+                .foregroundStyle(QuickMDDesignTokens.onSurface(for: colorScheme))
             if let errorMessage = model.errorMessage {
                 Text(errorMessage)
                     .foregroundStyle(.red)
             } else {
                 Text("Open a markdown file to get started")
                     .font(.title3)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
             }
             Button("Open File\u{2026}") {
                 let panel = NSOpenPanel()
@@ -1721,26 +1835,29 @@ extension ContentView {
                     model.load(from: url)
                 }
             }
+            .buttonStyle(.borderedProminent)
+            .tint(QuickMDDesignTokens.primary(for: colorScheme))
             .controlSize(.large)
 
             let recentURLs = NSDocumentController.shared.recentDocumentURLs
             if !recentURLs.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Recent Files")
-                        .font(.headline)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                         .padding(.top, 8)
                     ForEach(recentURLs.prefix(5), id: \.self) { url in
                         Button(action: { model.load(from: url) }) {
                             HStack {
                                 Image(systemName: "doc")
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                                 Text(url.lastPathComponent)
                                     .lineLimit(1)
+                                    .foregroundStyle(QuickMDDesignTokens.onSurface(for: colorScheme))
                                 Spacer()
                                 Text(url.deletingLastPathComponent().lastPathComponent)
                                     .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme))
                             }
                         }
                         .buttonStyle(.plain)
@@ -1752,7 +1869,7 @@ extension ContentView {
             Spacer()
             Text("You can also drag files onto this window")
                 .font(.caption)
-                .foregroundStyle(.quaternary)
+                .foregroundStyle(QuickMDDesignTokens.onSurfaceVariant(for: colorScheme).opacity(0.7))
                 .padding(.bottom, 20)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1765,7 +1882,7 @@ extension ContentView {
     @ViewBuilder
     private func mainContentArea(html: String) -> some View {
         HSplitView {
-            WebView(html: html, baseURL: model.baseURL, theme: theme)
+            WebView(html: html, baseURL: model.baseURL, theme: theme, model: model)
                 .frame(minWidth: 200)
             if showEditor {
                 MarkdownEditorView(text: $model.rawContent, position: $editorPosition, onTopLineChange: { line, fractionPast in

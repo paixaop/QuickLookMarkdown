@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import CodeEditorView
 import LanguageSupport
@@ -506,11 +507,37 @@ final class ImagePasteHandler: ObservableObject {
     deinit { uninstall() }
 }
 
+// MARK: - Editor caret (Stitch primary, 2pt)
+
+private struct EditorPrimaryCaret: NSViewRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            guard let textView = findEditorTextViewInView(window.contentView) else { return }
+            textView.insertionPointColor = QuickMDDesignTokens.primaryNSColor(for: colorScheme)
+            // Stitch spec: 2pt caret. Swift may not expose `insertionPointWidth` on this target; use KVC when supported.
+            let setWidth = NSSelectorFromString("setInsertionPointWidth:")
+            if textView.responds(to: setWidth) {
+                textView.setValue(CGFloat(2), forKey: "insertionPointWidth")
+            }
+        }
+    }
+}
+
 // MARK: - Editor Status Bar
 
 struct EditorStatusBar: View {
     let position: CodeEditor.Position
     let text: String
+    @Environment(\.colorScheme) private var colorScheme
 
     private var cursorLocation: (line: Int, column: Int) {
         let loc = position.selections.first?.location ?? 0
@@ -537,18 +564,25 @@ struct EditorStatusBar: View {
 
     var body: some View {
         let loc = cursorLocation
-        HStack(spacing: 16) {
+        let meta = QuickMDDesignTokens.onSurfaceVariant(for: colorScheme)
+        HStack(spacing: 12) {
             Text("Ln \(loc.line), Col \(loc.column)")
-            Text("Words: \(wordCount)")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(meta)
             Text("Chars: \(charCount)")
-            Text("~\(readTime) min read")
-            Spacer()
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(meta.opacity(0.85))
+            Spacer(minLength: 16)
+            HStack(spacing: 10) {
+                Text("Words \(wordCount)")
+                Text("~\(readTime) min read")
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(meta)
         }
-        .font(.system(size: 11, design: .monospaced))
-        .foregroundStyle(.secondary)
         .padding(.horizontal, 12)
-        .padding(.vertical, 4)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .padding(.vertical, 6)
+        .background(QuickMDDesignTokens.surfaceContainerLow(for: colorScheme))
         .accessibilityElement(children: .combine)
     }
 }
@@ -580,6 +614,11 @@ struct MarkdownEditorView: View {
                 showMinimap: true,
                 wrapText: true
             ))
+            .background {
+                EditorPrimaryCaret()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
             .background(TopLineObserver(onTopLineChange: onTopLineChange))
             .onAppear {
                 EditorFontManager.shared.applyToEditorDeferred()
