@@ -438,7 +438,15 @@ struct WebView: NSViewRepresentable {
         }
 
         func openFileLink(_ url: URL) {
-            let standardized = url.standardizedFileURL
+            // Strip fragment for file identity comparisons; keep it for scrolling
+            let fragment = url.fragment
+            var fileOnlyURL = url
+            if fragment != nil {
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                components?.fragment = nil
+                fileOnlyURL = components?.url ?? url
+            }
+            let standardized = fileOnlyURL.standardizedFileURL
 
             // Check if already open in an existing tab/window
             for window in NSApp.windows {
@@ -451,9 +459,15 @@ struct WebView: NSViewRepresentable {
                     if let tabGroup = window.tabGroup {
                         tabGroup.selectedWindow = window
                     }
-                    // Scroll to anchor fragment if present
-                    if let fragment = url.fragment, let wk = Self.findWebView(in: window) {
-                        scrollToFragment(fragment, in: wk)
+                    // Reload from disk and scroll to fragment via pendingFragment → didFinish.
+                    // Deferred to next runloop to avoid crashing CodeEditorView's minimap
+                    // layout when text storage changes mid-layout pass.
+                    if let wk = Self.findWebView(in: window) as? ZoomableWebView,
+                       let tabModel = wk.commentCoordinator?.model {
+                        tabModel.pendingFragment = fragment
+                        DispatchQueue.main.async {
+                            tabModel.load(from: standardized)
+                        }
                     }
                     return
                 }
@@ -597,17 +611,57 @@ struct WebView: NSViewRepresentable {
 
         private func addCommentToSource(text: String, comment: String, model: MarkdownDocumentModel, sourceLine: Int = -1, offsetInBlock: Int = -1, endOffsetInBlock: Int = -1) {
             let source = model.rawContent
+            let nsSource = source as NSString
 
-            // Primary: use source line + rendered offsets to locate text directly
-            if sourceLine > 0, offsetInBlock >= 0, endOffsetInBlock > offsetInBlock {
-                if let range = Self.sourceRangeFromRenderedOffsets(
-                    sourceLine: sourceLine, offsetInBlock: offsetInBlock, endOffsetInBlock: endOffsetInBlock,
-                    frontmatterLineCount: model.frontmatterLineCount, source: source
-                ) {
-                    let updated = MarkdownDocumentModel.addComment(around: range, comment: comment, in: source)
-                    model.setContent(updated, actionName: "Add Comment")
-                    ContentView.pushIncrementalUpdate(model: model)
-                    return
+            // Find the selected text on the source line indicated by data-source-line.
+            // We search for ALL occurrences in the block and use the rendered offset
+            // to disambiguate when the same text appears multiple times.
+            if sourceLine > 0, !text.isEmpty {
+                let lines = source.components(separatedBy: "\n")
+                let adjustedLine = sourceLine + model.frontmatterLineCount - 1
+                if adjustedLine >= 0, adjustedLine < lines.count {
+                    // Calculate char offset of this line in the source
+                    var lineCharOffset = 0
+                    for i in 0..<adjustedLine { lineCharOffset += lines[i].count + 1 }
+
+                    // Search from this line forward (up to ~500 chars to cover multi-line blocks)
+                    let searchLen = min(500, nsSource.length - lineCharOffset)
+                    if searchLen > 0 {
+                        // Find ALL occurrences of the text in this block
+                        var matches: [NSRange] = []
+                        var searchStart = lineCharOffset
+                        let searchEnd = lineCharOffset + searchLen
+                        while searchStart < searchEnd {
+                            let range = NSRange(location: searchStart, length: searchEnd - searchStart)
+                            let found = nsSource.range(of: text, range: range)
+                            if found.location == NSNotFound { break }
+                            matches.append(found)
+                            searchStart = found.location + found.length
+                        }
+
+                        if matches.count == 1 {
+                            // Only one occurrence — use it directly
+                            let updated = MarkdownDocumentModel.addComment(around: matches[0], comment: comment, in: source)
+                            model.setContent(updated, actionName: "Add Comment")
+                            ContentView.pushIncrementalUpdate(model: model)
+                            return
+                        } else if matches.count > 1, offsetInBlock >= 0 {
+                            // Multiple occurrences — use the rendered offset to pick
+                            // the closest one. The offsetInBlock is the character position
+                            // in the rendered text; we compare it to each match's distance
+                            // from the block start in the source (approximate but sufficient
+                            // to disambiguate).
+                            let best = matches.min(by: { a, b in
+                                let distA = abs((a.location - lineCharOffset) - offsetInBlock)
+                                let distB = abs((b.location - lineCharOffset) - offsetInBlock)
+                                return distA < distB
+                            })!
+                            let updated = MarkdownDocumentModel.addComment(around: best, comment: comment, in: source)
+                            model.setContent(updated, actionName: "Add Comment")
+                            ContentView.pushIncrementalUpdate(model: model)
+                            return
+                        }
+                    }
                 }
             }
 
@@ -1186,11 +1240,14 @@ struct WebView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: ZoomableWebView, context: Context) {
+        // Keep coordinator's model reference current (SwiftUI may recreate the struct)
+        context.coordinator.model = model
         // Store reference on every update
         WebViewStore.shared.webView = view
 
-        if html != context.coordinator.lastHTML {
-            MarkdownDocumentModel.log("WebView.updateNSView reloading, html length=\(html.count)")
+        let forceReload = WebViewStore.shared.isFileWatcherReload
+        if html != context.coordinator.lastHTML || forceReload {
+            MarkdownDocumentModel.log("WebView.updateNSView reloading, html length=\(html.count), forced=\(forceReload)")
             context.coordinator.lastHTML = html
             context.coordinator.lastTheme = theme
             view.loadHTMLString(html, baseURL: baseURL)
@@ -1610,9 +1667,9 @@ private struct ContentViewLifecycle: ViewModifier {
             }
         }
         .task {
-            // Cold-start safety net: onOpenURL may fire before the view
-            // is fully ready, so retry loading the pending URL.
-            for delay in [0.1, 0.3, 0.5, 1.0, 2.0] {
+            // Cold-start safety net: openFiles may set pendingURL before or after
+            // onAppear runs. Poll until the file is loaded or we give up.
+            for delay in [0.05, 0.1, 0.2, 0.5, 1.0, 2.0] {
                 if model.html != nil { break }
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 if model.html == nil, let url = AppDelegate.pendingURL {
@@ -1737,14 +1794,9 @@ private struct ContentViewLifecycle: ViewModifier {
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .openFileRequest)) { notification in
-            // Only the active model or an empty model should respond.
-            // Without this guard, ALL tabs would load the file.
-            guard AppDelegate.activeModel === model || model.currentURL == nil else { return }
-            guard let url = notification.object as? URL else { return }
-            model.load(from: url)
-            AppDelegate.pendingURL = nil
-        }
+        // File open requests are handled via pendingURL:
+        // - Warm start: openFiles loads directly into activeModel
+        // - Cold start: onAppear checks pendingURL, .task retry loop catches races
     }
 }
 
@@ -1904,6 +1956,12 @@ extension ContentView {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onChange(of: model.rawContent) { _, _ in
+            // File watcher reloads already trigger a full loadHTMLString via
+            // the html property change. Skip dirty-marking and the debounced
+            // incremental update which would race with the full reload.
+            if WebViewStore.shared.isFileWatcherReload {
+                return
+            }
             if let window = WebViewStore.shared.webView?.window {
                 window.isDocumentEdited = true
             }

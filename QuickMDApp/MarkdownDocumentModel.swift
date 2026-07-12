@@ -242,6 +242,18 @@ final class MarkdownDocumentModel: ObservableObject {
         isDirty = false
     }
 
+    /// Flush all in-memory state so the next load starts completely fresh.
+    /// Called at the top of load(from:) before reading from disk.
+    func resetForFreshLoad() {
+        isDirty = false
+        undoManager.removeAllActions()
+        activeTOCHeadingID = nil
+        isSelfWriting = false
+        errorMessage = nil
+        // Note: pendingFragment is NOT cleared here — navigateTo() sets it
+        // before calling load(), and it's consumed in didFinish.
+    }
+
     /// Window/tab title: "parent/filename — QuickMD" with a bullet prefix when dirty.
     var windowTitle: String {
         guard let url = currentURL else { return "QuickMD" }
@@ -402,10 +414,32 @@ final class MarkdownDocumentModel: ObservableObject {
                 if let tabGroup = window.tabGroup {
                     tabGroup.selectedWindow = window
                 }
+                // Always reload from disk to ensure fresh content
+                Self.reloadModelInWindow(window, from: standardized)
                 return true
             }
         }
         return false
+    }
+
+    /// Find the MarkdownDocumentModel in a window and reload from disk.
+    /// Deferred to the next runloop iteration to avoid crashing CodeEditorView's
+    /// minimap layout when text storage changes mid-layout pass.
+    static func reloadModelInWindow(_ window: NSWindow, from url: URL) {
+        guard let contentView = window.contentView else { return }
+        func findZoomableWebView(in view: NSView) -> NSView? {
+            if view is ZoomableWebView { return view }
+            for sub in view.subviews {
+                if let found = findZoomableWebView(in: sub) { return found }
+            }
+            return nil
+        }
+        if let zwv = findZoomableWebView(in: contentView) as? ZoomableWebView,
+           let model = zwv.commentCoordinator?.model {
+            DispatchQueue.main.async {
+                model.load(from: url)
+            }
+        }
     }
 
     /// Re-render HTML from current rawContent without reloading from disk.
@@ -419,6 +453,7 @@ final class MarkdownDocumentModel: ObservableObject {
 
     func load(from url: URL) {
         Self.log("load(from: \(url.path))")
+        resetForFreshLoad()
 
         // File size guard
         if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
@@ -451,7 +486,14 @@ final class MarkdownDocumentModel: ObservableObject {
             Self.log("Wrapped HTML total: \(html?.count ?? 0) chars")
             baseURL = url.deletingLastPathComponent()
             fileName = url.lastPathComponent
-            currentURL = url
+            // Strip fragment from currentURL — fragments are for navigation, not identity
+            var cleanURL = url
+            if cleanURL.fragment != nil {
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                components?.fragment = nil
+                cleanURL = components?.url ?? url
+            }
+            currentURL = cleanURL
             errorMessage = nil
             Self.log("Model updated successfully, fileName=\(url.lastPathComponent)")
 
@@ -501,9 +543,17 @@ final class MarkdownDocumentModel: ObservableObject {
                     webView.evaluateJavaScript("window.__getScrollFraction ? __getScrollFraction() : (document.documentElement.scrollTop / Math.max(1, document.documentElement.scrollHeight - document.documentElement.clientHeight))") { result, _ in
                         WebViewStore.shared.preReloadScrollFraction = result as? Double ?? 0
                         WebViewStore.shared.isFileWatcherReload = true
+                        // Reset transient UI state for a clean reload
+                        WebViewStore.shared.suppressEditorToRenderer = false
+                        WebViewStore.shared.isEditReload = false
+                        WebViewStore.shared.commentPanelOpen = false
+                        WebViewStore.shared.hoveredLinkURL = ""
                         self?.load(from: url)
                     }
                 } else {
+                    WebViewStore.shared.isFileWatcherReload = true
+                    WebViewStore.shared.suppressEditorToRenderer = false
+                    WebViewStore.shared.isEditReload = false
                     self?.load(from: url)
                 }
             }

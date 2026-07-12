@@ -73,9 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let path = filenames.first {
             let url = URL(fileURLWithPath: path)
             Self.pendingURL = url
-            // Notify any active ContentView to load the file.
-            // On cold start, onAppear will pick up pendingURL directly.
-            NotificationCenter.default.post(name: .openFileRequest, object: url)
+            // If a model is already active (warm start), load directly.
+            // On cold start, pendingURL will be picked up by onAppear or the .task retry loop.
+            if let model = Self.activeModel {
+                model.load(from: url)
+                Self.pendingURL = nil
+            }
         }
         sender.reply(toOpenOrPrint: .success)
     }
@@ -122,11 +125,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MarkdownDocumentModel.log("open(urls:) called: \(urls.map(\.path))")
         if let url = urls.first {
             Self.pendingURL = url
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                if Self.pendingURL != nil, let model = Self.activeModel {
-                    model.load(from: url)
-                    Self.pendingURL = nil
-                }
+            if let model = Self.activeModel {
+                model.load(from: url)
+                Self.pendingURL = nil
             }
         }
     }
@@ -198,28 +199,116 @@ enum PandocHelper {
     ]
 
     static func pandocPath() -> String? {
-        let candidates = [
-            "/opt/homebrew/bin/pandoc",
-            "/usr/local/bin/pandoc",
-            "/usr/bin/pandoc",
-        ]
-        for path in candidates {
+        for path in pandocSearchCandidates() {
             if FileManager.default.isExecutableFile(atPath: path) {
                 return path
             }
         }
-        // Try `which pandoc` as fallback
+
+        // GUI-launched macOS apps often get a minimal PATH. Ask the user's
+        // login shell too, so Homebrew/MacPorts/Nix paths from shell startup
+        // files are considered instead of relying on a single hardcoded path.
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            if let path = findPandocWithShell(shell), FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+
+        NSLog("QuickMD Pandoc: executable was not found in PATH, common install locations, or login shell")
+        return nil
+    }
+
+    private static func pandocSearchCandidates() -> [String] {
+        var candidates: [String] = []
+        var seen = Set<String>()
+
+        func append(_ path: String) {
+            guard !path.isEmpty, seen.insert(path).inserted else { return }
+            candidates.append(path)
+        }
+
+        let environmentPaths = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        for directory in environmentPaths.split(separator: ":").map(String.init) {
+            append(URL(fileURLWithPath: directory).appendingPathComponent("pandoc").path)
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        for directory in [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/opt/local/bin",
+            "/nix/var/nix/profiles/default/bin",
+            "\(home)/.nix-profile/bin",
+            "\(home)/.local/bin",
+            "\(home)/bin",
+        ] {
+            append(URL(fileURLWithPath: directory).appendingPathComponent("pandoc").path)
+        }
+
+        return candidates
+    }
+
+    private static func executablePath(named executableName: String) -> String? {
+        let environmentPaths = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let directories = environmentPaths.split(separator: ":").map(String.init) + [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/opt/local/bin",
+            "/nix/var/nix/profiles/default/bin",
+            "\(home)/.nix-profile/bin",
+            "\(home)/.local/bin",
+            "\(home)/bin",
+        ]
+        for directory in directories {
+            let path = URL(fileURLWithPath: directory).appendingPathComponent(executableName).path
+            if FileManager.default.isExecutableFile(atPath: path) { return path }
+        }
+        for shell in ["/bin/zsh", "/bin/bash"] {
+            if let path = findExecutableWithShell(executableName, shell: shell), FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    private static func findPandocWithShell(_ shell: String) -> String? {
+        findExecutableWithShell("pandoc", shell: shell)
+    }
+
+    private static func findExecutableWithShell(_ executableName: String, shell: String) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
+
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        proc.arguments = ["pandoc"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        try? proc.run()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-lc", "command -v \(executableName)"]
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        proc.standardOutput = outputPipe
+        proc.standardError = errorPipe
+
+        do {
+            try proc.run()
+        } catch {
+            NSLog("QuickMD Pandoc: failed to run shell while searching for %@: shell=%@, error=%@", executableName, shell, error.localizedDescription)
+            return nil
+        }
+
         proc.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return path.isEmpty ? nil : path
+        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if proc.terminationStatus != 0 {
+            NSLog("QuickMD Pandoc: shell did not find %@: shell=%@, status=%d, stderr=%@", executableName, shell, proc.terminationStatus, errorOutput)
+            return nil
+        }
+
+        return output.isEmpty ? nil : output.components(separatedBy: .newlines).first
     }
 
     static func showInstallAlert() {
@@ -419,6 +508,9 @@ enum PandocHelper {
         var args = [input.path, "-o", output.path, "--standalone"]
         if let format = format { args += ["-t", format] }
         if let inputFormat = inputFormat { args += ["-f", inputFormat] }
+        if output.pathExtension.lowercased() == "pdf", let tectonic = executablePath(named: "tectonic") {
+            args += ["--pdf-engine", tectonic]
+        }
         proc.arguments = args
         let errPipe = Pipe()
         proc.standardError = errPipe
@@ -985,7 +1077,7 @@ extension QuickMDApp {
             AIProgressHUD.shared.dismiss()
             let newContent: String
             var replacedRange: NSRange?
-            if let selected = selectedText, let nsRange = selectionRange {
+            if selectedText != nil, let nsRange = selectionRange {
                 let nsOriginal = originalContent as NSString
                 newContent = nsOriginal.replacingCharacters(in: nsRange, with: result)
                 replacedRange = NSRange(location: nsRange.location, length: (result as NSString).length)
@@ -1285,7 +1377,9 @@ private let fileTypeAssociations: [FileTypeAssociation] = [
     FileTypeAssociation(id: "public.plain-text", name: "Plain Text", extensions: ["txt"], utis: ["public.plain-text"], category: "Other"),
 ]
 
-private let bundleID = Bundle.main.bundleIdentifier ?? "com.pedro.QuickMDApp"
+private func quickMDBundleID() -> String {
+    Bundle.main.bundleIdentifier ?? "com.pedro.QuickMDApp"
+}
 
 /// Check if QuickMD is the current default handler for a UTI.
 private func isDefaultHandler(for uti: String) -> Bool {
@@ -1293,12 +1387,12 @@ private func isDefaultHandler(for uti: String) -> Bool {
     guard let handler = LSCopyDefaultRoleHandlerForContentType(utiCF, .all)?.takeRetainedValue() else {
         return false
     }
-    return (handler as String).caseInsensitiveCompare(bundleID) == .orderedSame
+    return (handler as String).caseInsensitiveCompare(quickMDBundleID()) == .orderedSame
 }
 
 /// Register or unregister QuickMD as the default handler for a set of UTIs.
 private func setDefaultHandler(for utis: [String], enabled: Bool) {
-    let appID = bundleID as CFString
+    let appID = quickMDBundleID() as CFString
     for uti in utis {
         let utiCF = uti as CFString
         if enabled {
